@@ -36,3 +36,4 @@ plans/
 .DS_Store
 
 .lattice/
+Quotio/Resources/Proxy/cli-proxy-api-plus

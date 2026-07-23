@@ -380,6 +380,10 @@ nonisolated struct AuthFile: Codable, Identifiable, Hashable, Sendable {
         if provider == "copilot" {
             return .copilot
         }
+        // ponytail: xai files report provider="xai"; .grok rawValue is "grok"
+        if provider == "xai" {
+            return .grok
+        }
         return AIProvider(rawValue: provider)
     }
     

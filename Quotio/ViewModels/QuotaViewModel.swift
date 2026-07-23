@@ -384,6 +384,16 @@ final class QuotaViewModel {
     }
 
     private func initializeFullMode() async {
+        do {
+            _ = try await MonitorToCLIProxyAuthExporter.exportMissingAccounts(
+                authDir: proxyManager.authDir
+            )
+        } catch {
+            Log.proxy("Monitor→CLIProxy export failed: \(error.localizedDescription)")
+        }
+        // Rescan after export so Providers UI sees new files without leaving the tab.
+        await loadDirectAuthFiles()
+
         // Always refresh quotas directly first (works without proxy)
         await refreshQuotasUnified()
         
