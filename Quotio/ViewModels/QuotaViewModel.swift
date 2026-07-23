@@ -2119,7 +2119,13 @@ final class QuotaViewModel {
             }
             
             // Store URL for copy/open buttons
-            oauthState = OAuthState(provider: provider, status: .polling, state: state, authURL: urlString)
+            oauthState = OAuthState(
+                provider: provider,
+                status: .polling,
+                state: state,
+                authURL: urlString,
+                userCode: response.userCode
+            )
             
             // Auto-open browser if launchMode is .autoOpen
             if launchMode == .autoOpen, let url = URL(string: urlString) {
@@ -2809,10 +2815,11 @@ final class QuotaViewModel {
 struct OAuthState {
     let provider: AIProvider
     var status: OAuthStatus
-    var state: String?
-    var error: String?
-    var authURL: String?
-    
+    var state: String? = nil
+    var error: String? = nil
+    var authURL: String? = nil
+    var userCode: String? = nil
+
     enum OAuthStatus {
         case waiting, polling, success, error
     }

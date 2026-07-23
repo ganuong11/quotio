@@ -15,8 +15,8 @@ nonisolated enum ProxyBinarySource: String, Codable, CaseIterable, Identifiable,
 
     static let userDefaultsKey = "selectedProxyBinarySource"
     static let explicitSelectionDefaultsKey = "hasExplicitProxyBinarySourceSelection"
-    static let plusLocalVersion = "6.9.28-0"
-    static let plusLocalSHA256 = "a722885ab3c0cea5535ee69a86220d35c4f95ee7656e009d872d24de2910acf0"
+    static let plusLocalVersion = "7.2.96-0"
+    static let plusLocalSHA256 = "220e746855c870870d94f219323541159b8161cc5bb10f7e5b7bf80c36ef0320"
     static let plusLocalBinaryName = "cli-proxy-api-plus"
     static let plusLocalResourceSubdirectory = "Proxy"
 
@@ -41,7 +41,7 @@ nonisolated enum ProxyBinarySource: String, Codable, CaseIterable, Identifiable,
     var shortDescription: String {
         switch self {
         case .plusLocal:
-            return "Bundled 6.9.28-0 with legacy compatibility"
+            return "Bundled 7.2.96-0 with xAI Grok support"
         case .upstream:
             return "Latest maintained upstream releases"
         }
@@ -50,7 +50,7 @@ nonisolated enum ProxyBinarySource: String, Codable, CaseIterable, Identifiable,
     var selectionDescription: String {
         switch self {
         case .plusLocal:
-            return "CLIProxyAPIPlus (bundled 6.9.28-0)"
+            return "CLIProxyAPIPlus (bundled 7.2.96-0)"
         case .upstream:
             return "CLIProxyAPI (latest upstream)"
         }
@@ -59,7 +59,7 @@ nonisolated enum ProxyBinarySource: String, Codable, CaseIterable, Identifiable,
     var detailDescription: String {
         switch self {
         case .plusLocal:
-            return "Preserves legacy Copilot and Kiro compatibility."
+            return "Bundled upstream CLIProxyAPI with xAI Grok support."
         case .upstream:
             return "Actively maintained upstream releases."
         }

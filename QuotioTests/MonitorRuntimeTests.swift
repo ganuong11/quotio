@@ -17,10 +17,11 @@ final class MonitorRuntimeTests: XCTestCase {
     }
 
     func testMonitorOnlyProvidersDoNotOfferLocalProxySetup() {
-        for provider in [AIProvider.factoryDroid, .devin, .grok, .openRouter, .warp] {
+        for provider in [AIProvider.factoryDroid, .devin, .openRouter, .warp] {
             XCTAssertFalse(provider.supportsLocalProxySetup)
         }
         XCTAssertTrue(AIProvider.claude.supportsLocalProxySetup)
+        XCTAssertTrue(AIProvider.grok.supportsLocalProxySetup)
     }
 
     func testStatusBarIncludesEnabledMonitorAccountsWithoutQuota() {
@@ -565,6 +566,27 @@ final class MonitorRuntimeTests: XCTestCase {
             DevinQuotaFetcher.loadAppCredential(path: path),
             DevinCredential(apiKey: "app-token", apiServerURL: nil)
         )
+    }
+
+    func testGrokIsMonitorAddableAndVaultPreferredOverNativeFile() {
+        XCTAssertTrue(AIProvider.grok.supportsQuotaOnlyMode)
+        XCTAssertTrue(AIProvider.grok.supportsManualAuth)
+
+        let vault = MonitorAccount.make(
+            provider: .grok,
+            accountKey: "person@example.com",
+            source: .quotioKeychain,
+            canDelete: true
+        )
+        let native = MonitorAccount.make(
+            provider: .grok,
+            accountKey: "person@example.com",
+            source: .nativeCredential
+        )
+        let selected = MonitorAccountDiscovery.selectPreferred([native, vault])
+        XCTAssertEqual(selected.count, 1)
+        XCTAssertEqual(selected.first?.source, .quotioKeychain)
+        XCTAssertTrue(selected.first?.canDelete == true)
     }
 
     func testGrokParsesMultipleAccountsAndSkipsInvalidEntries() throws {

@@ -210,7 +210,9 @@ actor DirectAuthFileService {
             "kiro": .kiro,
             "vertex": .vertex,
             "cursor": .cursor,
-            "trae": .trae
+            "trae": .trae,
+            "xai": .grok,
+            "grok": .grok
         ]
         return typeMap[type.lowercased()]
     }
@@ -243,7 +245,9 @@ actor DirectAuthFileService {
             ("qwen-", .qwen),
             ("iflow-", .iflow),
             ("kiro-", .kiro),
-            ("vertex-", .vertex)
+            ("vertex-", .vertex),
+            ("xai-", .grok),
+            ("grok-", .grok)
         ]
         
         for (prefix, provider) in prefixes {

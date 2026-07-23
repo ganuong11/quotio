@@ -976,7 +976,8 @@ struct QuotaProviderRow: View {
     let accounts: [String: ProviderQuotaData]
     
     private var lowestQuota: Double {
-        accounts.values.flatMap { $0.models }.map { $0.percentage }.min() ?? 100
+        let percentages = accounts.values.flatMap { $0.models }.map { $0.percentage }.filter { $0 >= 0 }
+        return percentages.min() ?? 100
     }
     
     private var quotaColor: Color {

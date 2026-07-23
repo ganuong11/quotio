@@ -44,7 +44,8 @@ struct ProvidersScreen: View {
             }
         } else {
             return AIProvider.allCases.filter {
-                $0.supportsQuotaOnlyMode && ($0.supportsManualAuth || $0 == .glm || $0 == .clinePass)
+                $0.supportsQuotaOnlyMode
+                    && ($0.supportsManualAuth || $0 == .glm || $0 == .clinePass)
             }
         }
     }
@@ -936,7 +937,7 @@ struct OAuthSheet: View {
             }
             
             if let state = viewModel.oauthState, state.provider == provider {
-                OAuthStatusView(status: state.status, error: state.error, state: state.state, authURL: state.authURL, provider: provider)
+                OAuthStatusView(status: state.status, error: state.error, state: state.state, authURL: state.authURL, userCode: state.userCode, provider: provider)
                     .transition(.opacity.combined(with: .scale(scale: 0.95)))
             }
 
@@ -1011,6 +1012,7 @@ private struct OAuthStatusView: View {
     let error: String?
     let state: String?
     let authURL: String?
+    let userCode: String?
     let provider: AIProvider
     
     /// Stable rotation angle for spinner animation (fixes UUID() infinite re-render)
@@ -1055,8 +1057,9 @@ private struct OAuthStatusView: View {
                             .foregroundStyle(provider.color)
                     }
                     
-                    // For Copilot Device Code flow, show device code with copy button
-                    if (provider == .copilot || provider == .kiro), let deviceCode = state, !deviceCode.isEmpty {
+                    // Device-code flows (Copilot/Kiro CLI; xAI Management API user_code)
+                    let deviceCode = userCode ?? ((provider == .copilot || provider == .kiro) ? state : nil)
+                    if let deviceCode, !deviceCode.isEmpty {
                         VStack(spacing: 8) {
                             Text("oauth.enterCodeInBrowser".localized())
                                 .font(.subheadline)
@@ -1085,6 +1088,30 @@ private struct OAuthStatusView: View {
                             Text("oauth.waitingForAuth".localized())
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+
+                            if let urlString = authURL, let url = URL(string: urlString) {
+                                HStack(spacing: 12) {
+                                    Button {
+                                        NSPasteboard.general.clearContents()
+                                        NSPasteboard.general.setString(urlString, forType: .string)
+                                        copied = true
+                                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                                            copied = false
+                                        }
+                                    } label: {
+                                        Label(copied ? "oauth.copied".localized() : "oauth.copyLink".localized(), systemImage: copied ? "checkmark" : "doc.on.doc")
+                                    }
+                                    .buttonStyle(.bordered)
+
+                                    Button {
+                                        NSWorkspace.shared.open(url)
+                                    } label: {
+                                        Label("oauth.openLink".localized(), systemImage: "safari")
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .tint(provider.color)
+                                }
+                            }
                         }
                     } else if (provider == .copilot || provider == .kiro), let message = error {
                         Text(message)

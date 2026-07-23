@@ -94,21 +94,49 @@ actor GrokQuotaFetcher {
     }
 
     func fetchAllQuotas() async -> [String: ProviderQuotaData] {
-        var results: [String: ProviderQuotaData] = [:]
-        for candidate in Self.loadCandidates() {
-            if let quota = await fetchQuota(candidate) {
+        var results = await fetchOwnedQuotas()
+        for candidate in Self.loadCandidates() where results[candidate.entryKey] == nil {
+            if let quota = await fetchQuota(candidate, vaultAccount: nil) {
                 results[candidate.entryKey] = quota
             }
         }
         return results
     }
 
-    /// Fetches the candidate identified by its stable auth-file entry key.
+    /// Fetches the candidate identified by its stable auth-file entry key or vault account key.
     func fetchQuota(accountKey: String) async -> ProviderQuotaData? {
+        if let account = await MonitorCredentialVault.shared.accounts().first(where: {
+            $0.provider == .grok && !$0.isDisabled && $0.accountKey == accountKey
+        }) {
+            return await fetchOwnedQuota(account: account)
+        }
         guard let candidate = Self.loadCandidates().first(where: { $0.entryKey == accountKey }) else {
             return nil
         }
-        return await fetchQuota(candidate)
+        return await fetchQuota(candidate, vaultAccount: nil)
+    }
+
+    private func fetchOwnedQuotas() async -> [String: ProviderQuotaData] {
+        var results: [String: ProviderQuotaData] = [:]
+        for account in await MonitorCredentialVault.shared.accounts().filter({ $0.provider == .grok && !$0.isDisabled }) {
+            if let quota = await fetchOwnedQuota(account: account) {
+                results[account.accountKey] = quota
+            }
+        }
+        return results
+    }
+
+    private func fetchOwnedQuota(account: MonitorAccount) async -> ProviderQuotaData? {
+        guard let credential = await MonitorCredentialVault.shared.credential(for: account.id) else { return nil }
+        let candidate = GrokAuthCandidate(
+            entryKey: account.accountKey,
+            accessToken: credential.accessToken,
+            refreshToken: credential.refreshToken,
+            idToken: credential.idToken,
+            clientID: credential.extra["clientId"] ?? Self.defaultClientID,
+            expiresAt: credential.expiresAt
+        )
+        return await fetchQuota(candidate, vaultAccount: account)
     }
 
     nonisolated static func quotaResult(
@@ -151,16 +179,20 @@ actor GrokQuotaFetcher {
         return trimmed(String(key[separator.upperBound...]))
     }
 
-    private func fetchQuota(_ original: GrokAuthCandidate) async -> ProviderQuotaData? {
+    private func fetchQuota(
+        _ original: GrokAuthCandidate,
+        vaultAccount: MonitorAccount?
+    ) async -> ProviderQuotaData? {
         var candidate = original
+        let displayName = vaultAccount?.displayName ?? candidate.displayName
         if let expiry = candidate.expiresAt, expiry.timeIntervalSinceNow <= 300,
-           let refreshed = await refresh(candidate) {
+           let refreshed = await refresh(candidate, vaultAccount: vaultAccount) {
             candidate = refreshed
         }
 
         var billing = await get(billingURL, token: candidate.accessToken)
         if billing?.1.statusCode == 401 || billing?.1.statusCode == 403,
-           let refreshed = await refresh(candidate) {
+           let refreshed = await refresh(candidate, vaultAccount: vaultAccount) {
             candidate = refreshed
             billing = await get(billingURL, token: candidate.accessToken)
         }
@@ -170,7 +202,7 @@ actor GrokQuotaFetcher {
                 data: billingData,
                 statusCode: billingResponse.statusCode,
                 plan: nil,
-                displayName: candidate.displayName
+                displayName: displayName
             )
         }
         guard 200...299 ~= billingResponse.statusCode else { return nil }
@@ -186,7 +218,7 @@ actor GrokQuotaFetcher {
             data: billingData,
             statusCode: billingResponse.statusCode,
             plan: plan,
-            displayName: candidate.displayName
+            displayName: displayName
         )
     }
 
@@ -201,7 +233,10 @@ actor GrokQuotaFetcher {
         return (data, http)
     }
 
-    private func refresh(_ candidate: GrokAuthCandidate) async -> GrokAuthCandidate? {
+    private func refresh(
+        _ candidate: GrokAuthCandidate,
+        vaultAccount: MonitorAccount?
+    ) async -> GrokAuthCandidate? {
         guard let refreshToken = candidate.refreshToken else { return nil }
         let body = "grant_type=refresh_token&client_id=\(Self.formEncoded(candidate.clientID))&refresh_token=\(Self.formEncoded(refreshToken))"
         var request = URLRequest(url: refreshURL)
@@ -218,16 +253,38 @@ actor GrokQuotaFetcher {
         let idToken = Self.trimmed(json["id_token"] as? String) ?? candidate.idToken
         let expiresIn = (json["expires_in"] as? NSNumber)?.doubleValue ?? 3600
         let expiresAt = Date().addingTimeInterval(expiresIn)
-        do {
-            try Self.persistRotatedCredential(
-                entryKey: candidate.entryKey,
-                accessToken: accessToken,
-                refreshToken: rotatedRefresh,
-                idToken: idToken,
-                expiresAt: expiresAt
-            )
-        } catch {
-            Log.quota("Failed to persist refreshed Grok credential: \(error.localizedDescription)")
+        if let vaultAccount {
+            var credential = await MonitorCredentialVault.shared.credential(for: vaultAccount.id)
+                ?? MonitorOAuthCredential(
+                    accessToken: accessToken,
+                    refreshToken: rotatedRefresh,
+                    idToken: idToken,
+                    accountID: vaultAccount.accountKey,
+                    expiresAt: expiresAt,
+                    extra: ["clientId": candidate.clientID]
+                )
+            credential.accessToken = accessToken
+            credential.refreshToken = rotatedRefresh
+            credential.idToken = idToken
+            credential.expiresAt = expiresAt
+            credential.extra["clientId"] = candidate.clientID
+            do {
+                try await MonitorCredentialVault.shared.save(credential, metadata: vaultAccount)
+            } catch {
+                Log.quota("Failed to persist refreshed Grok vault credential: \(error.localizedDescription)")
+            }
+        } else {
+            do {
+                try Self.persistRotatedCredential(
+                    entryKey: candidate.entryKey,
+                    accessToken: accessToken,
+                    refreshToken: rotatedRefresh,
+                    idToken: idToken,
+                    expiresAt: expiresAt
+                )
+            } catch {
+                Log.quota("Failed to persist refreshed Grok credential: \(error.localizedDescription)")
+            }
         }
         return GrokAuthCandidate(
             entryKey: candidate.entryKey,

@@ -91,7 +91,7 @@ nonisolated enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendab
         case .cursor: return "cursor"
         case .factoryDroid: return "factory-droid"
         case .devin: return "devin"
-        case .grok: return "grok"
+        case .grok: return "xai"
         case .openRouter: return "openrouter"
         case .trae: return "trae"
         case .glm: return "glm"
@@ -135,7 +135,8 @@ nonisolated enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendab
         case .kiro: return ""  // Uses CLI-based auth like Copilot
         case .copilot: return ""
         case .cursor: return ""  // Uses browser session
-        case .factoryDroid, .devin, .grok, .openRouter: return ""
+        case .factoryDroid, .devin, .openRouter: return ""
+        case .grok: return "/xai-auth-url"
         case .trae: return ""  // Uses browser session
         case .glm: return ""
         case .warp: return ""
@@ -181,7 +182,8 @@ nonisolated enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendab
         case .iflow: return "iflow-menubar"
         case .vertex: return "vertex-menubar"
         case .cursor: return "cursor-menubar"
-        case .factoryDroid, .devin, .grok, .openRouter: return nil
+        case .factoryDroid, .devin, .openRouter: return nil
+        case .grok: return "xai-menubar"
         case .trae: return "trae-menubar"
         case .glm: return "glm-menubar"
         case .warp: return "warp-menubar"
@@ -230,12 +232,11 @@ nonisolated enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendab
     }
     
     /// Whether this provider can be added manually (via OAuth, CLI login, or file import)
-    /// Cursor, Trae, Windsurf are excluded because they only read from local app databases
-    /// GLM and ClinePass are excluded because they should only be added via Custom Providers
+    /// Cursor/Trae: local app databases only. Devin: auto-detect. GLM/ClinePass: Custom Providers.
     var supportsManualAuth: Bool {
         switch self {
-        case .cursor, .trae, .devin, .grok, .glm, .clinePass:
-            return false  // API-key providers: Custom Providers; Cursor/Trae: local app databases
+        case .cursor, .trae, .devin, .glm, .clinePass:
+            return false
         default:
             return true
         }
@@ -254,7 +255,7 @@ nonisolated enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendab
     /// Whether this provider is quota-tracking only (not a real provider that can route requests)
     var isQuotaTrackingOnly: Bool {
         switch self {
-        case .cursor, .trae, .factoryDroid, .devin, .grok, .openRouter, .warp:
+        case .cursor, .trae, .factoryDroid, .devin, .openRouter, .warp:
             return true  // Only for tracking usage, not a provider
         default:
             return false
@@ -518,6 +519,13 @@ nonisolated struct OAuthURLResponse: Codable, Sendable {
     let url: String?
     let state: String?
     let error: String?
+    let userCode: String?
+    let flow: String?
+
+    enum CodingKeys: String, CodingKey {
+        case status, url, state, error, flow
+        case userCode = "user_code"
+    }
 }
 
 nonisolated struct OAuthStatusResponse: Codable, Sendable {

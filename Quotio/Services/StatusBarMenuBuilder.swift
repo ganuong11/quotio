@@ -2167,7 +2167,7 @@ private struct LowestBarLayout: View {
     private var settings: MenuBarSettingsManager { MenuBarSettingsManager.shared }
 
     private var sorted: [ModelBadgeData] {
-        models.sorted { $0.percentage < $1.percentage }
+        models.filter { $0.percentage >= 0 }.sorted { $0.percentage < $1.percentage }
     }
 
     private var lowest: ModelBadgeData? {
