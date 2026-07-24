@@ -2096,6 +2096,11 @@ final class QuotaViewModel {
     }
     
     func startOAuth(for provider: AIProvider, projectId: String? = nil, authMethod: AuthCommand? = nil, launchMode: OAuthLaunchMode = .manual) async {
+        if provider == .grok {
+            await startGrokLoopbackOAuth()
+            return
+        }
+
         if modeManager.isMonitorMode {
             await startMonitorOAuth(for: provider)
             return
@@ -2146,6 +2151,28 @@ final class QuotaViewModel {
             
         } catch {
             oauthState = OAuthState(provider: provider, status: .error, error: error.localizedDescription)
+        }
+    }
+
+    private func startGrokLoopbackOAuth() async {
+        oauthState = OAuthState(provider: .grok, status: .waiting)
+        do {
+            let account = try await MonitorOAuthCoordinator.shared.login(provider: .grok)
+            if let credential = await MonitorCredentialVault.shared.credential(for: account.id) {
+                try? MonitorToCLIProxyAuthExporter.writeAuthFile(
+                    account: account,
+                    credential: credential,
+                    authDir: proxyManager.authDir,
+                    overwrite: true
+                )
+            }
+            oauthState = OAuthState(provider: .grok, status: .success)
+            await loadDirectAuthFiles()
+            await refreshQuotasDirectly(force: true)
+        } catch is CancellationError {
+            oauthState = nil
+        } catch {
+            oauthState = OAuthState(provider: .grok, status: .error, error: error.localizedDescription)
         }
     }
 

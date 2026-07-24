@@ -18,7 +18,7 @@ actor MonitorOAuthCoordinator {
         case .kiro:
             task = Task { try await kiroDeviceFlow() }
         case .grok:
-            task = Task { try await xaiDeviceFlow() }
+            task = Task { try await browserPKCEFlow(provider: .grok) }
         case .codex, .gemini, .antigravity:
             task = Task { try await browserPKCEFlow(provider: provider) }
         default:
@@ -188,6 +188,17 @@ actor MonitorOAuthCoordinator {
                 clientID: "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
                 clientSecret: "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"
             )
+        case .grok:
+            return BrowserConfiguration(
+                authorizationURL: "https://auth.x.ai/oauth2/authorize",
+                tokenURL: "https://auth.x.ai/oauth2/token",
+                clientID: GrokQuotaFetcher.defaultClientID,
+                clientSecret: nil,
+                scopes: "openid profile email offline_access grok-cli:access api:access",
+                preferredPort: 56121,
+                callbackPath: "/callback",
+                extraAuthorizationValues: ["plan": "generic", "referrer": "quotio"]
+            )
         default:
             throw MonitorOAuthError.flowNotImplemented(provider.displayName)
         }
@@ -219,7 +230,7 @@ actor MonitorOAuthCoordinator {
                 namespace: "https://api.openai.com/auth",
                 claim: "chatgpt_account_id"
             )
-        } else {
+        } else if provider == .gemini || provider == .antigravity {
             let user = try? await googleUserInfo(accessToken: accessToken)
             email = email ?? user?.email
             accountID = user?.id
@@ -233,13 +244,15 @@ actor MonitorOAuthCoordinator {
             credentialReference: "keychain",
             canDelete: true
         )
+        var extra: [String: String] = [:]
+        if provider == .grok { extra["clientId"] = GrokQuotaFetcher.defaultClientID }
         let credential = MonitorOAuthCredential(
             accessToken: accessToken,
             refreshToken: refreshToken,
             idToken: idToken,
             accountID: accountID,
             expiresAt: expiresIn.map { Date().addingTimeInterval($0) },
-            extra: [:]
+            extra: extra
         )
         try await MonitorCredentialVault.shared.save(credential, metadata: account)
         return account
@@ -443,83 +456,6 @@ actor MonitorOAuthCoordinator {
         return "AWS Builder ID • " + String(MonitorIdentity.fingerprint(clientID).prefix(8))
     }
 
-    private func xaiDeviceFlow() async throws -> MonitorAccount {
-        let clientID = GrokQuotaFetcher.defaultClientID
-        let device = try await postForm(
-            url: "https://auth.x.ai/oauth2/device/code",
-            values: [
-                "client_id": clientID,
-                "scope": "openid profile email offline_access grok-cli:access",
-            ]
-        )
-        guard let deviceCode = device["device_code"] as? String,
-              let userCode = device["user_code"] as? String,
-              let verification = (device["verification_uri_complete"] as? String)
-                ?? (device["verification_uri"] as? String),
-              let verificationURL = URL(string: verification) else {
-            throw MonitorOAuthError.invalidResponse
-        }
-
-        _ = await MainActor.run { NSWorkspace.shared.open(verificationURL) }
-        await MainActor.run {
-            NotificationCenter.default.post(
-                name: .monitorOAuthDeviceCode,
-                object: nil,
-                userInfo: ["code": userCode, "url": verification]
-            )
-        }
-
-        var pollInterval = max(5, device["interval"] as? Int ?? 5)
-        let deadline = Date().addingTimeInterval(TimeInterval(device["expires_in"] as? Int ?? 900))
-        while Date() < deadline {
-            try Task.checkCancellation()
-            try await Task.sleep(for: .seconds(pollInterval))
-            let response = try await postFormAllowingError(
-                url: "https://auth.x.ai/oauth2/token",
-                values: [
-                    "client_id": clientID,
-                    "device_code": deviceCode,
-                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                ]
-            )
-            if let accessToken = response["access_token"] as? String {
-                let refreshToken = response["refresh_token"] as? String
-                let idToken = response["id_token"] as? String
-                let expiresIn = (response["expires_in"] as? Int).map(Double.init)
-                    ?? (response["expires_in"] as? NSNumber)?.doubleValue
-                    ?? 3600
-                let email = MonitorIdentity.jwtString(idToken, claim: "email")
-                let accountKey = email ?? "Grok " + String(MonitorIdentity.fingerprint(accessToken).prefix(8))
-                let account = MonitorAccount.make(
-                    provider: .grok,
-                    accountKey: accountKey,
-                    displayName: email ?? accountKey,
-                    source: .quotioKeychain,
-                    credentialReference: "keychain",
-                    canDelete: true
-                )
-                let credential = MonitorOAuthCredential(
-                    accessToken: accessToken,
-                    refreshToken: refreshToken,
-                    idToken: idToken,
-                    accountID: email,
-                    expiresAt: Date().addingTimeInterval(expiresIn),
-                    extra: ["clientId": clientID]
-                )
-                try await MonitorCredentialVault.shared.save(credential, metadata: account)
-                return account
-            }
-            switch response["error"] as? String {
-            case "authorization_pending": continue
-            case "slow_down": pollInterval += 5
-            case "expired_token", "access_denied": throw MonitorOAuthError.expired
-            case .some(let code): throw MonitorOAuthError.provider(code)
-            default: throw MonitorOAuthError.invalidResponse
-            }
-        }
-        throw MonitorOAuthError.expired
-    }
-
     private func postJSON(url: String, body: [String: Any]) async throws -> [String: Any] {
         guard let endpoint = URL(string: url) else { throw MonitorOAuthError.invalidResponse }
         var request = URLRequest(url: endpoint)
@@ -553,26 +489,6 @@ actor MonitorOAuthCoordinator {
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse,
               200...299 ~= http.statusCode,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw MonitorOAuthError.invalidResponse
-        }
-        return json
-    }
-
-    /// OIDC device-token polls often return 400 + `{"error":"authorization_pending"}`.
-    private func postFormAllowingError(url: String, values: [String: String]) async throws -> [String: Any] {
-        guard let endpoint = URL(string: url) else { throw MonitorOAuthError.invalidResponse }
-        var request = URLRequest(url: endpoint)
-        request.httpMethod = "POST"
-        request.addValue("application/json", forHTTPHeaderField: "Accept")
-        request.addValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        request.httpBody = values
-            .map { "\($0.key.monitorFormEncoded)=\($0.value.monitorFormEncoded)" }
-            .sorted()
-            .joined(separator: "&")
-            .data(using: .utf8)
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard response is HTTPURLResponse,
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw MonitorOAuthError.invalidResponse
         }

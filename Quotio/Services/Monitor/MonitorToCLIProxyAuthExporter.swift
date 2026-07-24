@@ -144,6 +144,24 @@ nonisolated enum MonitorToCLIProxyAuthExporter {
         return result
     }
 
+    static func writeAuthFile(
+        account: MonitorAccount,
+        credential: MonitorOAuthCredential,
+        authDir: String = NSString(string: "~/.cli-proxy-api").expandingTildeInPath,
+        overwrite: Bool = false,
+        fileManager: FileManager = .default
+    ) throws {
+        guard let built = buildAuthFile(account: account, credential: credential) else { return }
+        let url = URL(fileURLWithPath: authDir).appendingPathComponent(built.filename)
+        try fileManager.createDirectory(
+            atPath: authDir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        if !overwrite, fileManager.fileExists(atPath: url.path) { return }
+        try SecureAtomicFileWriter.write(built.data, to: url)
+    }
+
     static func resolveCredential(
         account: MonitorAccount,
         store: any MonitorCredentialStore
