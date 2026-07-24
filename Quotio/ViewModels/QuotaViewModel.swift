@@ -2608,7 +2608,7 @@ final class QuotaViewModel {
                     provider: file.providerType?.displayName ?? file.provider,
                     account: file.email ?? file.name
                 )
-            } else if file.status == "ready" && previousStatus == "cooling" {
+            } else if file.isReadyStatus && previousStatus == "cooling" {
                 notificationManager.clearCoolingNotification(
                     provider: file.provider,
                     account: file.email ?? file.name

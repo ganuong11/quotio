@@ -185,7 +185,7 @@ struct AccountRow: View {
     
     private var statusColor: Color {
         switch account.status {
-        case "ready": return account.isDisabled ? .gray : .green
+        case "ready", "active": return account.isDisabled ? .gray : .green
         case "cooling", "outdated": return .orange
         case "error": return .red
         default: return .gray

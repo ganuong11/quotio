@@ -422,13 +422,15 @@ nonisolated struct AuthFile: Codable, Identifiable, Hashable, Sendable {
         return key.isEmpty ? name : key
     }
     
+    var isReadyStatus: Bool { status == "ready" || status == "active" }
+    
     var isReady: Bool {
-        status == "ready" && !disabled && !unavailable
+        isReadyStatus && !disabled && !unavailable
     }
     
     var statusColor: Color {
         switch status {
-        case "ready": return disabled ? .gray : .green
+        case "ready", "active": return disabled ? .gray : .green
         case "cooling": return .orange
         case "error": return .red
         default: return .gray
