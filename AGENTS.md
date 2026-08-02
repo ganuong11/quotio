@@ -60,4 +60,18 @@ For UI changes, also run the app manually and check light/dark mode. For provide
 - Check staged changes for secrets and generated build output.
 - Prefer concise conventional commit messages.
 
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub Issues (uses the `gh` CLI). See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Five canonical roles; label strings equal their names. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
 Keep this file short and high-signal. Prefer pointers to source files over copied code or long directory listings.
