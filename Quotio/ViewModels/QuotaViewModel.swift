@@ -577,7 +577,88 @@ final class QuotaViewModel {
         monitorAccounts = await monitorCoordinator.discoverAccounts(merging: providerQuotas)
         await refreshQuotasDirectly(force: true)
     }
-    
+
+    // MARK: - Qoder PAT onboarding (ADR 0006 §3, ticket #4)
+
+    /// Errors surfaced from Qoder onboarding. `QoderPATService` already
+    /// redacts PATs/tokens out of its own errors; this only adds the
+    /// duplicate-account case which the service cannot know about.
+    nonisolated enum QoderOnboardingError: LocalizedError {
+        /// An account with the same `accountKey` (email, or userID when email
+        /// is absent) is already present. Reject so the user does not silently
+        /// overwrite an existing account — `MonitorAccount.make` derives a
+        /// stable id from `provider|accountKey`, so a re-save would replace.
+        case duplicate
+
+        var errorDescription: String? {
+            switch self {
+            case .duplicate: "qoder.onboarding.duplicate".localizedStatic()
+            }
+        }
+    }
+
+    /// Pure helper for Qoder onboarding string normalisation. Keeps the
+    /// trimming logic testable and out of the actor body.
+    nonisolated enum QoderOnboarding {
+        /// Returns the trimmed string if non-empty, else nil.
+        static func blankToNil(_ value: String) -> String? {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+    }
+
+    /// Step 1 of ADR 0006 §3: exchange a PAT against the global endpoint and
+    /// resolve the user identity. The result is shown to the user for
+    /// confirmation before `saveQoderAccount(from:)` persists anything. Thin
+    /// wrapper over `QoderPATService` so the onboarding sheet stays free of
+    /// networking (AGENTS.md).
+    func exchangeQoderPAT(_ rawPAT: String) async throws -> QoderPATResult {
+        try await QoderPATService.shared.credentials(fromPat: rawPAT)
+    }
+
+    /// Step 2 of ADR 0006 §3: persist the resolved credential and identity as
+    /// a `MonitorAccount` (`source: .quotioKeychain`, `provider: .qoder`).
+    /// `accountKey` prefers email (more recognisable to the user than a userID)
+    /// and falls back to userID — both are unique per Qoder account. After
+    /// saving, the same refresh sequence as the API-key monitor path runs so
+    /// the new account appears in the dashboard and triggers a quota fetch.
+    func saveQoderAccount(from result: QoderPATResult) async throws {
+        let identity = result.identity
+        let email = QoderOnboarding.blankToNil(identity.email)
+        let name = QoderOnboarding.blankToNil(identity.name)
+        let userID = QoderOnboarding.blankToNil(identity.userID)
+
+        // accountKey = userID or email (issue #4 AC). userID is the stable
+        // identity key Qoder issues, so keying on it keeps an account stable
+        // across email changes and makes the dedup guard below reliable.
+        // `QoderPATService.credentials(fromPat:)` already rejects an empty userID,
+        // so this guard only triggers under unexpected state.
+        let accountKey = userID ?? email ?? ""
+        guard !accountKey.isEmpty else { throw QoderPATError.identityMissing }
+
+        // Dedup guard. Without it, re-pasting the same PAT silently overwrites
+        // the existing account (same `provider|accountKey` → same id).
+        if monitorAccounts.contains(where: {
+            $0.provider == .qoder
+                && $0.accountKey.caseInsensitiveCompare(accountKey) == .orderedSame
+        }) {
+            throw QoderOnboardingError.duplicate
+        }
+
+        let account = MonitorAccount.make(
+            provider: .qoder,
+            accountKey: accountKey,
+            displayName: name ?? email ?? userID ?? "",
+            source: .quotioKeychain,
+            credentialReference: "keychain",
+            canDelete: true
+        )
+
+        try await MonitorCredentialVault.shared.save(result.credential, metadata: account)
+        monitorAccounts = await monitorCoordinator.discoverAccounts(merging: providerQuotas)
+        await refreshQuotasDirectly(force: true)
+    }
+
     /// Refresh quotas directly without proxy (for Quota-Only Mode)
     /// Note: Cursor and Trae are NOT auto-refreshed - user must use "Scan for IDEs" (issue #29)
     func refreshQuotasDirectly(force: Bool = false) async {

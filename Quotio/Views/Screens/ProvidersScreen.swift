@@ -28,6 +28,7 @@ struct ProvidersScreen: View {
     @State private var monitorAPIKeyProvider: AIProvider?
     @State private var editingMonitorAPIKeyAccount: MonitorAccount?
     @State private var showAddProviderPopover = false
+    @State private var showQoderOnboardingSheet = false
     @State private var switchingAccount: AccountRowData?
     @State private var modeManager = OperatingModeManager.shared
 
@@ -289,6 +290,10 @@ struct ProvidersScreen: View {
                 }
             )
         }
+        .sheet(isPresented: $showQoderOnboardingSheet) {
+            QoderPATOnboardingSheet()
+                .environment(viewModel)
+        }
         .sheet(item: $switchingAccount) { account in
             SwitchAccountSheet(
                 accountEmail: account.displayName,
@@ -470,6 +475,13 @@ struct ProvidersScreen: View {
         if [.factoryDroid, .openRouter].contains(provider) {
             editingMonitorAPIKeyAccount = nil
             monitorAPIKeyProvider = provider
+            return
+        }
+        // Qoder uses a dedicated PAT-paste onboarding sheet (ADR 0006 §3), not
+        // the OAuthSheet path: `usesAPIKeyAuth: false` keeps it out of the
+        // Custom Provider flow, and there is no OAuth device/code flow.
+        if provider == .qoder {
+            showQoderOnboardingSheet = true
             return
         }
 

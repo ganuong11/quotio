@@ -113,19 +113,35 @@ struct DashboardScreen: View {
             }
         }
         .sheet(item: $selectedProvider) { provider in
-            OAuthSheet(provider: provider, projectId: $projectId) {
-                selectedProvider = nil
-                projectId = ""
-                viewModel.oauthState = nil
-                Task {
-                    if modeManager.isMonitorMode {
-                        await viewModel.manualRefresh()
-                    } else {
-                        await viewModel.refreshData()
+            if provider == .qoder {
+                // Qoder onboards via PAT paste (ADR 0006 §3), not OAuth. Route
+                // both Dashboard tap sites through the dedicated sheet.
+                QoderPATOnboardingSheet {
+                    selectedProvider = nil
+                    Task {
+                        if modeManager.isMonitorMode {
+                            await viewModel.manualRefresh()
+                        } else {
+                            await viewModel.refreshData()
+                        }
                     }
                 }
+                .environment(viewModel)
+            } else {
+                OAuthSheet(provider: provider, projectId: $projectId) {
+                    selectedProvider = nil
+                    projectId = ""
+                    viewModel.oauthState = nil
+                    Task {
+                        if modeManager.isMonitorMode {
+                            await viewModel.manualRefresh()
+                        } else {
+                            await viewModel.refreshData()
+                        }
+                    }
+                }
+                .environment(viewModel)
             }
-            .environment(viewModel)
         }
         .sheet(item: $selectedAgentForConfig) { (agent: CLIAgent) in
             AgentConfigSheet(viewModel: viewModel.agentSetupViewModel, agent: agent)
