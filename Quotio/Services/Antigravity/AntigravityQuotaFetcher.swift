@@ -54,7 +54,10 @@ nonisolated struct GroupedModelQuota: Identifiable, Sendable {
     var id: String { group.id }
 
     var percentage: Double {
-        models.map(\.percentage).min() ?? 0
+        // Filter out -1 (unknown/unavailable) percentages so an unknown model
+        // can't be selected as the lowest, mirroring MenuBarSettingsManager.aggregateModelPercentages.
+        let validPercentages = models.map(\.percentage).filter { $0 >= 0 }
+        return validPercentages.min() ?? -1
     }
 
     var formattedPercentage: String {
