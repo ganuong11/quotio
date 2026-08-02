@@ -302,7 +302,11 @@ actor QoderPATService {
     /// Replace `pt-…` / `jt-…` runs with a placeholder. Token characters are
     /// alphanumeric plus `-`/`_`; we stop at whitespace, quotes, or JSON
     /// punctuation so the substitution stays local to the token run.
-    private nonisolated static func redactTokens(in text: String) -> String {
+    ///
+    /// Internal so other Qoder services reuse it (the SSE reparser scrubs
+    /// upstream error snippets the same way). Hardens the AGENTS.md
+    /// "no secrets logged" rule against surprising upstream echoes.
+    nonisolated static func redactTokens(in text: String) -> String {
         let pattern = #"(pt|jt)-[A-Za-z0-9_-]+"#
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }
         let range = NSRange(text.startIndex..., in: text)
