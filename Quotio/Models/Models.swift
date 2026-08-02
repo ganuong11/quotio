@@ -27,7 +27,8 @@ nonisolated enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendab
     case glm = "glm"
     case warp = "warp"
     case clinePass = "clinepass"
-    
+    case qoder = "qoder"
+
     var id: String { rawValue }
     
     var displayName: String {
@@ -50,6 +51,7 @@ nonisolated enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendab
         case .glm: return "Z.ai"
         case .warp: return "Warp"
         case .clinePass: return "ClinePass"
+        case .qoder: return "Qoder"
         }
     }
     
@@ -73,6 +75,7 @@ nonisolated enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendab
         case .glm: return "brain"
         case .warp: return "terminal.fill"
         case .clinePass: return "cpu"
+        case .qoder: return "sparkles"
         }
     }
     
@@ -97,6 +100,7 @@ nonisolated enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendab
         case .glm: return "glm"
         case .warp: return "warp"
         case .clinePass: return "clinepass"
+        case .qoder: return "qoder"
         }
     }
     
@@ -120,6 +124,7 @@ nonisolated enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendab
         case .glm: return Color(hex: "3B82F6") ?? .blue
         case .warp: return Color(hex: "01E5FF") ?? .cyan
         case .clinePass: return Color(hex: "61A3FA") ?? .blue
+        case .qoder: return Color(hex: "4CAF50") ?? .green
         }
     }
     
@@ -141,6 +146,7 @@ nonisolated enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendab
         case .glm: return ""
         case .warp: return ""
         case .clinePass: return ""
+        case .qoder: return ""  // No management-API OAuth; onboarding is PAT paste (ADR 0006)
         }
     }
     
@@ -165,6 +171,7 @@ nonisolated enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendab
         case .glm: return "G"
         case .warp: return "W"
         case .clinePass: return "CL"
+        case .qoder: return "QD"
         }
     }
     
@@ -188,13 +195,14 @@ nonisolated enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendab
         case .glm: return "glm-menubar"
         case .warp: return "warp-menubar"
         case .clinePass: return "clinepass-menubar"
+        case .qoder: return "qoder-menubar"
         }
     }
     
     /// Whether this provider supports quota tracking in quota-only mode
     var supportsQuotaOnlyMode: Bool {
         switch self {
-        case .claude, .codex, .cursor, .factoryDroid, .gemini, .antigravity, .copilot, .devin, .grok, .openRouter, .trae, .glm, .warp, .kiro, .clinePass:
+        case .claude, .codex, .cursor, .factoryDroid, .gemini, .antigravity, .copilot, .devin, .grok, .openRouter, .trae, .glm, .warp, .kiro, .clinePass, .qoder:
             return true
         case .qwen, .iflow, .vertex:
             return false

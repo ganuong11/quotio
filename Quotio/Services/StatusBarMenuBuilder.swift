@@ -2541,6 +2541,7 @@ private extension AIProvider {
         case .glm: return "Z.ai"
         case .warp: return "Warp"
         case .clinePass: return "ClinePass"
+        case .qoder: return "Qoder"
         }
     }
 }

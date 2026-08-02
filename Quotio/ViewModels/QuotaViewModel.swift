@@ -1915,7 +1915,7 @@ final class QuotaViewModel {
             quota = await grokFetcher.fetchQuota(accountKey: account.accountKey)
         case .openRouter:
             quota = await openRouterFetcher.fetchQuota(accountKey: account.accountKey)
-        case .qwen, .iflow, .vertex:
+        case .qwen, .iflow, .vertex, .qoder:
             return
         }
 
@@ -2052,7 +2052,7 @@ final class QuotaViewModel {
             fresh = await coordinatedRefresh {
                 await fetcher.fetchAsProviderQuota()
             }
-        case .qwen, .iflow, .vertex:
+        case .qwen, .iflow, .vertex, .qoder:
             return
         }
 
@@ -2096,6 +2096,13 @@ final class QuotaViewModel {
     }
     
     func startOAuth(for provider: AIProvider, projectId: String? = nil, authMethod: AuthCommand? = nil, launchMode: OAuthLaunchMode = .manual) async {
+        if provider == .qoder {
+            // Qoder onboarding (PAT paste, ADR 0006) is not implemented yet.
+            // Render as a dead-but-stable tile per ADR 0007 Phase 0.
+            oauthState = OAuthState(provider: provider, status: .error, error: "qoder.onboarding.unavailable".localized())
+            return
+        }
+
         if provider == .grok {
             await startGrokLoopbackOAuth()
             return

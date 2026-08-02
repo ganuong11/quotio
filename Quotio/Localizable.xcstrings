@@ -11859,6 +11859,34 @@
         }
       }
     },
+    "qoder.onboarding.unavailable" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Qoder onboarding is not available yet."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "L'onboarding Qoder n'est pas encore disponible."
+          }
+        },
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Thiết lập Qoder chưa khả dụng."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Qoder 接入尚不可用。"
+          }
+        }
+      }
+    },
     "oauth.success" : {
       "extractionState" : "stale",
       "localizations" : {
