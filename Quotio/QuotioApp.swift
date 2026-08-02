@@ -492,23 +492,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AtomFeedUpdateService.shared.stopPolling()
 
         CLIProxyManager.terminateProxyOnShutdown()
-        
-        // Use semaphore to ensure tunnel cleanup completes before app terminates
-        // with a timeout to prevent hanging termination
-        let semaphore = DispatchSemaphore(value: 0)
-        let cleanupTimeout: DispatchTime = .now() + .milliseconds(1500)
-        
-        Task { @MainActor in
-            await TunnelManager.shared.stopTunnel()
-            semaphore.signal()
-        }
-        
-        let result = semaphore.wait(timeout: cleanupTimeout)
-        if result == .timedOut {
-            // Fallback: force kill orphan processes if stopTunnel timed out
-            TunnelManager.cleanupOrphans()
-            NSLog("[AppDelegate] Tunnel cleanup timed out, forced orphan cleanup")
-        }
+
+        // Clean up any running cloudflared tunnel synchronously.
+        //
+        // This must NOT await MainActor work while blocking the main thread: the
+        // previous implementation dispatched `stopTunnel()` to the MainActor and
+        // blocked the main thread on a semaphore waiting for it to signal. A
+        // MainActor task cannot run while the main thread is blocked, so the wait
+        // always hit its 1.5s timeout and added ~1.5s to every shutdown. The
+        // graceful `stopTunnel()` never actually ran here — the timeout fallback
+        // (`cleanupOrphans()`) is what tore the tunnel down. Call that directly:
+        // it is nonisolated + synchronous and performs the same process teardown.
+        TunnelManager.cleanupOrphans()
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
