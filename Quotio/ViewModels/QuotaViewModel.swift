@@ -1680,9 +1680,21 @@ final class QuotaViewModel {
             self.authFiles = newAuthFiles
 
             do {
-                self.usageStats = try await client.fetchUsageStats()
+                // CPA-sourced usage never includes Qoder traffic (Qoder
+                // bypasses CPA per ADR 0001), so merge in the Qoder slice
+                // captured by RequestTracker. Filter to the `"qoder"` key
+                // only — RequestTracker holds both CPA and Qoder traffic, so
+                // merging the whole stats would double-count CPA.
+                let cpa = try await client.fetchUsageStats()
+                let qoder = requestTracker.stats.byProvider["qoder"] ?? .zero
+                self.usageStats = cpa.merging(qoder)
             } catch APIError.httpError(404) {
-                self.usageStats = nil
+                // CPA doesn't expose /usage on this version. Still surface
+                // Qoder traffic (if any) so the dashboard isn't blank.
+                let qoder = requestTracker.stats.byProvider["qoder"] ?? .zero
+                self.usageStats = qoder.requestCount > 0
+                    ? UsageStats(usage: nil, failedRequests: nil).merging(qoder)
+                    : nil
                 Log.quota("Usage stats endpoint is not supported by this CLIProxyAPI version")
             }
 

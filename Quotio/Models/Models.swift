@@ -496,10 +496,64 @@ nonisolated struct APIKeysResponse: Codable, Sendable {
 nonisolated struct UsageStats: Codable, Sendable {
     let usage: UsageData?
     let failedRequests: Int?
-    
+
     enum CodingKeys: String, CodingKey {
         case usage
         case failedRequests = "failed_requests"
+    }
+
+    /// Merge a Quotio-side provider slice (e.g. Qoder traffic captured by
+    /// `RequestTracker`) into CPA-sourced usage (ADR 0005 §2).
+    ///
+    /// Qoder bypasses CPA entirely (ADR 0001), so its tokens exist in
+    /// `RequestTracker` but never in CPA's `/usage` response. Merging the
+    /// Qoder slice is therefore double-count-free by construction. Callers
+    /// MUST filter to the bypassing provider's slice before merging — passing
+    /// the whole `RequestStats` would re-add CPA traffic that `/usage`
+    /// already counts.
+    ///
+    /// When `qoder` has no traffic yet, this is a no-op passthrough.
+    func merging(_ qoder: ProviderStats) -> UsageStats {
+        // Use stored fields (not the `totalTokens` computed var) to stay
+        // nonisolated — the project defaults to @MainActor isolation, which
+        // a computed property would inherit and make unreachable here.
+        guard qoder.requestCount > 0
+            || (qoder.inputTokens + qoder.outputTokens) > 0 else { return self }
+
+        let base = usage ?? UsageData(
+            totalRequests: 0,
+            successCount: 0,
+            failureCount: 0,
+            totalTokens: 0,
+            inputTokens: 0,
+            outputTokens: 0
+        )
+
+        return UsageStats(
+            usage: base.adding(
+                requests: qoder.requestCount,
+                input: qoder.inputTokens,
+                output: qoder.outputTokens
+            ),
+            failedRequests: failedRequests
+        )
+    }
+}
+
+nonisolated extension UsageData {
+    /// Return a copy with the given counts added. Qoder requests are treated
+    /// as successful here: ProxyBridge only records a Qoder `RequestLog` after
+    /// the SSE stream completed with a 200 head (`ProxyBridge.swift` ~:1078),
+    /// so `statusCode == 200` and they should not inflate the failure count.
+    func adding(requests: Int, input: Int, output: Int) -> UsageData {
+        UsageData(
+            totalRequests: (totalRequests ?? 0) + requests,
+            successCount: (successCount ?? 0) + requests,
+            failureCount: failureCount,
+            totalTokens: (totalTokens ?? 0) + input + output,
+            inputTokens: (inputTokens ?? 0) + input,
+            outputTokens: (outputTokens ?? 0) + output
+        )
     }
 }
 

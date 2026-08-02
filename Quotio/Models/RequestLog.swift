@@ -224,10 +224,20 @@ struct ProviderStats: Codable, Sendable {
     let inputTokens: Int
     let outputTokens: Int
     let averageDurationMs: Int
-    
+
     var totalTokens: Int {
         inputTokens + outputTokens
     }
+
+    /// Empty slice used as a no-op fallback when a provider has no traffic
+    /// (e.g. merging Qoder usage when no Qoder request has run yet).
+    static let zero = ProviderStats(
+        provider: "",
+        requestCount: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        averageDurationMs: 0
+    )
 }
 
 /// Statistics for a specific model
