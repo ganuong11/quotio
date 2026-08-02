@@ -131,7 +131,14 @@ final class ProxyBridge {
     
     /// Callback for request metadata extraction (for RequestTracker)
     var onRequestCompleted: ((RequestMetadata) -> Void)?
-    
+
+    /// Qoder failover router (ADR 0001, ADR 0005 §3). When non-nil, requests
+    /// whose body `model:` starts with `qoder/` are routed here instead of the
+    /// CPA forwarding path. Set by `QuotaViewModel` at proxy start; nil in
+    /// tests and when the Qoder branch is not configured. The CPA forwarding
+    /// path (`forwardRequest`) is untouched regardless of this property.
+    var qoderRouter: QoderFailoverRouter?
+
     // MARK: - Request Metadata
 
     /// Metadata extracted from proxied requests
@@ -150,6 +157,62 @@ final class ProxyBridge {
         let fallbackAttempts: [FallbackAttempt]
         let fallbackStartedFromCache: Bool
         let responseSnippet: String?
+        // Token usage fields (ADR 0005 §2). Populated by the Qoder branch from
+        // the SSE final chunk's `usage` block; nil on the CPA path (CPA's own
+        // /usage endpoint is the source of truth for non-Qoder traffic, so
+        // leaving these nil avoids double-counting). OpenAI semantics: the
+        // Qoder `usage.prompt_tokens` already includes cached tokens — pass
+        // through unchanged (do NOT replicate pi's subtraction).
+        let inputTokens: Int?
+        let outputTokens: Int?
+        let cacheReadTokens: Int?
+        let cacheWriteTokens: Int?
+        let reasoningTokens: Int?
+
+        /// Convenience initializer for CPA-path callers that don't have token
+        /// data — keeps the existing call site in `recordCompletion` compiling
+        /// unchanged (all token fields default to nil).
+        init(
+            timestamp: Date,
+            method: String,
+            path: String,
+            provider: String?,
+            model: String?,
+            resolvedModel: String?,
+            resolvedProvider: String?,
+            statusCode: Int?,
+            durationMs: Int,
+            requestSize: Int,
+            responseSize: Int,
+            fallbackAttempts: [FallbackAttempt],
+            fallbackStartedFromCache: Bool,
+            responseSnippet: String?,
+            inputTokens: Int? = nil,
+            outputTokens: Int? = nil,
+            cacheReadTokens: Int? = nil,
+            cacheWriteTokens: Int? = nil,
+            reasoningTokens: Int? = nil
+        ) {
+            self.timestamp = timestamp
+            self.method = method
+            self.path = path
+            self.provider = provider
+            self.model = model
+            self.resolvedModel = resolvedModel
+            self.resolvedProvider = resolvedProvider
+            self.statusCode = statusCode
+            self.durationMs = durationMs
+            self.requestSize = requestSize
+            self.responseSize = responseSize
+            self.fallbackAttempts = fallbackAttempts
+            self.fallbackStartedFromCache = fallbackStartedFromCache
+            self.responseSnippet = responseSnippet
+            self.inputTokens = inputTokens
+            self.outputTokens = outputTokens
+            self.cacheReadTokens = cacheReadTokens
+            self.cacheWriteTokens = cacheWriteTokens
+            self.reasoningTokens = reasoningTokens
+        }
     }
     
     // MARK: - Initialization
@@ -431,9 +494,40 @@ final class ProxyBridge {
 
         let metadata = extractMetadata(method: method, path: path, body: body)
 
+        // Qoder branch (ADR 0001): a request whose body `model:` starts with
+        // `qoder/` is intercepted here and routed direct to api3.qoder.sh,
+        // bypassing CPA entirely. The CPA path (createFallbackContext +
+        // forwardRequest below) is untouched. The branch is gated on the
+        // `qoderRouter` being wired (QuotaViewModel sets it at proxy start); a
+        // qoder/ request with no router falls through to CPA, which will 404
+        // — preferable to silently swallowing it.
+        //
+        // The router read happens inside the MainActor Task below (alongside
+        // the rest of the request setup) because `qoderRouter` is MainActor-
+        // isolated and `processRequest` is `nonisolated`.
+        let isQoderBound = metadata.model?.hasPrefix("qoder/") == true
+
         // Check for virtual model and create fallback context
         Task { @MainActor [weak self] in
             guard let self = self else { return }
+
+            // Qoder branch: route to the failover router and return — the CPA
+            // path (fallback + forwardRequest) does not run for qoder/ models.
+            if isQoderBound, let router = self.qoderRouter {
+                self.forwardQoderRequest(
+                    router: router,
+                    method: method,
+                    path: path,
+                    headers: headers,
+                    body: body,
+                    originalConnection: connection,
+                    connectionId: connectionId,
+                    startTime: startTime,
+                    requestSize: data.count,
+                    requestModel: metadata.model ?? ""
+                )
+                return
+            }
 
             let fallbackContext = self.createFallbackContext(body: body)
             let resolvedBody: String
@@ -771,7 +865,252 @@ final class ProxyBridge {
 
         targetConnection.start(queue: .global(qos: .userInitiated))
     }
-    
+
+    // MARK: - Qoder Branch (ADR 0001)
+
+    /// Forward a `qoder/<id>` request through the failover router, bypassing
+    /// CPA. Mirrors the shape of `forwardRequest` (CPA path) but the upstream
+    /// is the router's HTTPS stream to api3.qoder.sh, not an NWConnection to
+    /// localhost. The agent-facing socket stays NWConnection (unchanged).
+    ///
+    /// Lifecycle:
+    ///   1. `router.openStream(...)` — all rotation/cooldown/re-exchange is
+    ///      decided here, *before* the first response byte. On throw, send a
+    ///      true HTTP error (400/503) to the agent — no stream has started.
+    ///   2. On opened stream: write `HTTP/1.1 200` + `text/event-stream`
+    ///      headers to the agent, then pump upstream bytes through a local
+    ///      `QoderSSEReparser` and forward each re-encoded OpenAI chunk to the
+    ///      agent socket.
+    ///   3. On stream end: call `finish()` on the reparser, capture usage,
+    ///      record metadata + `onRequestCompleted`.
+    ///   4. Mid-stream failure (transport drop, reparser gate): terminate —
+    ///      never rotate (the 200 SSE response already began; ADR 0006 §2).
+    ///
+    /// Cancellation: the pump Task is captured and cancelled from the agent
+    /// connection's stateUpdateHandler on disconnect, so a dropped agent
+    /// socket doesn't leak the URLSession byte stream.
+    private func forwardQoderRequest(
+        router: QoderFailoverRouter,
+        method: String,
+        path: String,
+        headers: [(String, String)],
+        body: String,
+        originalConnection: NWConnection,
+        connectionId: Int,
+        startTime: Date,
+        requestSize: Int,
+        requestModel: String
+    ) {
+        // Extract the proxy API key from `Authorization: Bearer <key>`. The
+        // router uses it for session-ID derivation (ADR 0005 §1) and validates
+        // it non-empty (CPA is bypassed for Qoder, so we own key validation).
+        let proxyAPIKey = headers.first(where: { $0.0.lowercased() == "authorization" })?
+            .1
+            .components(separatedBy: " ")
+            .dropFirst()
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespaces)
+        ?? ""
+
+        // Pass the raw body to the router. The `qoder/` routing prefix is
+        // stripped inside the router (ADR 0003 §1) before the body reaches the
+        // translator and the upstream gateway — ProxyBridge only does prefix
+        // *detection* (to decide routing), not stripping.
+        let bodyData = Data(body.utf8)
+
+        // The pump runs in a detached-from-actor Task so the `for await` on
+        // the upstream byte stream doesn't block the MainActor. Cancellation:
+        // when the proxy stops or the agent socket is cancelled, the active-
+        // counter handler in `handleNewConnection` runs `connection.cancel()`;
+        // our pump's next `sendToAgent` then fails, the `try` propagates, and
+        // `Task.checkCancellation()` breaks the byte iterator (URLSession
+        // tears its stream down when the iterator is dropped). No explicit
+        // stateUpdateHandler wiring needed here — NWConnection allows only one
+        // handler, already set in `handleNewConnection`.
+        Task { [weak self] in
+            guard let self = self else { return }
+
+            let opened: QoderOpenedStream
+            do {
+                opened = try await router.openStream(
+                    requestBody: bodyData,
+                    proxyAPIKey: proxyAPIKey
+                )
+            } catch let error as QoderFailoverError {
+                // Pre-stream failure → true HTTP error. Map by kind:
+                //  - requestRejected / missingProxyAPIKey → 400
+                //  - noAccountsAvailable → 503
+                let status: Int
+                if case .noAccountsAvailable = error {
+                    status = 503
+                } else {
+                    status = 400
+                }
+                self.sendError(to: originalConnection, statusCode: status, message: error.localizedDescription)
+                return
+            } catch {
+                // Any other unexpected error → 502 (we couldn't reach upstream).
+                self.sendError(to: originalConnection, statusCode: 502, message: "Qoder upstream error.")
+                return
+            }
+
+            // Confirmed 2xx: write the SSE response head, then pump.
+            let responseHead = "HTTP/1.1 200 OK\r\n" +
+                "Content-Type: text/event-stream\r\n" +
+                "Cache-Control: no-cache\r\n" +
+                "Connection: close\r\n" +
+                "\r\n"
+            guard let headData = responseHead.data(using: .utf8) else {
+                originalConnection.cancel()
+                return
+            }
+
+            // Send head, then begin streaming. Use a continuation-style send.
+            originalConnection.send(content: headData, completion: .contentProcessed { headError in
+                if headError != nil {
+                    originalConnection.cancel()
+                    return
+                }
+            })
+
+            // Pump upstream bytes → reparser → OpenAI chunks → agent socket.
+            // The gateway client owns the byte-stream plumbing and calls our
+            // `onChunk` per buffer; we feed each buffer through the reparser
+            // and forward the OpenAI-shape bytes to the agent socket.
+            // `QoderSSEReparser` is a per-request `var` (not Sendable by
+            // design — never shared). Owned inside this Task.
+            var reparser = QoderSSEReparser()
+            var totalResponseBytes = 0
+            var pumpFailed = false
+
+            // The onChunk closure captures mutable state via a final-class
+            // holder (closures can't capture `inout` reparser). The holder is
+            // local to this Task, never shared across isolation domains.
+            final class ReparserBox: @unchecked Sendable {
+                var reparser: QoderSSEReparser
+                var totalBytes: Int = 0
+                var failed: Bool = false
+                init(_ reparser: QoderSSEReparser) { self.reparser = reparser }
+            }
+            let box = ReparserBox(reparser)
+            // Track the agent connection so the closure can send to it.
+            let agentConn = originalConnection
+
+            do {
+                try await opened.pump { rawChunk in
+                    box.totalBytes += rawChunk.count
+                    let openAIChunks: Data
+                    do {
+                        openAIChunks = try box.reparser.feed(rawChunk)
+                    } catch {
+                        // Reparser gate (reasoning_content / tool_calls /
+                        // upstreamStatus). A mid-stream gate can't become a
+                        // true HTTP 400 — the 200 SSE head already shipped.
+                        // Terminate the agent stream; chunks already sent
+                        // stand. ADR 0004 documents this wire behavior.
+                        box.failed = true
+                        Log.proxy("Qoder stream gate tripped: \(error.localizedDescription)")
+                        return false  // stop pumping
+                    }
+                    if !openAIChunks.isEmpty {
+                        do {
+                            try await Self.sendToAgent(openAIChunks, on: agentConn)
+                        } catch {
+                            // Agent socket went away — stop pumping cleanly.
+                            return false
+                        }
+                    }
+                    return true
+                }
+            } catch {
+                if !Task.isCancelled {
+                    Log.proxy("Qoder upstream stream ended: \(error.localizedDescription)")
+                }
+            }
+
+            totalResponseBytes = box.totalBytes
+            pumpFailed = box.failed
+            reparser = box.reparser  // read back final state for usage capture
+
+            // Flush the reparser's terminal chunk ([DONE] + trailing usage).
+            if !pumpFailed {
+                let terminal: Data
+                do {
+                    terminal = try reparser.finish()
+                } catch {
+                    terminal = Data()
+                }
+                if !terminal.isEmpty {
+                    try? await Self.sendToAgent(terminal, on: originalConnection)
+                }
+            }
+
+            // Close the agent socket (Connection: close).
+            originalConnection.send(content: nil, isComplete: true, completion: .contentProcessed { _ in
+                originalConnection.cancel()
+            })
+
+            // Record completion metadata, including captured usage for the
+            // Quotio-side usage accumulator (ADR 0005 §2).
+            let usage = reparser.capturedUsage
+            let inputTokens = (usage?["prompt_tokens"] as? Int)
+                ?? (usage?["prompt_tokens"] as? NSNumber)?.intValue
+            let outputTokens = (usage?["completion_tokens"] as? Int)
+                ?? (usage?["completion_tokens"] as? NSNumber)?.intValue
+            // OpenAI semantics: prompt_tokens INCLUDES cached. Pass through.
+            // `completion_tokens_details` is a nested object that
+            // JSONSerialization reconstructs as NSDictionary (not `[String:
+            // Any]`), so coerce defensively — same NSNumber-fallback pattern as
+            // the sibling token reads.
+            let details = usage?["completion_tokens_details"] as? NSDictionary
+            let reasoningTokens = (details?["reasoning_tokens"] as? Int)
+                ?? (details?["reasoning_tokens"] as? NSNumber)?.intValue
+
+            let durationMs = Int(Date().timeIntervalSince(startTime) * 1000)
+            let finalMetadata = RequestMetadata(
+                timestamp: startTime,
+                method: method,
+                path: path,
+                provider: "qoder",
+                model: requestModel,
+                resolvedModel: requestModel,
+                resolvedProvider: "qoder",
+                statusCode: pumpFailed ? nil : 200,
+                durationMs: durationMs,
+                requestSize: requestSize,
+                responseSize: totalResponseBytes,
+                fallbackAttempts: [],
+                fallbackStartedFromCache: false,
+                responseSnippet: nil,
+                inputTokens: inputTokens,
+                outputTokens: outputTokens,
+                cacheReadTokens: nil,
+                cacheWriteTokens: nil,
+                reasoningTokens: reasoningTokens
+            )
+            self.onRequestCompleted?(finalMetadata)
+        }
+    }
+
+    /// Send one chunk to the agent NWConnection, awaiting the send completion
+    /// before returning so chunk order is preserved across `connection.send`
+    /// calls (NWConnection does not guarantee ordering across overlapping
+    /// sends). Throws on send error so the pump can terminate.
+    private nonisolated static func sendToAgent(
+        _ data: Data,
+        on connection: NWConnection
+    ) async throws {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            connection.send(content: data, completion: .contentProcessed { error in
+                if let error {
+                    cont.resume(throwing: error)
+                } else {
+                    cont.resume()
+                }
+            })
+        }
+    }
+
     // MARK: - Response Streaming (Iterative)
 
     private nonisolated func receiveResponse(

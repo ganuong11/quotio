@@ -99,7 +99,17 @@ nonisolated struct QoderSSEReparser {
     /// Stashed `usage` from the final chunk. Emitted in the last OpenAI chunk
     /// (OpenAI puts usage on the final chunk, optionally behind a
     /// `stream_options: {include_usage: true}` request — we always include it).
-    private var stashedUsage: [String: Any]?
+    ///
+    /// `internal` so ProxyBridge's Qoder pump (ticket #7) can read the final
+    /// usage after `finish()` and populate `RequestMetadata`'s token fields for
+    /// the Quotio-side usage accumulator (ADR 0005 §2). OpenAI semantics
+    /// (`prompt_tokens` INCLUDES `cached_tokens`) — pass through unchanged.
+    private(set) var stashedUsage: [String: Any]?
+
+    /// Read-only accessor for the captured usage block, used by ProxyBridge
+    /// (ticket #7) after the stream ends to populate `RequestMetadata` token
+    /// fields. Returns nil if the upstream stream never carried a usage chunk.
+    var capturedUsage: [String: Any]? { stashedUsage }
 
     /// Stashed `finish_reason`. Emitted on the final chunk before `[DONE]`.
     private var stashedFinishReason: String?

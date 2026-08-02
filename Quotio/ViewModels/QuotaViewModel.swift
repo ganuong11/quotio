@@ -1512,7 +1512,18 @@ final class QuotaViewModel {
             proxyManager.proxyBridge.onRequestCompleted = { [weak self] metadata in
                 self?.requestTracker.addRequest(from: metadata)
             }
-            
+
+            // Wire up the Qoder failover router (ADR 0001, ADR 0005 §3). When
+            // set, ProxyBridge routes `qoder/<id>` requests through this router
+            // direct to api3.qoder.sh, bypassing CPA. Non-Qoder traffic is
+            // unaffected. The router reuses MonitorCredentialVault for stored
+            // PATs and QoderPATService for one-shot re-exchange on 401.
+            proxyManager.proxyBridge.qoderRouter = QoderFailoverRouter(
+                vault: MonitorCredentialVault.shared,
+                patService: QoderPATService.shared,
+                gateway: QoderGatewayClient()
+            )
+
             try await proxyManager.start()
             setupAPIClient()
             startAutoRefresh()
@@ -1555,7 +1566,13 @@ final class QuotaViewModel {
         
         // Stop RequestTracker
         requestTracker.stop()
-        
+
+        // Tear down the Qoder router alongside the proxy — clears in-memory
+        // cooldown state and releases the URLSession. A nil router means
+        // ProxyBridge falls back to CPA for any in-flight qoder/ requests (the
+        // CPA path is the unchanged default).
+        proxyManager.proxyBridge.qoderRouter = nil
+
         proxyManager.stop()
         restartWarmupScheduler()
         

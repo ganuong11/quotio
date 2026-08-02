@@ -86,7 +86,7 @@ nonisolated enum QoderPATError: LocalizedError {
 
 /// Performs the Qoder PAT-exchange → userinfo sequence against the global
 /// `openapi.qoder.sh` endpoints. No CN endpoint is reachable from this service.
-actor QoderPATService {
+actor QoderPATService: QoderPATRefreshing {
     static let shared = QoderPATService()
 
     /// Global OpenAPI base. Hardcoded — never `openapi.qoder.com.cn`.
@@ -163,6 +163,59 @@ actor QoderPATService {
             extra: extra
         )
         return QoderPATResult(credential: credential, identity: identity)
+    }
+
+    /// Exchange-only refresh: re-runs the PAT → job-token exchange using the
+    /// PAT stored on `credential.extra["pat"]`, preserving the existing
+    /// `accountID`, `extra["machineID"]`, and identity. Used by the failover
+    /// router (ADR 0006 §2) on HTTP 401 — most 401s are job-token expiry
+    /// (~24h), not PAT revocation, so re-exchanging the same PAT and retrying
+    /// the same account is the right first move.
+    ///
+    /// **machineID-preserving by design.** This is the divergence from
+    /// `credentials(fromPat:)` flagged in ticket #7: that entry point mints a
+    /// fresh machine ID on every call (Phase 1's `QoderQuotaFetcher` uses it
+    /// and accepts the rotation — the machine ID is a client-identification
+    /// header, not session state). The router must NOT rotate the machine ID
+    /// per request, or every retried request presents as a new install to
+    /// Qoder. Here we keep the stored `extra["machineID"]` verbatim.
+    ///
+    /// `account` is the monitor metadata; its `id` matches the credential's
+    /// `accountID`. The router persists the refreshed credential via the
+    /// Vault's CAS path (`vault.save`), so concurrent refreshes from the quota
+    /// fetcher don't clobber this write.
+    func refreshCredential(
+        _ credential: MonitorOAuthCredential,
+        account: MonitorAccount
+    ) async throws -> MonitorOAuthCredential {
+        guard let pat = credential.extra["pat"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              pat.hasPrefix("pt-") else {
+            // Without a stored PAT we can't re-exchange. The router treats this
+            // as "PAT revoked" and disables the account.
+            throw QoderPATError.invalidPAT
+        }
+
+        let exchange = try await exchangeJobToken(pat: pat)
+        let bufferedExpiry = exchange.expiresAt.addingTimeInterval(-Self.expiryBuffer)
+
+        // Preserve accountID, machineID, and any identity-derived extra fields.
+        // Only the token + expiry + refresh token change.
+        var extra = credential.extra
+        extra["pat"] = pat
+        if !exchange.jobRefreshToken.isEmpty {
+            extra["jobRefreshToken"] = exchange.jobRefreshToken
+        }
+        // `machineID` is intentionally left untouched — see method doc.
+
+        return MonitorOAuthCredential(
+            accessToken: exchange.jobToken,
+            refreshToken: nil,
+            idToken: credential.idToken,
+            accountID: credential.accountID,
+            expiresAt: bufferedExpiry,
+            extra: extra
+        )
     }
 
     // MARK: - Exchange

@@ -97,6 +97,11 @@ final class RequestTracker {
     /// Add a request from ProxyBridge callback
     func addRequest(from metadata: ProxyBridge.RequestMetadata) {
         let attempts = metadata.fallbackAttempts.isEmpty ? nil : metadata.fallbackAttempts
+        // Token fields (ADR 0005 §2): the Qoder branch populates these from the
+        // SSE final chunk's usage block; the CPA path leaves them nil (CPA's
+        // own /usage endpoint is the source of truth for non-Qoder traffic).
+        // Qoder traffic never flows through CPA, so populating RequestLog here
+        // is double-count-free by construction.
         let entry = RequestLog(
             timestamp: metadata.timestamp,
             method: metadata.method,
@@ -105,8 +110,8 @@ final class RequestTracker {
             model: metadata.model,
             resolvedModel: metadata.resolvedModel,
             resolvedProvider: metadata.resolvedProvider,
-            inputTokens: nil,
-            outputTokens: nil,
+            inputTokens: metadata.inputTokens,
+            outputTokens: metadata.outputTokens,
             durationMs: metadata.durationMs,
             statusCode: metadata.statusCode,
             requestSize: metadata.requestSize,
