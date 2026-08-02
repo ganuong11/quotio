@@ -57,8 +57,9 @@ final class QoderChatTranslatorTests: XCTestCase {
     /// Helper: build a QoderMessage the way the translator does. content nil
     /// for "no content" cases mirrors pi's `if (msg.content)` JS-truthiness
     /// skip — both empty-string content and nil content must hash the same.
+    /// Phase 2b: content wraps in `.text` (the golden vectors are text-only).
     private func qmsg(_ role: String, _ content: String?) -> QoderMessage {
-        QoderMessage(role: role, content: content, toolCalls: [], toolCallID: nil)
+        QoderMessage(role: role, content: content.map { .text($0) }, toolCalls: [], toolCallID: nil)
     }
 
     func testStableChatRecordIDMatchesReference() {
@@ -109,13 +110,13 @@ final class QoderChatTranslatorTests: XCTestCase {
         let out = QoderChatTranslator.transformMessagesForQoder(msgs)
         XCTAssertEqual(out.count, 2)
         XCTAssertEqual(out[0].role, "system")
-        XCTAssertEqual(out[0].content, "Be terse.")
+        XCTAssertEqual(out[0].content, .text("Be terse."))
         XCTAssertEqual(out[1].role, "user")
-        XCTAssertEqual(out[1].content, "Hi")
+        XCTAssertEqual(out[1].content, .text("Hi"))
     }
 
-    /// Multipart text content flattens to plain text. (Image parts are
-    /// rejected at the gate before transform runs.)
+    /// Multipart text-only content flattens to plain text (no image part →
+    /// pi's fast path, transform.ts ~102-104).
     func testTransformFlattensMultipartText() {
         let msgs = [
             OpenAIChatMessage(
@@ -127,13 +128,12 @@ final class QoderChatTranslatorTests: XCTestCase {
         ]
         let out = QoderChatTranslator.transformMessagesForQoder(msgs)
         XCTAssertEqual(out.count, 1)
-        XCTAssertEqual(out[0].content, "a b c")
+        XCTAssertEqual(out[0].content, .text("a b c"))
     }
 
     /// Assistant with tool calls but no text gets a single-space placeholder
     /// (Qoder gateway otherwise drops the message and orphans the tool_result).
-    /// Tool calls are unreachable on the text path (gate 1), but the branch is
-    /// asserted here for ticket #8 correctness.
+    /// Phase 2b: assistant tool calls now reach this branch (gate 1 lifted).
     func testTransformAssistantToolCallPlaceholder() {
         let msgs = [
             OpenAIChatMessage(
@@ -144,7 +144,7 @@ final class QoderChatTranslatorTests: XCTestCase {
             ),
         ]
         let out = QoderChatTranslator.transformMessagesForQoder(msgs)
-        XCTAssertEqual(out[0].content, " ")
+        XCTAssertEqual(out[0].content, .text(" "))
         XCTAssertEqual(out[0].toolCalls.count, 1)
         XCTAssertEqual(out[0].toolCalls[0].function.name, "f")
     }
@@ -156,7 +156,7 @@ final class QoderChatTranslatorTests: XCTestCase {
         ]
         let out = QoderChatTranslator.transformMessagesForQoder(msgs)
         XCTAssertEqual(out[0].role, "tool")
-        XCTAssertEqual(out[0].content, "result")
+        XCTAssertEqual(out[0].content, .text("result"))
         XCTAssertEqual(out[0].toolCallID, "tc1")
     }
 
@@ -171,7 +171,7 @@ final class QoderChatTranslatorTests: XCTestCase {
         XCTAssertEqual(out[0].role, "user")
     }
 
-    // MARK: - transformTools (ported but unused on text path)
+    // MARK: - transformTools (Phase 2b: now wired into the envelope)
 
     /// transformTools round-trips a JSON-Schema parameter blob faithfully.
     func testTransformToolsRoundTripsParameters() throws {
@@ -197,11 +197,38 @@ final class QoderChatTranslatorTests: XCTestCase {
         XCTAssertEqual(redecoded?["required"] as? [String], ["x"])
     }
 
-    // MARK: - Fail-fast gates
+    // MARK: - Tools wiring (Phase 2b — gates lifted)
 
-    /// Non-empty tools → toolsNotSupported (Phase 2a text path).
-    func testGateRejectsTools() {
+    /// A tools-bearing request translates successfully and the envelope carries
+    /// the transformed tools (previously Phase 2a rejected this with a 400).
+    func testToolsTranslateIntoEnvelope() throws {
         let request = OpenAIChatRequest(
+            model: "m",
+            messages: [OpenAIChatMessage(role: "user", content: .text("hi"), toolCalls: nil, toolCallID: nil)],
+            tools: [OpenAITool(function: OpenAIToolDefinition(
+                name: "f", description: "do f", parameters: Data("{}".utf8)
+            ))],
+            maxTokens: nil
+        )
+        let result = try translate(request)
+        let env = try JSONSerialization.jsonObject(with: result.envelopeJSON) as? [String: Any]
+        let tools = env?["tools"] as? [[String: Any]]
+        XCTAssertEqual(tools?.count, 1)
+        XCTAssertEqual(tools?[0]["type"] as? String, "function")
+        XCTAssertEqual((tools?[0]["function"] as? [String: Any])?["name"] as? String, "f")
+    }
+
+    /// The tool surface feeds the recordID hash — adding a tool changes the
+    /// recordID (cache affinity includes tools, stream.ts ~173). Previously
+    /// Phase 2a always hashed toolsJSON="" so tool-bearing requests shared a
+    /// recordID with tool-free requests, breaking cache affinity.
+    func testRecordIDChangesWithTools() throws {
+        let noTools = OpenAIChatRequest(
+            model: "m",
+            messages: [OpenAIChatMessage(role: "user", content: .text("hi"), toolCalls: nil, toolCallID: nil)],
+            tools: nil, maxTokens: nil
+        )
+        let withTools = OpenAIChatRequest(
             model: "m",
             messages: [OpenAIChatMessage(role: "user", content: .text("hi"), toolCalls: nil, toolCallID: nil)],
             tools: [OpenAITool(function: OpenAIToolDefinition(
@@ -209,26 +236,33 @@ final class QoderChatTranslatorTests: XCTestCase {
             ))],
             maxTokens: nil
         )
-        XCTAssertThrowsError(try translate(request)) { error in
-            guard case .toolsNotSupported = error as? QoderTranslatorError else {
-                return XCTFail("expected .toolsNotSupported, got \(error)")
-            }
-        }
+        let r1 = try translate(noTools)
+        let r2 = try translate(withTools)
+        XCTAssertNotEqual(r1.chatRecordID, r2.chatRecordID,
+            "recordID must change when tools are added (cache affinity includes tools)")
     }
 
-    /// Empty tools array is allowed (treated as "no tools").
-    func testGateAllowsEmptyTools() throws {
+    /// Empty tools array is allowed (treated as "no tools" — envelope tools is
+    /// empty, recordID matches a no-tools request).
+    func testEmptyToolsAllowed() throws {
         let request = OpenAIChatRequest(
             model: "m",
             messages: [OpenAIChatMessage(role: "user", content: .text("hi"), toolCalls: nil, toolCallID: nil)],
             tools: [],
             maxTokens: nil
         )
-        _ = try translate(request)
+        let result = try translate(request)
+        let env = try JSONSerialization.jsonObject(with: result.envelopeJSON) as? [String: Any]
+        XCTAssertEqual((env?["tools"] as? [Any])?.count, 0)
     }
 
-    /// Image content part in any message → imageContentNotSupported.
-    func testGateRejectsImageContent() {
+    // MARK: - Image content parts (Phase 2b — gate lifted)
+
+    /// A user message with an image part produces array-of-parts content in
+    /// the envelope: a text part and an `image_url` part carrying the verbatim
+    /// URL (Phase 2b: OpenAI input already carries a ready URL — we don't
+    /// reconstruct pi's mimeType/base64 byte model).
+    func testImagePartBecomesImageURLPart() throws {
         let request = OpenAIChatRequest(
             model: "m",
             messages: [OpenAIChatMessage(
@@ -243,11 +277,38 @@ final class QoderChatTranslatorTests: XCTestCase {
             tools: nil,
             maxTokens: nil
         )
-        XCTAssertThrowsError(try translate(request)) { error in
-            guard case .imageContentNotSupported = error as? QoderTranslatorError else {
-                return XCTFail("expected .imageContentNotSupported, got \(error)")
-            }
-        }
+        let result = try translate(request)
+        let env = try JSONSerialization.jsonObject(with: result.envelopeJSON) as? [String: Any]
+        let messages = env?["messages"] as? [[String: Any]]
+        let content = messages?[0]["content"] as? [[String: Any]]
+        XCTAssertEqual(content?.count, 2)
+        XCTAssertEqual(content?[0]["type"] as? String, "text")
+        XCTAssertEqual(content?[0]["text"] as? String, "look")
+        XCTAssertEqual(content?[1]["type"] as? String, "image_url")
+        let imageURL = content?[1]["image_url"] as? [String: Any]
+        XCTAssertEqual(imageURL?["url"] as? String, "https://example.com/x.png")
+    }
+
+    /// A `data:` URL image part passes through verbatim (the common case for
+    /// CLI agents embedding screenshots as base64 data URLs).
+    func testImageDataURLPassesThrough() throws {
+        let dataURL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+        let request = OpenAIChatRequest(
+            model: "m",
+            messages: [OpenAIChatMessage(
+                role: "user",
+                content: .parts([.imageURL(URL(string: dataURL)!)]),
+                toolCalls: nil,
+                toolCallID: nil
+            )],
+            tools: nil,
+            maxTokens: nil
+        )
+        let result = try translate(request)
+        let env = try JSONSerialization.jsonObject(with: result.envelopeJSON) as? [String: Any]
+        let content = (env?["messages"] as? [[String: Any]])?[0]["content"] as? [[String: Any]]
+        let imageURL = content?[0]["image_url"] as? [String: Any]
+        XCTAssertEqual(imageURL?["url"] as? String, dataURL)
     }
 
     // MARK: - Envelope structure + determinism (pinned options)

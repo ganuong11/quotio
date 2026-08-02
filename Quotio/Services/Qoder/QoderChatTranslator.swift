@@ -2,11 +2,12 @@
 //  QoderChatTranslator.swift
 //  Quotio
 //
-//  Phase 2a (ADR 0001, ADR 0004, ADR 0005): builds Qoder's bespoke chat
-//  request envelope from an OpenAI-shape request body. Pure value type — no
-//  I/O, no actor state, no globals. Text path only: tools and image content
-//  parts fail fast at this boundary (ticket #8 lifts both gates). The
-//  reasoning-bearing-response gate lives in the SSE reparser.
+//  Phase 2a → 2b (ADR 0001, ADR 0004, ADR 0005, ADR 0007 §3): builds Qoder's
+//  bespoke chat request envelope from an OpenAI-shape request body. Pure value
+//  type — no I/O, no actor state, no globals. Phase 2b lifts the tools and
+//  image fail-fast gates: tools translate into the envelope `tools` field
+//  (and feed the recordID hash), and image content parts become `image_url`
+//  parts. The reasoning-bearing-response handling lives in the SSE reparser.
 //
 //  Reference: pi-provider-qoder/src/stream.ts lines ~30-230 (envelope builder,
 //  stableHash, stableChatRecordID) and src/transform.ts (transformMessagesForQoder,
@@ -111,17 +112,32 @@ nonisolated struct QoderModelConfig: Sendable, Equatable {
 
 // MARK: - Normalized Qoder-shape message (translator → envelope builder)
 
+/// Content of a normalized Qoder message. Phase 2b: user messages may carry
+/// image parts (Qoder's gateway accepts OpenAI-shape `image_url` parts, per
+/// transform.ts ~30-105); all other roles use plain text. Nil for assistant
+/// turns carrying only tool calls.
+nonisolated enum QoderMessageContent: Sendable, Equatable {
+    case text(String)
+    case parts([QoderContentPart])
+}
+
+/// One part of a multi-part user message. Phase 2b mirrors pi's QoderContent
+/// union (transform.ts ~29-31): text or image_url. The image URL is passed
+/// through verbatim — OpenAI input already carries a ready URL (often a
+/// `data:` URL), so we don't reconstruct pi's mimeType/base64 byte model.
+nonisolated enum QoderContentPart: Sendable, Equatable {
+    case text(String)
+    case imageURL(String)
+}
+
 /// Normalized Qoder-shape message produced by `transformMessagesForQoder`.
-/// Content is a plain string on the text path: the image gate rejects
-/// multi-part content, and the tools gate rejects tool calls, so the
-/// array-of-parts and tool-call shapes from pi's transform.ts are unreachable
-/// in Phase 2a (ticket #8 lifts them). The fields are retained and serialized
-/// faithfully so the envelope is correct once #8 opens the gates.
+/// The array-of-parts shape is reachable for user messages carrying image
+/// parts (Phase 2b); tool calls ride assistant turns (Phase 2b).
 nonisolated struct QoderMessage: Sendable, Equatable {
     let role: String
-    /// Plain-text content; nil for assistant turns carrying only tool calls.
-    let content: String?
-    /// Assistant tool calls (OpenAI shape). Empty in Phase 2a (tools gate).
+    /// Plain text, array of parts, or nil (assistant with only tool calls).
+    let content: QoderMessageContent?
+    /// Assistant tool calls (OpenAI shape).
     let toolCalls: [QoderToolCall]
     /// `role: "tool"` only. Carries the originating tool_call_id.
     let toolCallID: String?
@@ -171,26 +187,18 @@ nonisolated struct QoderChatTranslatorOptions: Sendable {
     static let deferringToRandom = QoderChatTranslatorOptions()
 }
 
-/// Fail-fast gate errors and parse errors. ProxyBridge (#7) maps each to an
-/// HTTP 400 response body for the CLI agent. Tokens/secrets are never embedded.
+/// Parse errors. ProxyBridge (#7) maps each to an HTTP 400 response body for
+/// the CLI agent. Tokens/secrets are never embedded. (Phase 2a's tools/image
+/// fail-fast gates were lifted in Phase 2b — tools and image content parts
+/// now translate into the Qoder envelope per ADR 0007 §3.)
 nonisolated enum QoderTranslatorError: Error, LocalizedError {
     /// Request body was not valid OpenAI-shape JSON. Detail is structural only.
     case malformedRequest(String)
-    /// Non-empty `tools` array — Phase 2a text path does not support tools
-    /// (ticket #8 lifts this gate).
-    case toolsNotSupported
-    /// A user message carried `image_url` content parts — Phase 2a text path
-    /// does not support images (ticket #8).
-    case imageContentNotSupported
 
     var errorDescription: String? {
         switch self {
         case .malformedRequest(let detail):
             return "Qoder translator: malformed request (\(detail))."
-        case .toolsNotSupported:
-            return "Qoder translator: tools are not supported on the text path (Phase 2b)."
-        case .imageContentNotSupported:
-            return "Qoder translator: image content parts are not supported on the text path (Phase 2b)."
         }
     }
 }
@@ -243,17 +251,8 @@ nonisolated enum QoderChatTranslator {
         modelConfig: QoderModelConfig,
         options: QoderChatTranslatorOptions = .deferringToRandom
     ) throws -> QoderTranslationResult {
-        // Gate 1: tools. Phase 2a is text-only.
-        if let tools = request.tools, !tools.isEmpty {
-            throw QoderTranslatorError.toolsNotSupported
-        }
-        // Gate 2: image content parts. Walk every message's content.
-        for msg in request.messages {
-            if case .parts(let parts) = msg.content,
-               parts.contains(where: { if case .imageURL = $0 { return true } else { return false } }) {
-                throw QoderTranslatorError.imageContentNotSupported
-            }
-        }
+        // Phase 2b lifted the tools and image fail-fast gates (ADR 0007 §3).
+        // Tools and image parts now translate into the Qoder envelope.
 
         // Model key: prefer the resolved config; fall back to the request model
         // when the catalog had no entry (defaultUnknown carries an empty key).
@@ -262,13 +261,21 @@ nonisolated enum QoderChatTranslator {
         let maxTokens = resolveMaxTokens(requestMax: request.maxTokens, modelCap: modelConfig.maxOutputTokens)
         let normalizedMessages = transformMessagesForQoder(request.messages)
 
-        // Content-derived record IDs (deterministic). Tools JSON is always ""
-        // here (gate 1), so the tools branch of the hash is a no-op — but the
-        // signature accepts it for parity with pi and for ticket #8.
+        // Transform tools once: used both for the recordID hash (prompt-cache
+        // affinity includes the tool surface — pi hashes `JSON.stringify(tools)`,
+        // stream.ts ~173) and for the envelope's `tools` field. Empty when the
+        // request carried no tools.
+        let transformedTools = transformTools(request.tools ?? [])
+        let toolsJSON = transformedTools.isEmpty ? "" : canonicalToolsJSON(transformedTools)
+
+        // Content-derived record IDs (deterministic). toolsJSON is "" on the
+        // text path (no tools) so the tools branch of the hash is a no-op;
+        // tool-bearing requests hash the canonical tools JSON for cache
+        // affinity (Phase 2b fix — previously always "" broke affinity).
         let recordID = stableChatRecordID(
             model: modelKey,
             messages: normalizedMessages,
-            toolsJSON: "",
+            toolsJSON: toolsJSON,
             maxTokens: maxTokens
         )
 
@@ -294,6 +301,7 @@ nonisolated enum QoderChatTranslator {
             modelConfig: modelConfig,
             maxTokens: maxTokens,
             messages: normalizedMessages,
+            tools: transformedTools,
             lastUserText: lastUserText,
             businessID: businessID,
             businessBeginAtMS: businessBeginAt
@@ -359,9 +367,22 @@ nonisolated enum QoderChatTranslator {
                 hash.update(data: Data([0]))
                 hash.update(data: Data(msg.role.utf8))
             }
-            if let content = msg.content, !content.isEmpty {
-                hash.update(data: Data([0]))
-                hash.update(data: Data(content.utf8))
+            // Pi's JS-truthiness: hash content if non-empty. For text, hash the
+            // string; for parts (image-bearing user messages), hash the
+            // canonical JSON of the parts array (mirrors pi's
+            // `JSON.stringify(msg.content)` for object content, stream.ts ~65).
+            if let content = msg.content {
+                let contentHashString: String
+                switch content {
+                case .text(let s):
+                    contentHashString = s
+                case .parts(let parts):
+                    contentHashString = canonicalPartsJSON(parts)
+                }
+                if !contentHashString.isEmpty {
+                    hash.update(data: Data([0]))
+                    hash.update(data: Data(contentHashString.utf8))
+                }
             }
         }
         if !toolsJSON.isEmpty {
@@ -391,18 +412,26 @@ nonisolated enum QoderChatTranslator {
     ///     input carries system as a message, so we add a branch that passes it
     ///     through — Qoder honors role:system messages (the top-level `system:`
     ///     field is what the server ignores, confirmed in stream.ts).
-    ///   - pi maps image content to `image_url` parts; the translator's image
-    ///     gate rejects images before this runs, so parts are flattened to text
-    ///     here and the array-of-parts output shape is never produced in Phase 2a.
+    ///   - pi maps image content to `image_url` data-URL parts from an internal
+    ///     base64 byte model; OpenAI input already carries a ready `image_url`
+    ///     URL (often a `data:` URL), so Phase 2b passes the URL string through
+    ///     verbatim instead of reconstructing bytes (advisor deviation, ADR 0004).
     static func transformMessagesForQoder(_ messages: [OpenAIChatMessage]) -> [QoderMessage] {
         var out: [QoderMessage] = []
         out.reserveCapacity(messages.count)
         for msg in messages {
             switch msg.role {
-            case "system", "user":
+            case "system":
                 out.append(QoderMessage(
                     role: msg.role,
-                    content: contentText(msg.content),
+                    content: contentText(msg.content).map { .text($0) },
+                    toolCalls: [],
+                    toolCallID: nil
+                ))
+            case "user":
+                out.append(QoderMessage(
+                    role: msg.role,
+                    content: transformUserContent(msg.content),
                     toolCalls: [],
                     toolCallID: nil
                 ))
@@ -419,13 +448,12 @@ nonisolated enum QoderChatTranslator {
                 // null, orphaning the following tool_result and making dmodel/
                 // ultimate upstreams reject the request. Pi injects a single-
                 // space placeholder when an assistant turn has tool calls but
-                // no text. (Tool calls are unreachable in Phase 2a — gate 1 —
-                // but the branch is correct for ticket #8.)
-                let resolved: String?
+                // no text (transform.ts ~138-146).
+                let resolved: QoderMessageContent?
                 if !text.isEmpty {
-                    resolved = text
+                    resolved = .text(text)
                 } else if !toolCalls.isEmpty {
-                    resolved = " "
+                    resolved = .text(" ")
                 } else {
                     resolved = nil
                 }
@@ -438,7 +466,7 @@ nonisolated enum QoderChatTranslator {
             case "tool":
                 out.append(QoderMessage(
                     role: "tool",
-                    content: contentText(msg.content),
+                    content: contentText(msg.content).map { .text($0) },
                     toolCalls: [],
                     toolCallID: msg.toolCallID
                 ))
@@ -451,11 +479,10 @@ nonisolated enum QoderChatTranslator {
         return out
     }
 
-    /// Port of pi's `transformTools` (transform.ts). UNUSED on the text path —
-    /// the tools gate rejects non-empty tools before this runs. Ported for
-    /// parity and so ticket #8 can lift the gate without re-implementing.
-    /// Tool parameters round-trip through JSONSerialization so arbitrary
-    /// JSON-Schema is preserved byte-faithfully.
+    /// Port of pi's `transformTools` (transform.ts). Phase 2b: the result feeds
+    /// both the envelope `tools` field and the recordID hash (via
+    /// `canonicalToolsJSON`). Tool parameters round-trip through
+    /// JSONSerialization so arbitrary JSON-Schema is preserved byte-faithfully.
     static func transformTools(_ tools: [OpenAITool]) -> [[String: Any]] {
         tools.map { tool in
             var function: [String: Any] = ["name": tool.function.name]
@@ -476,6 +503,23 @@ nonisolated enum QoderChatTranslator {
         }
     }
 
+    /// Canonical JSON string of the transformed tools, for the recordID hash.
+    /// Pi hashes `JSON.stringify(toolsRaw)` (stream.ts ~173) so prompt-cache
+    /// affinity includes the tool surface. JS `JSON.stringify` is not key-order
+    /// stable across implementations, so we serialize with `.sortedKeys` for
+    /// determinism — the same logical tool set always hashes the same, which is
+    /// what cache affinity needs. Cross-implementation parity with pi is not
+    /// required (Quotio's recordID is Quotio-internal, never compared to pi's).
+    static func canonicalToolsJSON(_ tools: [[String: Any]]) -> String {
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: tools,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        ), let str = String(data: data, encoding: .utf8) else {
+            return ""
+        }
+        return str
+    }
+
     // MARK: - Envelope builder
 
     /// Assemble the Qoder request envelope as a JSON object tree. Field set
@@ -491,6 +535,7 @@ nonisolated enum QoderChatTranslator {
         modelConfig: QoderModelConfig,
         maxTokens: Int,
         messages: [QoderMessage],
+        tools: [[String: Any]],
         lastUserText: String,
         businessID: String,
         businessBeginAtMS: Int
@@ -520,7 +565,9 @@ nonisolated enum QoderChatTranslator {
             // leading role:system message in `messages` instead.
             "system": "",
             "messages": messagesJSON,
-            "tools": [],   // gate 1 blocks non-empty tools in Phase 2a
+            // Phase 2b: transformed tools from the request (empty when no
+            // tools). stream.ts ~198: `tools: toolsRaw || []`.
+            "tools": tools,
             "parameters": ["max_tokens": maxTokens],
             "chat_context": [
                 "chatPrompt": "",
@@ -555,14 +602,18 @@ nonisolated enum QoderChatTranslator {
     }
 
     /// Serialize one normalized Qoder message to its JSON-object form.
-    /// Content nil → JSON null (matches pi). Tool calls / tool_call_id are
-    /// emitted only when present (always empty on the text path).
+    /// Content nil → JSON null (matches pi). Text → string. Parts → array of
+    /// `{"type":"text"|"image_url", ...}` objects (Phase 2b). Tool calls /
+    /// tool_call_id are emitted only when present.
     private static func messageToJSONObject(_ msg: QoderMessage) -> [String: Any] {
         var dict: [String: Any] = ["role": msg.role]
-        if let content = msg.content {
-            dict["content"] = content
-        } else {
+        switch msg.content {
+        case .none:
             dict["content"] = NSNull()
+        case .text(let s):
+            dict["content"] = s
+        case .parts(let parts):
+            dict["content"] = parts.map(partToJSONObject)
         }
         if !msg.toolCalls.isEmpty {
             dict["tool_calls"] = msg.toolCalls.map { tc in
@@ -744,29 +795,103 @@ nonisolated enum QoderChatTranslator {
 
     /// Last user message's text — feeds `chat_context.text` / `originalContent`
     /// and `business.name`. Pi walks normalized messages backwards for the
-    /// first role:user.
+    /// first role:user. For image-bearing parts content, concatenates the text
+    /// parts (image URLs are not text-summarizable; pi does the same in
+    /// stream.ts ~143-153 for `lastUserText`).
     private static func lastUserMessageText(in messages: [QoderMessage]) -> String {
         for msg in messages.reversed() where msg.role == "user" {
-            return msg.content ?? ""
+            switch msg.content {
+            case .text(let s):
+                return s
+            case .parts(let parts):
+                return parts.compactMap { part -> String? in
+                    if case .text(let t) = part { return t }
+                    return nil
+                }.joined()
+            case .none:
+                return ""
+            }
         }
         return ""
     }
 
-    /// Flatten an OpenAIContent to plain text. Image parts drop to "" — the
-    /// image gate rejects them before this runs, so this is text-only in 2a.
+    /// Transform a user message's OpenAI content into Qoder-shape content.
+    /// Phase 2b (transform.ts ~78-109): if the content carries any image part,
+    /// emit array-of-parts (text parts + image_url parts); otherwise flatten to
+    /// a plain text string (the gateway's common case). The image URL is passed
+    /// through verbatim — OpenAI input already carries a ready URL.
+    private static func transformUserContent(_ content: OpenAIContent?) -> QoderMessageContent? {
+        guard let content else { return nil }
+        switch content {
+        case .text(let s):
+            return .text(s)
+        case .parts(let parts):
+            // If no image part is present, flatten to text (pi's fast path,
+            // transform.ts ~102-104) — keeps the common text-only case a string.
+            let hasImage = parts.contains { if case .imageURL = $0 { return true } else { return false } }
+            if !hasImage {
+                let flat = parts.compactMap { part -> String? in
+                    if case .text(let t) = part { return t }
+                    return nil
+                }.joined()
+                return .text(flat)
+            }
+            // Preserve part order: text parts stay text, image parts become
+            // image_url entries carrying the verbatim URL string.
+            let qoderParts: [QoderContentPart] = parts.map { part in
+                switch part {
+                case .text(let t):
+                    return .text(t)
+                case .imageURL(let url):
+                    return .imageURL(url.absoluteString)
+                }
+            }
+            return .parts(qoderParts)
+        }
+    }
+
+    /// Flatten an OpenAIContent to plain text, dropping image parts to "".
+    /// Phase 2b: used for system/assistant/tool content (never image-bearing)
+    /// and for `lastUserMessageText`'s text-only summary. User image content
+    /// is handled separately by `transformUserContent`.
     private static func contentText(_ content: OpenAIContent?) -> String? {
         guard let content else { return nil }
         switch content {
         case .text(let s):
             return s
         case .parts(let parts):
-            // Gate 2 rejects image parts; if it somehow slipped through, drop
-            // them here rather than emit image_url (Phase 2b will handle it).
             return parts.compactMap { part -> String? in
                 if case .text(let t) = part { return t }
                 return nil
             }.joined()
         }
+    }
+
+    /// Serialize one `QoderContentPart` to its OpenAI-shape JSON object: text
+    /// → `{"type":"text","text":...}`, image → `{"type":"image_url","image_url":
+    /// {"url":...}}`. Shared by `messageToJSONObject` (envelope) and
+    /// `canonicalPartsJSON` (recordID hash) so the two can't drift.
+    private static func partToJSONObject(_ part: QoderContentPart) -> [String: Any] {
+        switch part {
+        case .text(let t):
+            return ["type": "text", "text": t]
+        case .imageURL(let url):
+            return ["type": "image_url", "image_url": ["url": url]] as [String: Any]
+        }
+    }
+
+    /// Canonical JSON string of an array of `QoderContentPart`, for the
+    /// recordID hash (mirrors pi's `JSON.stringify(msg.content)` for object
+    /// content). Sorted keys for determinism — same parts → same hash.
+    private static func canonicalPartsJSON(_ parts: [QoderContentPart]) -> String {
+        let arr = parts.map(partToJSONObject)
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: arr,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        ), let str = String(data: data, encoding: .utf8) else {
+            return ""
+        }
+        return str
     }
 
     /// `business.begin_at` — ms since epoch, matching pi's `Date.now()`.

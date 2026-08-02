@@ -194,35 +194,237 @@ final class QoderSSEReparserTests: XCTestCase {
         }
     }
 
-    // MARK: - Reasoning / tool_calls text-path gates
+    // MARK: - Reasoning content (Phase 2b)
 
-    /// `delta.reasoning_content` throws — Phase 2b (ticket #8) handles it.
-    func testReasoningContentThrows() {
-        var reparser = QoderSSEReparser()
+    /// `delta.reasoning_content` is stripped of thinking-tag artifacts then
+    /// re-emitted as OpenAI `delta.reasoning_content`.
+    func testReasoningContentEmitted() throws {
+        var reparser = QoderSSEReparser(created: 1)
         let line = qoderLine([
             "id": "x", "model": "m",
             "choices": [["delta": ["reasoning_content": "thinking..."]]],
         ])
-        XCTAssertThrowsError(try reparser.feed(Data(line.utf8))) { error in
-            guard case .reasoningContentNotSupported = error as? QoderSSEReparserError else {
-                return XCTFail("expected .reasoningContentNotSupported, got \(error)")
-            }
-        }
+        let out = try reparser.feed(Data(line.utf8))
+        let chunks = openAIChunks(out)
+        XCTAssertEqual(chunks.count, 1)
+        let delta = chunks[0]["choices"] as? [[String: Any]]
+        let deltaDict = (delta?[0]["delta"] as? [String: Any])
+        XCTAssertEqual(deltaDict?["reasoning_content"] as? String, "thinking...")
+        XCTAssertNil(deltaDict?["content"], "reasoning chunk must not carry content")
     }
 
-    /// `delta.tool_calls` throws — tools were already rejected at the request
-    /// boundary; this is defensive.
-    func testToolCallsThrow() {
-        var reparser = QoderSSEReparser()
+    /// A literal `<thinking>` opener routed into reasoning_content is stripped
+    /// (Qoder's backend sometimes splits a tag pair across reasoning + content
+    /// channels — pi strips the artifacts in stream.ts ~354-355).
+    func testReasoningContentStripsThinkingTags() throws {
+        var reparser = QoderSSEReparser(created: 1)
         let line = qoderLine([
             "id": "x", "model": "m",
-            "choices": [["delta": ["tool_calls": [["index": 0]]]]],
+            "choices": [["delta": ["reasoning_content": "<thinking>real reasoning"]]],
         ])
-        XCTAssertThrowsError(try reparser.feed(Data(line.utf8))) { error in
-            guard case .toolCallsNotSupported = error as? QoderSSEReparserError else {
-                return XCTFail("expected .toolCallsNotSupported, got \(error)")
-            }
-        }
+        let out = try reparser.feed(Data(line.utf8))
+        let chunks = openAIChunks(out)
+        XCTAssertEqual(chunks.count, 1)
+        let delta = (chunks[0]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any]
+        XCTAssertEqual(delta?["reasoning_content"] as? String, "real reasoning")
+    }
+
+    /// An empty reasoning_content after stripping emits nothing (the artifact
+    /// was the whole payload — e.g. a lone `<thinking>` opener).
+    func testEmptyReasoningAfterStripEmitsNothing() throws {
+        var reparser = QoderSSEReparser(created: 1)
+        let line = qoderLine([
+            "id": "x", "model": "m",
+            "choices": [["delta": ["reasoning_content": "<thinking>"]]],
+        ])
+        let out = try reparser.feed(Data(line.utf8))
+        XCTAssertTrue(openAIChunks(out).isEmpty)
+    }
+
+    // MARK: - Content with embedded thinking tags (Phase 2b)
+
+    /// A `<thinking>...</thinking>` pair embedded in `delta.content` splits
+    /// into a reasoning delta (the thinking text) and text deltas (the parts
+    /// before and after the pair). Cross-checks the thinking parser wiring.
+    func testContentWithThinkingTagSplits() throws {
+        var reparser = QoderSSEReparser(created: 1)
+        let line = qoderLine([
+            "id": "x", "model": "m",
+            "choices": [["delta": ["content": "before <thinking>mid</thinking> after"]]],
+        ])
+        let out = try reparser.feed(Data(line.utf8))
+        let chunks = openAIChunks(out)
+        // Order: text "before ", reasoning "mid", text " after".
+        XCTAssertEqual(chunks.count, 3)
+        let d0 = (chunks[0]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any]
+        let d1 = (chunks[1]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any]
+        let d2 = (chunks[2]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any]
+        XCTAssertEqual(d0?["content"] as? String, "before ")
+        XCTAssertEqual(d1?["reasoning_content"] as? String, "mid")
+        XCTAssertEqual(d2?["content"] as? String, " after")
+    }
+
+    /// A thinking tag split across content deltas (cross-delta buffering)
+    /// resolves correctly: the partial opener is held back until the next
+    /// chunk completes it.
+    func testContentThinkingTagSplitAcrossDeltas() throws {
+        var reparser = QoderSSEReparser(created: 1)
+        let line1 = qoderLine([
+            "id": "x", "model": "m",
+            "choices": [["delta": ["content": "Hello <thin"]]],
+        ])
+        let line2 = qoderLine([
+            "choices": [["delta": ["content": "king>part</thinking> world"]]],
+        ])
+        var out = try reparser.feed(Data(line1.utf8))
+        out.append(try reparser.feed(Data(line2.utf8)))
+        out.append(try reparser.finish())
+        let chunks = openAIChunks(out)
+        // Concatenate content + reasoning separately.
+        let text = chunks.compactMap { (($0["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["content"] as? String }.joined()
+        let reasoning = chunks.compactMap { (($0["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["reasoning_content"] as? String }.joined()
+        XCTAssertEqual(text, "Hello  world")
+        XCTAssertEqual(reasoning, "part")
+    }
+
+    // MARK: - Tool calls (Phase 2b)
+
+    /// Helper: build an inner chunk dict with a tool_calls delta.
+    private func innerWithToolCalls(_ toolCalls: [[String: Any]]) -> [String: Any] {
+        [
+            "id": "x", "model": "m",
+            "choices": [["delta": ["tool_calls": toolCalls]]],
+        ]
+    }
+
+    /// A tool_calls delta is re-emitted as OpenAI `delta.tool_calls`, preserving
+    /// the index, id, type, and function name.
+    func testToolCallFirstDeltaEmitted() throws {
+        var reparser = QoderSSEReparser(created: 1)
+        let line = qoderLine(innerWithToolCalls([[
+            "index": 0,
+            "id": "call_1",
+            "type": "function",
+            "function": ["name": "get_weather", "arguments": ""],
+        ]]))
+        let out = try reparser.feed(Data(line.utf8))
+        let chunks = openAIChunks(out)
+        XCTAssertEqual(chunks.count, 1)
+        let tcArray = ((chunks[0]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["tool_calls"] as? [[String: Any]]
+        XCTAssertEqual(tcArray?.count, 1)
+        XCTAssertEqual(tcArray?[0]["index"] as? Int, 0)
+        XCTAssertEqual(tcArray?[0]["id"] as? String, "call_1")
+        XCTAssertEqual(tcArray?[0]["type"] as? String, "function")
+        let fn = tcArray?[0]["function"] as? [String: Any]
+        XCTAssertEqual(fn?["name"] as? String, "get_weather")
+    }
+
+    /// Argument fragments stream across deltas (true OpenAI streaming). Two
+    /// deltas with the SAME index but fragmented `function.arguments` produce
+    /// two chunks; the agent concatenates them.
+    func testToolCallArgumentsStreamFragmented() throws {
+        var reparser = QoderSSEReparser(created: 1)
+        let first = qoderLine(innerWithToolCalls([[
+            "index": 0, "id": "call_1", "type": "function",
+            "function": ["name": "get_weather", "arguments": "{\"city\":"],
+        ]]))
+        let frag = qoderLine(innerWithToolCalls([[
+            "index": 0,
+            "function": ["arguments": " \"Paris\"}"],
+        ]]))
+        var out = try reparser.feed(Data(first.utf8))
+        out.append(try reparser.feed(Data(frag.utf8)))
+        let chunks = openAIChunks(out)
+        XCTAssertEqual(chunks.count, 2)
+        // First chunk carries id/type/name + first argument fragment.
+        let fn0 = (((chunks[0]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["tool_calls"] as? [[String: Any]])?[0]["function"] as? [String: Any]
+        XCTAssertEqual(fn0?["arguments"] as? String, "{\"city\":")
+        // Second chunk carries only the argument fragment (sparse delta).
+        let tc1 = ((chunks[1]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["tool_calls"] as? [[String: Any]]
+        XCTAssertEqual(tc1?[0]["index"] as? Int, 0)
+        let fn1 = tc1?[0]["function"] as? [String: Any]
+        XCTAssertEqual(fn1?["arguments"] as? String, " \"Paris\"}")
+        XCTAssertNil(tc1?[0]["id"], "second fragment must not repeat id")
+    }
+
+    /// Multiple tool-call indices interleave correctly — each index gets its
+    /// own id on first sighting. Each entry in the upstream `tool_calls` array
+    /// is re-emitted as its own OpenAI chunk (one tool_call per delta).
+    func testMultipleToolCallIndices() throws {
+        var reparser = QoderSSEReparser(created: 1)
+        let line = qoderLine(innerWithToolCalls([
+            ["index": 0, "id": "call_a", "type": "function", "function": ["name": "f1", "arguments": ""]],
+            ["index": 1, "id": "call_b", "type": "function", "function": ["name": "f2", "arguments": ""]],
+        ]))
+        let out = try reparser.feed(Data(line.utf8))
+        let chunks = openAIChunks(out)
+        // One chunk per tool_call entry (streaming shape).
+        XCTAssertEqual(chunks.count, 2)
+        let tc0 = ((chunks[0]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["tool_calls"] as? [[String: Any]]
+        let tc1 = ((chunks[1]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["tool_calls"] as? [[String: Any]]
+        XCTAssertEqual(tc0?[0]["id"] as? String, "call_a")
+        XCTAssertEqual(tc0?[0]["index"] as? Int, 0)
+        XCTAssertEqual(tc1?[0]["id"] as? String, "call_b")
+        XCTAssertEqual(tc1?[0]["index"] as? Int, 1)
+    }
+
+    /// `index` defaults to 0 when absent (pi: `tc.index ?? 0`).
+    func testToolCallIndexDefaultsToZero() throws {
+        var reparser = QoderSSEReparser(created: 1)
+        let line = qoderLine(innerWithToolCalls([[
+            "id": "call_1", "type": "function",
+            "function": ["name": "f", "arguments": ""],
+        ]]))
+        let out = try reparser.feed(Data(line.utf8))
+        let tcArray = ((openAIChunks(out)[0]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["tool_calls"] as? [[String: Any]]
+        XCTAssertEqual(tcArray?[0]["index"] as? Int, 0)
+    }
+
+    /// Phase 2b: when tool_calls streamed and the upstream sends a generic
+    /// `finish_reason: "stop"`, the reparser overrides it to OpenAI's
+    /// `"tool_calls"` so the agent knows to execute the calls (pi forces
+    /// "toolUse" in stream.ts ~496-498). A meaningful upstream finish_reason
+    /// ("length", "content_filter") is preserved.
+    func testToolCallsOverrideFinishReasonToToolCalls() throws {
+        var reparser = QoderSSEReparser(created: 1)
+        let toolLine = qoderLine(innerWithToolCalls([[
+            "index": 0, "id": "call_1", "type": "function",
+            "function": ["name": "f", "arguments": "{}"],
+        ]]))
+        // Upstream sends the generic "stop" after tool_calls streamed.
+        let stopLine = qoderLine([
+            "choices": [["delta": [:], "finish_reason": "stop"]],
+        ])
+        var out = try reparser.feed(Data(toolLine.utf8))
+        out.append(try reparser.feed(Data(stopLine.utf8)))
+        let chunks = openAIChunks(out)
+        // The finish chunk carries "tool_calls", not "stop".
+        let finishChunk = chunks.first { ($0["choices"] as? [[String: Any]])?[0]["finish_reason"] != nil }
+        XCTAssertEqual(
+            (finishChunk?["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String,
+            "tool_calls"
+        )
+    }
+
+    /// A meaningful upstream finish_reason ("length") is preserved even when
+    /// tool_calls streamed — only a generic "stop" is overridden.
+    func testToolCallsPreserveMeaningfulFinishReason() throws {
+        var reparser = QoderSSEReparser(created: 1)
+        let toolLine = qoderLine(innerWithToolCalls([[
+            "index": 0, "id": "call_1", "type": "function",
+            "function": ["name": "f", "arguments": "{}"],
+        ]]))
+        let lengthLine = qoderLine([
+            "choices": [["delta": [:], "finish_reason": "length"]],
+        ])
+        var out = try reparser.feed(Data(toolLine.utf8))
+        out.append(try reparser.feed(Data(lengthLine.utf8)))
+        let chunks = openAIChunks(out)
+        let finishChunk = chunks.first { ($0["choices"] as? [[String: Any]])?[0]["finish_reason"] != nil }
+        XCTAssertEqual(
+            (finishChunk?["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String,
+            "length"
+        )
     }
 
     // MARK: - finish_reason + [DONE]

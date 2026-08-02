@@ -2,37 +2,38 @@
 //  QoderSSEReparser.swift
 //  Quotio
 //
-//  Phase 2a (ADR 0001, ADR 0004, ADR 0005): parses Qoder's SSE response frames
-//  and emits OpenAI-shape SSE deltas for the CLI agent. Pure value type — no
-//  I/O, no actor state. Owned as a `var` inside the ProxyBridge actor (ticket
-//  #7), which feeds raw upstream bytes in and writes the returned OpenAI-shape
-//  bytes to the agent socket.
+//  Phase 2a → 2b (ADR 0001, ADR 0004, ADR 0005, ADR 0007 §3): parses Qoder's
+//  SSE response frames and emits OpenAI-shape SSE deltas for the CLI agent.
+//  Pure value type — no I/O, no actor state. Owned as a `var` inside the
+//  ProxyBridge actor (ticket #7), which feeds raw upstream bytes in and writes
+//  the returned OpenAI-shape bytes to the agent socket.
 //
 //  Reference: pi-provider-qoder/src/stream.ts lines ~290-470 (SSE parse loop).
 //  Ported for algorithmic parity; the OpenAI re-encode is a Quotio addition
 //  (pi emits pi-ai SDK events, not OpenAI SSE).
 //
-//  Text path only:
-//   - `delta.content` → OpenAI `delta.content` (passed through unchanged).
+//  Phase 2b surface (full parity):
+//   - `delta.content` → fed through `QoderThinkingTagParser` so thinking tags
+//     embedded in the content stream split into `delta.reasoning_content`
+//     (thinking) and `delta.content` (text). One thinking block per stream
+//     (pi's one-shot `thinkingExtracted` rule).
+//   - `delta.reasoning_content` → `stripThinkingTags` then re-emit as
+//     `delta.reasoning_content`. Qoder's backend sometimes routes a literal
+//     `<thinking>` opener into this channel (closer into `content`); stripping
+//     keeps the thinking block clean (ADR 0004 §Decision).
+//   - `delta.tool_calls` → OpenAI `delta.tool_calls`, streamed fragment by
+//     fragment (index-keyed state machine so each index's id/name land once
+//     and argument fragments accumulate on the agent side as OpenAI expects).
 //   - `inner.usage` (final chunk) → OpenAI `usage`, passed through verbatim.
 //     Per ADR 0005 §2, Qoder follows OpenAI semantics (`prompt_tokens`
 //     INCLUDES `cached_tokens`); do NOT replicate pi's cache subtraction.
-//   - `delta.reasoning_content` → throws `.reasoningContentNotSupported`.
-//     The reparser cannot re-send an HTTP status mid-stream (the SSE response
-//     already returned 200), so it throws a typed error and ProxyBridge (#7)
-//     owns the wire representation — closing the agent socket with a trailing
-//     error chunk is the documented behavior, NOT a true HTTP 400. (Phase 2b
-//     ticket #8 lifts this gate and emits `delta.reasoning_content` instead.)
-//   - `delta.tool_calls` → throws `.toolCallsNotSupported` for the same reason.
-//     Tools were already rejected at the request boundary, so this is
-//     defensive against upstream behavior drift.
 //
 
 import Foundation
 
 /// Errors thrown while reparsing Qoder's SSE stream into OpenAI-shape SSE.
 /// None of these carry token/secret content. ProxyBridge (ticket #7) maps each
-/// to its wire representation — a mid-stream abort for the text-path gates.
+/// to its wire representation — a mid-stream abort.
 nonisolated enum QoderSSEReparserError: Error, LocalizedError {
     /// Qoder envelope's `statusCodeValue` was non-200. Pi throws in the same
     /// spot; ProxyBridge terminates the agent stream. Snippet is ≤200 chars,
@@ -42,12 +43,6 @@ nonisolated enum QoderSSEReparserError: Error, LocalizedError {
     /// SSE line shouldn't kill the stream); we surface them so ProxyBridge can
     /// decide — most callers will log-and-continue via the throwing `feed`.
     case malformedSSELine(snippet: String)
-    /// `delta.reasoning_content` appeared in a chunk. Phase 2a text path does
-    /// not re-emit reasoning; Phase 2b (ticket #8) handles it.
-    case reasoningContentNotSupported
-    /// `delta.tool_calls` appeared. Tools were rejected at the request
-    /// boundary; this is defensive against upstream drift.
-    case toolCallsNotSupported
 
     var errorDescription: String? {
         switch self {
@@ -58,10 +53,6 @@ nonisolated enum QoderSSEReparserError: Error, LocalizedError {
                 : "Qoder upstream returned status \(status): \(capped)"
         case .malformedSSELine(let snippet):
             return "Qoder SSE: malformed line (\(String(snippet.prefix(120))))."
-        case .reasoningContentNotSupported:
-            return "Qoder SSE: reasoning_content is not supported on the text path (Phase 2b)."
-        case .toolCallsNotSupported:
-            return "Qoder SSE: tool_calls are not supported on the text path (Phase 2b)."
         }
     }
 }
@@ -118,6 +109,22 @@ nonisolated struct QoderSSEReparser {
     /// double-emit on repeated `finish()` calls.
     private var finished: Bool = false
 
+    /// Streaming splitter for thinking tags embedded in the `content` channel
+    /// (Phase 2b). One per stream — owns cross-delta buffering and the one-shot
+    /// "first thinking block only" rule. See `QoderThinkingTagParser`.
+    private var thinkingParser: QoderThinkingTagParser = QoderThinkingTagParser()
+
+    /// Per-stream tool-call state, keyed by the OpenAI `tool_calls[].index`.
+    /// Phase 2b port of pi's `toolCallsState` (stream.ts ~29, 407-435). Tracks
+    /// whether each index has emitted its first delta (so id/type/name ride the
+    /// first chunk and argument fragments stream after). We re-emit each
+    /// fragment as an OpenAI `delta.tool_calls` chunk (true streaming), unlike
+    /// pi which buffers arguments and JSON.parses at stream end — that's pi-ai
+    /// `toolcall_end` machinery ADR 0004 explicitly skips. The non-empty check
+    /// also drives the `finish_reason: "tool_calls"` override (OpenAI clients
+    /// require this when tool_calls streamed, else the stream is malformed).
+    private var toolCallsState: [Int: QoderToolCallState] = [:]
+
     /// New reparser. `created` defaults to now; tests can pin via the second
     /// initializer to assert byte-exact OpenAI chunk output.
     init() {
@@ -135,12 +142,9 @@ nonisolated struct QoderSSEReparser {
     /// OpenAI-shape SSE bytes to write to the agent socket. Returns empty
     /// `Data` when no complete frame is available yet (buffering).
     ///
-    /// Throws on `statusCodeValue != 200`, malformed JSON lines, and the
-    /// reasoning/tool_calls text-path gates. A thrown error does NOT corrupt
-    /// the reparser state — the caller may continue feeding if it chooses to
-    /// swallow `.malformedSSELine` (pi's behavior) — but a thrown gate
-    /// (`.reasoningContentNotSupported` / `.toolCallsNotSupported`) signals
-    /// the caller should terminate the agent stream.
+    /// Throws on `statusCodeValue != 200` and malformed JSON lines. A thrown
+    /// error does NOT corrupt the reparser state — the caller may continue
+    /// feeding if it chooses to swallow `.malformedSSELine` (pi's behavior).
     mutating func feed(_ data: Data) throws -> Data {
         if data.isEmpty { return Data() }
         guard let chunk = String(data: data, encoding: .utf8) else {
@@ -174,6 +178,20 @@ nonisolated struct QoderSSEReparser {
         finished = true
         var out = try drainLines(terminal: true)
 
+        // Flush the thinking-tag parser: any held-back partial-tag prefix at
+        // the tail of the last content delta (or an open thinking block whose
+        // closer never arrived) must surface before [DONE]. Phase 2b — pi
+        // does this in stream.ts ~459-461 (`thinkingParser.finalize()`).
+        let pendingEmissions = thinkingParser.finalize()
+        for emission in pendingEmissions {
+            switch emission {
+            case .text(let text):
+                out.append(buildContentChunk(text))
+            case .thinking(let thinking):
+                out.append(buildReasoningChunk(thinking))
+            }
+        }
+
         // Trailing usage chunk (OpenAI convention: usage rides on its own
         // final chunk with an empty `choices` array). Only emit if we have
         // stashed usage that wasn't already attached to a content chunk.
@@ -199,21 +217,24 @@ nonisolated struct QoderSSEReparser {
                 if terminal && !buffer.isEmpty {
                     let leftover = buffer
                     buffer.removeAll(keepingCapacity: false)
-                    if let lineData = try? processLine(leftover) {
-                        out.append(lineData)
+                    do {
+                        let lineData = try processLine(leftover)
+                        if !lineData.isEmpty { out.append(lineData) }
+                    } catch QoderSSEReparserError.malformedSSELine {
+                        // Pi skips malformed SSE lines (pi parity). Buffer is
+                        // already drained; just drop the leftover.
                     }
-                    // processLine may throw on a gate; if it did, the throw
-                    // propagates and the buffer is already drained. Acceptable:
-                    // a thrown gate means we're terminating anyway.
+                    // Non-malformed throws (e.g. .upstreamStatus) propagate
+                    // and the buffer is already drained — acceptable, a thrown
+                    // upstream status means we're terminating anyway.
                 }
                 return out
             }
             let line = String(buffer[buffer.startIndex..<nlIndex])
             buffer.removeSubrange(buffer.startIndex...nlIndex)
             do {
-                if let lineData = try processLine(line) {
-                    out.append(lineData)
-                }
+                let lineData = try processLine(line)
+                if !lineData.isEmpty { out.append(lineData) }
             } catch QoderSSEReparserError.malformedSSELine {
                 // Pi skips malformed SSE lines (a single bad line shouldn't
                 // kill the stream). Mirror that by swallowing here; callers
@@ -225,22 +246,24 @@ nonisolated struct QoderSSEReparser {
     }
 
     /// Process one SSE line (already `\n`-stripped). Returns the OpenAI-shape
-    /// SSE bytes to emit, or nil if the line produced no output (comments,
-    /// events, keep-alives, `[DONE]`, etc.).
+    /// SSE bytes to emit (empty if the line produced no output). A single
+    /// inner delta can carry reasoning + content + tool_calls, so this may
+    /// concatenate several OpenAI chunks; pi's order is preserved
+    /// (reasoning_content → content → tool_calls, stream.ts ~349-435).
     ///
-    /// Throws on `statusCodeValue != 200` and on the reasoning/tool_calls
-    /// gates. Throws `.malformedSSELine` for JSON parse failures — the caller
-    /// (`drainLines`) swallows those by default (pi parity).
-    private mutating func processLine(_ rawLine: String) throws -> Data? {
+    /// Throws on `statusCodeValue != 200` and on malformed JSON. Throws
+    /// `.malformedSSELine` for JSON parse failures — the caller (`drainLines`)
+    /// swallows those by default (pi parity).
+    private mutating func processLine(_ rawLine: String) throws -> Data {
         // Surrounding whitespace trim (SSE spec: ignore leading/trailing
         // spaces around the field). CRLF was already collapsed in `feed`.
         let line = rawLine.trimmingCharacters(in: .whitespaces)
-        if line.isEmpty { return nil }   // SSE event boundary
-        if line.hasPrefix(":") { return nil }   // SSE comment / keep-alive
-        if !line.hasPrefix("data:") { return nil }   // ignore `event:`, `id:`, `retry:`
+        if line.isEmpty { return Data() }   // SSE event boundary
+        if line.hasPrefix(":") { return Data() }   // SSE comment / keep-alive
+        if !line.hasPrefix("data:") { return Data() }   // ignore `event:`, `id:`, `retry:`
         let dataStr = String(line.dropFirst("data:".count)).trimmingCharacters(in: .whitespaces)
-        if dataStr.isEmpty { return nil }
-        if dataStr == "[DONE]" { return nil }   // upstream [DONE] handled by finish()
+        if dataStr.isEmpty { return Data() }
+        if dataStr == "[DONE]" { return Data() }   // upstream [DONE] handled by finish()
 
         // Parse outer envelope. A malformed line throws and is swallowed by
         // drainLines (pi parity).
@@ -262,7 +285,7 @@ nonisolated struct QoderSSEReparser {
         guard let innerStr = envelope["body"] as? String,
               !innerStr.isEmpty,
               innerStr != "[DONE]" else {
-            return nil
+            return Data()
         }
         guard let innerData = innerStr.data(using: .utf8),
               let inner = try? JSONSerialization.jsonObject(with: innerData) as? [String: Any] else {
@@ -284,44 +307,89 @@ nonisolated struct QoderSSEReparser {
             stashedUsage = usage
         }
 
-        // Extract content delta + finish_reason. Empty deltas (e.g. role-only
-        // opener chunks, usage-only final chunks) emit nothing here.
-        var emitted: Data?
+        // Extract deltas + finish_reason. A line may produce several OpenAI
+        // chunks (reasoning + content-via-parser + tool_calls); accumulate them.
+        var out = Data()
+        var producedContentThisLine = false
         if let choices = inner["choices"] as? [Any], !choices.isEmpty {
             guard let choice = choices[0] as? [String: Any] else {
                 throw QoderSSEReparserError.malformedSSELine(snippet: innerStr)
             }
             if let delta = choice["delta"] as? [String: Any] {
-                // Text-path gate: reasoning_content.
-                if delta["reasoning_content"] != nil {
-                    throw QoderSSEReparserError.reasoningContentNotSupported
+                // 1. reasoning_content (Phase 2b). Pi strips thinking-tag
+                //    artifacts (a literal <thinking> opener sometimes lands
+                //    here, closer in `content`) then emits a thinking_delta.
+                //    We strip then re-emit as OpenAI delta.reasoning_content.
+                if let reasoning = delta["reasoning_content"] as? String, !reasoning.isEmpty {
+                    let cleaned = qoderStripThinkingTags(reasoning)
+                    if !cleaned.isEmpty {
+                        out.append(buildReasoningChunk(cleaned))
+                    }
                 }
-                // Defensive text-path gate: tool_calls. Tools were already
-                // rejected at the request boundary (translator gate 1), so a
-                // well-behaved upstream never emits this. If it appears, it
-                // signals upstream drift or a misrouted request — fail loudly
-                // rather than silently drop tool-call deltas the agent can't
-                // act on. Ticket #8 lifts this when tool support lands.
-                if delta["tool_calls"] != nil {
-                    throw QoderSSEReparserError.toolCallsNotSupported
-                }
+
+                // 2. content (Phase 2b). Feed through the thinking-tag parser
+                //    so an embedded <thinking>...</thinking> pair in the
+                //    content stream splits into reasoning + text. OpenAI SSE
+                //    has no explicit "thinking_end" token — the channel simply
+                //    switches — so unlike pi (which emits thinking_end when
+                //    content arrives mid-block, stream.ts ~376-385) we just let
+                //    the next delta's field carry the switch.
                 if let content = delta["content"] as? String, !content.isEmpty {
-                    emitted = buildChunk(delta: content, finishReason: nil, usage: nil)
+                    let emissions = thinkingParser.processChunk(content)
+                    for emission in emissions {
+                        switch emission {
+                        case .text(let text):
+                            out.append(buildContentChunk(text))
+                            producedContentThisLine = true
+                        case .thinking(let thinking):
+                            out.append(buildReasoningChunk(thinking))
+                        }
+                    }
+                }
+
+                // 3. tool_calls (Phase 2b). Index-keyed state machine ported
+                //    from stream.ts ~407-435. The first delta per index
+                //    carries id/type/name; argument fragments stream after.
+                if let toolCalls = delta["tool_calls"] as? [Any], !toolCalls.isEmpty {
+                    for raw in toolCalls {
+                        guard let tc = raw as? [String: Any] else { continue }
+                        let index = (tc["index"] as? Int) ?? 0
+                        var state = toolCallsState[index] ?? QoderToolCallState()
+                        // First sighting of this index carries id/type/name;
+                        // later deltas only carry argument fragments. OpenAI
+                        // clients reconstruct the call from the first delta +
+                        // concatenated fragments, so we re-emit each delta
+                        // verbatim (true streaming).
+                        out.append(buildToolCallChunk(index: index, delta: tc))
+                        state.recordDelta(tc)
+                        toolCallsState[index] = state
+                    }
                 }
             }
             if let finishReason = choice["finish_reason"] as? String, !finishReason.isEmpty {
-                stashedFinishReason = finishReason
+                // Phase 2b finish_reason override: when any tool_calls were
+                // streamed this response, OpenAI clients require
+                // `finish_reason: "tool_calls"` (the OpenAI name; pi-ai calls
+                // it "toolUse", stream.ts ~496-498). If the upstream sent a
+                // generic "stop", force the correct value so the agent knows
+                // to execute the tool calls. A meaningful upstream finish_reason
+                // ("length", "content_filter") wins.
+                let effective = (!toolCallsState.isEmpty && finishReason == "stop")
+                    ? "tool_calls"
+                    : finishReason
+                stashedFinishReason = effective
                 // Emit the finish chunk immediately when there's no pending
-                // content delta (the common case: a separate chunk carries
-                // finish_reason). When content and finish land together, we
-                // already emitted content above; emit finish separately next.
-                if emitted == nil {
-                    emitted = buildChunk(delta: nil, finishReason: finishReason, usage: nil)
+                // content delta this line (the common case: a separate chunk
+                // carries finish_reason). When content and finish land
+                // together, content was already emitted above; emit finish
+                // separately next.
+                if !producedContentThisLine {
+                    out.append(buildChunk(delta: nil, finishReason: effective, usage: nil))
                     stashedFinishReason = nil
                 }
             }
         }
-        return emitted
+        return out
     }
 
     // MARK: - OpenAI chunk builder
@@ -330,7 +398,7 @@ nonisolated struct QoderSSEReparser {
     /// text delta (nil → omit `delta` entirely, used for usage/finish chunks).
     /// `finishReason` non-nil → set `choices[0].finish_reason` and clear
     /// `delta`. `usage` non-nil → attach at top level.
-    private mutating func buildChunk(
+    private func buildChunk(
         delta: String?,
         finishReason: String?,
         usage: [String: Any]?
@@ -342,7 +410,63 @@ nonisolated struct QoderSSEReparser {
         if let finishReason {
             choice["finish_reason"] = finishReason
         }
+        return emitChunk(choice: choice, usage: usage)
+    }
 
+    /// Build a text-only content delta chunk (`delta.content`).
+    private func buildContentChunk(_ text: String) -> Data {
+        let choice: [String: Any] = [
+            "index": 0,
+            "delta": ["content": text],
+        ]
+        return emitChunk(choice: choice, usage: nil)
+    }
+
+    /// Build a reasoning delta chunk (`delta.reasoning_content`). Phase 2b —
+    /// OpenAI's reasoning models carry chain-of-thought under this field;
+    /// CLI agents that surface reasoning (e.g. for transparency) read it.
+    private func buildReasoningChunk(_ reasoning: String) -> Data {
+        let choice: [String: Any] = [
+            "index": 0,
+            "delta": ["reasoning_content": reasoning],
+        ]
+        return emitChunk(choice: choice, usage: nil)
+    }
+
+    /// Build a tool-call delta chunk (`delta.tool_calls`). Re-emits the upstream
+    /// delta entry verbatim so a fragmenting stream (id+name first, then
+    /// argument fragments) reaches the agent in OpenAI streaming shape. The
+    /// emitted payload carries only fields present in `tcDelta` (matching
+    /// OpenAI incremental streaming — clients tolerate sparse deltas).
+    private func buildToolCallChunk(
+        index: Int,
+        delta tcDelta: [String: Any]
+    ) -> Data {
+        var entry: [String: Any] = ["index": index]
+        if let id = tcDelta["id"] as? String, !id.isEmpty { entry["id"] = id }
+        if let type = tcDelta["type"] as? String, !type.isEmpty { entry["type"] = type }
+        if let fn = tcDelta["function"] as? [String: Any] {
+            var fnOut: [String: Any] = [:]
+            if let name = fn["name"] as? String, !name.isEmpty { fnOut["name"] = name }
+            if let args = fn["arguments"] as? String { fnOut["arguments"] = args }
+            if !fnOut.isEmpty { entry["function"] = fnOut }
+        }
+        // Defensive: if a malformed upstream delta carries no recognizable
+        // fields, drop it (don't emit an index-only no-op chunk that could
+        // confuse strict OpenAI clients).
+        guard entry.count > 1 else { return Data() }
+        let choice: [String: Any] = [
+            "index": 0,
+            "delta": ["tool_calls": [entry]],
+        ]
+        return emitChunk(choice: choice, usage: nil)
+    }
+
+    /// Serialize one chunk's choice (+ optional usage) into a `data: {...}\n\n`
+    /// SSE frame. Shared by all chunk builders. JSONSerialization is
+    /// deterministic per-call but key order is not guaranteed; OpenAI clients
+    /// parse JSON, so order is irrelevant.
+    private func emitChunk(choice: [String: Any], usage: [String: Any]?) -> Data {
         var chunk: [String: Any] = [
             "id": responseID ?? "chatcmpl-qoder",
             "object": "chat.completion.chunk",
@@ -353,9 +477,6 @@ nonisolated struct QoderSSEReparser {
         if let usage {
             chunk["usage"] = usage
         }
-
-        // JSONSerialization is deterministic per-call but key order is not
-        // guaranteed; OpenAI clients parse JSON, so order is irrelevant.
         guard let data = try? JSONSerialization.data(withJSONObject: chunk) else {
             return Data()
         }
@@ -380,5 +501,33 @@ nonisolated struct QoderSSEReparser {
             text = "\(body)"
         }
         return String(QoderPATService.redactTokens(in: text).prefix(200))
+    }
+}
+
+// MARK: - QoderToolCallState
+
+/// Mutable accumulator for one tool-call index across a stream (Phase 2b).
+/// Port of pi's `ToolCallState` (stream.ts ~29-36). The reparser records the
+/// id/name on first sighting and concatenates argument fragments; the OpenAI
+/// re-emit is done from the live delta (not this state), so the state's main
+/// job is tracking which indices have been seen — kept lightweight to mirror
+/// pi and to leave room for a future buffered-emit path if an OpenAI client
+/// ever needs a fully-assembled `toolcall_end` shape.
+nonisolated struct QoderToolCallState: Sendable {
+    var id: String = ""
+    var name: String = ""
+    /// Concatenated argument fragments (a JSON string built up across deltas).
+    /// Unused by the current streaming re-emit but retained for parity with
+    /// pi and for the diagnostic/state-completeness it provides.
+    var arguments: String = ""
+
+    /// Record fields from one upstream `delta.tool_calls[]` entry. Called after
+    /// the chunk is emitted so the state reflects what the agent has received.
+    mutating func recordDelta(_ tc: [String: Any]) {
+        if let id = tc["id"] as? String, !id.isEmpty { self.id = id }
+        if let fn = tc["function"] as? [String: Any] {
+            if let name = fn["name"] as? String, !name.isEmpty { self.name = name }
+            if let args = fn["arguments"] as? String { self.arguments += args }
+        }
     }
 }

@@ -523,17 +523,20 @@ final class QoderFailoverRouterTests: XCTestCase {
 
     // MARK: - Fail-fast gates from the translator
 
-    func testTranslatorToolsGateRejectsWith400() async throws {
+    /// Phase 2b: the tools fail-fast gate was lifted (ADR 0007 §3). A tools-
+    /// bearing request now flows through to the gateway with the transformed
+    /// tools in the envelope, instead of being rejected with HTTP 400. This
+    /// test is the inverse of the old 2a "tools gate rejects with 400" test.
+    func testToolsBearingRequestFlowsToGateway() async throws {
         let vault = InMemoryCredentialStore()
         let account = makeAccount(key: "user@example.com")
         await vault.seed(account, makeCredential(accountID: account.id))
         let gateway = MockGatewayClient()
+        await gateway.seed(.init(status: 200, body: Data("data: [DONE]\n\n".utf8)))
         let router = makeRouter(
             vault: vault, pat: MockPATRefresher(), gateway: gateway,
             metadata: makeMetadataStore()
         )
-        // tools non-empty → translator throws toolsNotSupported → router maps
-        // to requestRejected (HTTP 400), no account is contacted.
         let json: [String: Any] = [
             "model": "qoder/auto",
             "stream": true,
@@ -541,16 +544,17 @@ final class QoderFailoverRouterTests: XCTestCase {
             "tools": [["type": "function", "function": ["name": "x", "parameters": [:]]]],
         ]
         let body = try JSONSerialization.data(withJSONObject: json)
-        do {
-            _ = try await router.openStream(requestBody: body, proxyAPIKey: "key")
-            XCTFail("expected requestRejected for tools")
-        } catch let error as QoderFailoverError {
-            if case .requestRejected = error {} else {
-                XCTFail("expected requestRejected, got \(error)")
-            }
-        }
+        // Should NOT throw — tools are supported in Phase 2b.
+        _ = try await router.openStream(requestBody: body, proxyAPIKey: "key")
         let callCount = await gateway.callCount
-        XCTAssertEqual(callCount, 0, "tools gate must trip before any gateway call")
+        XCTAssertEqual(callCount, 1, "tools-bearing request must reach the gateway (gate lifted)")
+        // The envelope the gateway received carries the transformed tool.
+        let bodies = await gateway.receivedBodies
+        let lastBody = try XCTUnwrap(bodies.last)
+        let env = try JSONSerialization.jsonObject(with: lastBody) as? [String: Any]
+        let tools = env?["tools"] as? [[String: Any]]
+        XCTAssertEqual(tools?.count, 1)
+        XCTAssertEqual((tools?[0]["function"] as? [String: Any])?["name"] as? String, "x")
     }
 
     // MARK: - Prefix stripping (ADR 0003 §1 regression guard)
