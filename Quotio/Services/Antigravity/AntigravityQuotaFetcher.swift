@@ -287,6 +287,9 @@ nonisolated struct ModelQuota: Codable, Identifiable, Sendable {
         // Grok
         case "grok-weekly": return "quota.metric.weekly".localizedStatic()
         case "grok-extra-usage": return "quota.metric.extraUsage".localizedStatic()
+        // Qoder (Phase 1 — ADR 0007)
+        case "qoder-user-quota": return "qoder.quota.userQuota".localizedStatic()
+        case "qoder-org-resource-package": return "qoder.quota.orgResourcePackage".localizedStatic()
         // Factory Droid
         case "factory-standard-five-hour": return "factory.quota.standardFiveHour".localizedStatic()
         case "factory-standard-weekly": return "factory.quota.standardWeekly".localizedStatic()
