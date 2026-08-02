@@ -1,13 +1,14 @@
 # xAI Grok as first-class provider
 
 Date: 2026-07-23  
-Status: approved (Approach A)
+Status: approved (Approach A)  
+Updated: 2026-08-02 — bumped bundled CPA from v7.2.96 to v7.2.113 (binary refreshed; see `ProxyBinarySource.plusLocalVersion`/`plusLocalSHA256`).
 
 ## Goal
 
 Promote existing Grok from quota-tracking-only to a routable provider: Add Provider → CLIProxyAPI xAI device OAuth → auth file → proxy routing. Keep native `~/.grok` quota tracking.
 
-Bundle CLIProxyAPI **v7.2.96** as the Plus-local binary so xAI works out of the box.
+Bundle CLIProxyAPI **v7.2.113** as the Plus-local binary so xAI works out of the box.
 
 ## Non-goals
 
@@ -35,7 +36,7 @@ App identity stays `AIProvider.grok` (`rawValue: "grok"`). Wire key at CPA bound
 
 ### Bundle
 
-- Replace `Quotio/Resources/Proxy/cli-proxy-api-plus` with CPA v7.2.96 darwin aarch64 binary (keep filename).
+- Replace `Quotio/Resources/Proxy/cli-proxy-api-plus` with CPA v7.2.113 darwin aarch64 binary (keep filename).
 - `ProxyBinarySource.plusLocalVersion` / `plusLocalSHA256` + display strings.
 
 ### Model flags (`AIProvider.grok`)
