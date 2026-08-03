@@ -600,4 +600,282 @@ final class QoderChatTranslatorTests: XCTestCase {
             options: .deferringToRandom
         )
     }
+
+    // MARK: - Reasoning intent parsing (parseReasoningIntent)
+
+    /// Drive `parseReasoningIntent` by round-tripping a JSON body through
+    /// `parse(body:)`. The intent is exposed on the parsed request.
+    private func parsedIntent(_ json: String) throws -> OpenAIReasoningIntent {
+        let body = Data(json.utf8)
+        return try QoderChatTranslator.parse(body: body).reasoningIntent
+    }
+
+    /// No reasoning fields → `.absent`. The common case.
+    func testReasoningIntentAbsentWhenNoField() throws {
+        let intent = try parsedIntent(#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)
+        XCTAssertEqual(intent, .absent)
+    }
+
+    /// `reasoning_effort: "high"` (OpenAI shortcut) → enabled(high).
+    func testReasoningEffortShortcutString() throws {
+        let intent = try parsedIntent(
+            #"{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}"#
+        )
+        XCTAssertEqual(intent, .enabled(effort: "high"))
+    }
+
+    /// Unknown effort string clamps to a known tier rather than rejecting.
+    func testReasoningEffortClampsUnknown() throws {
+        let intent = try parsedIntent(
+            #"{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"ultra"}"#
+        )
+        XCTAssertEqual(intent, .enabled(effort: "max"))
+    }
+
+    /// `reasoning_effort: "none"` is a disable alias, not a low tier.
+    func testReasoningEffortNoneAliasIsDisabled() throws {
+        let intent = try parsedIntent(
+            #"{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"none"}"#
+        )
+        XCTAssertEqual(intent, .disabled, "\"none\" must disable thinking, not enable at low effort")
+    }
+
+    /// `reasoning: {effort: "medium"}` (OpenAI object) → enabled(medium).
+    func testReasoningObjectForm() throws {
+        let intent = try parsedIntent(
+            #"{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning":{"effort":"medium"}}"#
+        )
+        XCTAssertEqual(intent, .enabled(effort: "medium"))
+    }
+
+    /// `reasoning: {exclude: true}` is NOT a thinking toggle in OpenAI semantics
+    /// (it controls response content, not whether the model reasons). With no
+    /// effort, it falls through to `.absent` — the model still reasons at its
+    /// default. This guards against a regression where exclude mapped to disabled.
+    func testReasoningExcludeIsNotAThinkingToggle() throws {
+        let intent = try parsedIntent(
+            #"{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning":{"exclude":true}}"#
+        )
+        XCTAssertEqual(intent, .absent, "exclude controls response shape, not reasoning; must stay absent")
+    }
+
+    /// `reasoning: {effort: "high", exclude: true}` — effort still wins even
+    /// when exclude is present (the model reasons at high effort; exclude only
+    /// affects whether the trace is returned, which is the SSE reparser's job).
+    func testReasoningEffortWinsOverExclude() throws {
+        let intent = try parsedIntent(
+            #"{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning":{"effort":"high","exclude":true}}"#
+        )
+        XCTAssertEqual(intent, .enabled(effort: "high"))
+    }
+
+    /// `reasoning: {}` (empty object) → no signal → absent.
+    func testReasoningEmptyObjectIsAbsent() throws {
+        let intent = try parsedIntent(
+            #"{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning":{}}"#
+        )
+        XCTAssertEqual(intent, .absent)
+    }
+
+    /// `thinking: {type: "disabled"}` (Anthropic-style) → disabled. Unlike
+    /// OpenAI's exclude, this IS a true thinking toggle.
+    func testThinkingTypeDisabled() throws {
+        let intent = try parsedIntent(
+            #"{"model":"m","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"}}"#
+        )
+        XCTAssertEqual(intent, .disabled)
+    }
+
+    /// `thinking: {type: "enabled", budget_tokens: 8000}` → enabled with an
+    /// effort tier derived from the budget.
+    func testThinkingEnabledWithBudget() throws {
+        let intent = try parsedIntent(
+            #"{"model":"m","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":8000}}"#
+        )
+        XCTAssertEqual(intent, .enabled(effort: "medium"))
+    }
+
+    /// `thinking: {type: "enabled"}` with no budget → enabled with nil effort
+    /// (gateway picks its default tier).
+    func testThinkingEnabledNoBudget() throws {
+        let intent = try parsedIntent(
+            #"{"model":"m","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled"}}"#
+        )
+        XCTAssertEqual(intent, .enabled(effort: nil))
+    }
+
+    /// Unknown `thinking.type` falls through to absent (not a failure).
+    func testThinkingUnknownTypeIsAbsent() throws {
+        let intent = try parsedIntent(
+            #"{"model":"m","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"weird"}}"#
+        )
+        XCTAssertEqual(intent, .absent)
+    }
+
+    /// Precedence: `reasoning_effort` wins over `reasoning` and `thinking`.
+    func testReasoningEffortPrecedence() throws {
+        let intent = try parsedIntent(
+            #"{"model":"m","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"low","reasoning":{"effort":"high"},"thinking":{"type":"enabled","budget_tokens":999999}}"#
+        )
+        XCTAssertEqual(intent, .enabled(effort: "low"))
+    }
+
+    // MARK: - resolveThinking decision table
+
+    /// Non-reasoning model → `.absent` regardless of agent intent. The gateway
+    /// can't make `qoder/auto` reason.
+    func testResolveThinkingNonReasoningModelAlwaysAbsent() {
+        XCTAssertEqual(
+            QoderChatTranslator.resolveThinking(intent: .enabled(effort: "high"), modelReasoning: false),
+            .absent
+        )
+        XCTAssertEqual(
+            QoderChatTranslator.resolveThinking(intent: .disabled, modelReasoning: false),
+            .absent
+        )
+    }
+
+    /// Reasoning model + absent intent → `.absent` (gateway default). THE key
+    /// regression guard: this is the case the two-field struct got wrong.
+    func testResolveThinkingReasoningModelAbsentIntent() {
+        XCTAssertEqual(
+            QoderChatTranslator.resolveThinking(intent: .absent, modelReasoning: true),
+            .absent,
+            "absent intent on a reasoning model must stay absent (gateway default), not become disabled"
+        )
+    }
+
+    /// Reasoning model + disabled intent → `.disabled` (force off).
+    func testResolveThinkingReasoningModelDisabled() {
+        XCTAssertEqual(
+            QoderChatTranslator.resolveThinking(intent: .disabled, modelReasoning: true),
+            .disabled
+        )
+    }
+
+    /// Reasoning model + enabled(effort:) → `.enabled(effort:)`.
+    func testResolveThinkingReasoningModelEnabledWithEffort() {
+        XCTAssertEqual(
+            QoderChatTranslator.resolveThinking(intent: .enabled(effort: "xhigh"), modelReasoning: true),
+            .enabled(effort: "xhigh")
+        )
+    }
+
+    /// Reasoning model + enabled(effort: nil) → `.absent` (gateway picks tier).
+    func testResolveThinkingReasoningModelEnabledNoEffort() {
+        XCTAssertEqual(
+            QoderChatTranslator.resolveThinking(intent: .enabled(effort: nil), modelReasoning: true),
+            .absent
+        )
+    }
+
+    // MARK: - thinking_config envelope emission
+
+    /// Helper: parse the `model_config` block out of a translation result.
+    private func modelConfigBlock(_ result: QoderTranslationResult) throws -> [String: Any]? {
+        let env = try JSONSerialization.jsonObject(with: result.envelopeJSON) as? [String: Any]
+        return env?["model_config"] as? [String: Any]
+    }
+
+    /// Absent selection → no `thinking_config` key in model_config. Preserves
+    /// today's envelope shape for the common case.
+    func testEnvelopeNoThinkingConfigWhenAbsent() throws {
+        let request = OpenAIChatRequest(
+            model: "ultimate",
+            messages: [OpenAIChatMessage(role: "user", content: .text("hi"), toolCalls: nil, toolCallID: nil)]
+        )
+        let result = try QoderChatTranslator.translate(
+            request: request, userID: "u", proxyAPIKey: "k",
+            modelConfig: QoderModelConfig(key: "ultimate", isReasoning: true, maxOutputTokens: 32768, source: "system"),
+            options: .deferringToRandom
+        )
+        let mc = try modelConfigBlock(result)
+        XCTAssertNil(mc?["thinking_config"], "absent selection must not emit thinking_config")
+    }
+
+    /// Enabled selection → `{enabled: {effort: ...}}` in model_config.
+    func testEnvelopeEmitsEnabledThinkingConfig() throws {
+        let body = Data(#"{"model":"ultimate","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}"#.utf8)
+        let request = try QoderChatTranslator.parse(body: body)
+        let result = try QoderChatTranslator.translate(
+            request: request, userID: "u", proxyAPIKey: "k",
+            modelConfig: QoderModelConfig(key: "ultimate", isReasoning: true, maxOutputTokens: 32768, source: "system"),
+            options: .deferringToRandom
+        )
+        let mc = try modelConfigBlock(result)
+        let tc = mc?["thinking_config"] as? [String: Any]
+        let enabled = tc?["enabled"] as? [String: Any]
+        let expected: [String: Any] = ["effort": "high"]
+        XCTAssertEqual(enabled?["effort"] as? String, expected["effort"] as? String)
+    }
+
+    /// Disabled selection → `{disabled: {}}` in model_config.
+    func testEnvelopeEmitsDisabledThinkingConfig() throws {
+        let body = Data(#"{"model":"ultimate","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"}}"#.utf8)
+        let request = try QoderChatTranslator.parse(body: body)
+        let result = try QoderChatTranslator.translate(
+            request: request, userID: "u", proxyAPIKey: "k",
+            modelConfig: QoderModelConfig(key: "ultimate", isReasoning: true, maxOutputTokens: 32768, source: "system"),
+            options: .deferringToRandom
+        )
+        let mc = try modelConfigBlock(result)
+        let tc = mc?["thinking_config"] as? [String: Any]
+        XCTAssertNotNil(tc?["disabled"], "disabled selection must emit {disabled: {}}")
+    }
+
+    /// Non-reasoning model + enabled intent → no thinking_config (model can't
+    /// reason regardless of what the agent asked).
+    func testEnvelopeNoThinkingConfigOnNonReasoningModel() throws {
+        let body = Data(#"{"model":"auto","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}"#.utf8)
+        let request = try QoderChatTranslator.parse(body: body)
+        let result = try QoderChatTranslator.translate(
+            request: request, userID: "u", proxyAPIKey: "k",
+            modelConfig: QoderModelConfig(key: "auto", isReasoning: false, maxOutputTokens: 32768, source: "system"),
+            options: .deferringToRandom
+        )
+        let mc = try modelConfigBlock(result)
+        XCTAssertNil(mc?["thinking_config"], "non-reasoning model must never carry thinking_config")
+    }
+
+    // MARK: - thinking selection in the recordID cache key
+
+    /// Absent selection hashes identically to the pre-reasoning era — guards
+    /// the pi-parity golden vector and existing cache keys. Compares the
+    /// four-arg call (which defaults thinking to .absent) against the explicit
+    /// five-arg call with .absent.
+    func testRecordIDAbsentThinkingMatchesDefault() {
+        let msgs = [qmsg("user", "hi")]
+        let withoutArg = QoderChatTranslator.stableChatRecordID(
+            model: "m", messages: msgs, toolsJSON: "", maxTokens: 32768
+        )
+        let explicitAbsent = QoderChatTranslator.stableChatRecordID(
+            model: "m", messages: msgs, toolsJSON: "", maxTokens: 32768, thinking: .absent
+        )
+        XCTAssertEqual(withoutArg, explicitAbsent)
+    }
+
+    /// Different effort tiers fork the cache key — two requests to the same
+    /// reasoning model with low vs high effort get distinct recordIDs.
+    func testRecordIDVariesByEffortTier() {
+        let msgs = [qmsg("user", "hi")]
+        let low = QoderChatTranslator.stableChatRecordID(
+            model: "ultimate", messages: msgs, toolsJSON: "", maxTokens: 32768, thinking: .enabled(effort: "low")
+        )
+        let high = QoderChatTranslator.stableChatRecordID(
+            model: "ultimate", messages: msgs, toolsJSON: "", maxTokens: 32768, thinking: .enabled(effort: "high")
+        )
+        XCTAssertNotEqual(low, high, "different effort tiers must fork the cache key")
+    }
+
+    /// Enabled vs disabled fork the cache key too.
+    func testRecordIDVariesEnabledVsDisabled() {
+        let msgs = [qmsg("user", "hi")]
+        let enabled = QoderChatTranslator.stableChatRecordID(
+            model: "ultimate", messages: msgs, toolsJSON: "", maxTokens: 32768, thinking: .enabled(effort: "high")
+        )
+        let disabled = QoderChatTranslator.stableChatRecordID(
+            model: "ultimate", messages: msgs, toolsJSON: "", maxTokens: 32768, thinking: .disabled
+        )
+        XCTAssertNotEqual(enabled, disabled)
+    }
 }

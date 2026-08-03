@@ -43,6 +43,29 @@ nonisolated struct OpenAIChatRequest: Sendable, Equatable {
     /// `max_completion_tokens` (newer). Nil when the caller omits it; the
     /// translator falls back to pi's 32768 default.
     let maxTokens: Int?
+    /// The agent's reasoning intent, parsed from `reasoning_effort`,
+    /// `reasoning: {...}`, or `thinking: {...}`. `.absent` when the request
+    /// carries none of these (the common case — most agents don't speak
+    /// reasoning today, so the translator falls back to gateway defaults).
+    let reasoningIntent: OpenAIReasoningIntent
+
+    /// Memberwise init with `reasoningIntent` defaulting to `.absent`. The
+    /// default lets existing test call sites (and any future caller that
+    /// doesn't care about reasoning) construct a request without naming the
+    /// field — important because the translator predates reasoning support.
+    init(
+        model: String,
+        messages: [OpenAIChatMessage],
+        tools: [OpenAITool]? = nil,
+        maxTokens: Int? = nil,
+        reasoningIntent: OpenAIReasoningIntent = .absent
+    ) {
+        self.model = model
+        self.messages = messages
+        self.tools = tools
+        self.maxTokens = maxTokens
+        self.reasoningIntent = reasoningIntent
+    }
 }
 
 nonisolated struct OpenAIChatMessage: Sendable, Equatable {
@@ -108,6 +131,63 @@ nonisolated struct QoderModelConfig: Sendable, Equatable {
     static let defaultUnknown = QoderModelConfig(
         key: "", isReasoning: false, maxOutputTokens: 32768, source: "system"
     )
+}
+
+// MARK: - Reasoning intent (agent request → Qoder thinking_config)
+
+/// The agent's reasoning intent, parsed from whichever vocabulary it speaks.
+/// Three states — the distinction between `.absent` and `.disabled` is
+/// load-bearing: `.absent` means "agent said nothing, use gateway default";
+/// `.disabled` means "agent explicitly asked to turn thinking off." Encoding
+/// both as `enabled: false` (as an earlier two-field struct did) collapsed
+/// them and made every default-path request force-disable thinking on
+/// reasoning models — the inverse of the intended behavior.
+///
+/// Three input variants are recognized (see `parseReasoningIntent`):
+///   - OpenAI's `reasoning_effort: "low"|"medium"|"high"` (string shortcut)
+///   - OpenAI's `reasoning: {effort: "...", exclude: bool}` (object form)
+///   - Anthropic-style `thinking: {type: "enabled"|"disabled", budget_tokens}`
+///
+/// Unknown effort strings are clamped to the closest Qoder tier rather than
+/// rejected — agents that invent custom values still get a usable request.
+nonisolated enum OpenAIReasoningIntent: Sendable, Equatable {
+    /// Agent expressed no reasoning intent (no `reasoning_effort`, no
+    /// `reasoning`, no `thinking` field). The common case — the translator
+    /// falls back to the gateway's default behavior for the model.
+    case absent
+    /// Agent asked to disable thinking. Reachable only from explicit "off"
+    /// shapes: `reasoning: {exclude: true}` (when no effort accompanies it),
+    /// `thinking: {type: "disabled"}`, or an effort alias like `"none"`/`"off"`.
+    case disabled
+    /// Agent asked for thinking. `effort` is one of Qoder's tiers
+    /// (`"low"|"medium"|"high"|"xhigh"|"max"`); `nil` means "enabled but let
+    /// the gateway pick the tier" (e.g. `thinking: {type: "enabled"}` with no
+    /// budget, or `reasoning: {}`).
+    case enabled(effort: String?)
+}
+
+/// Qoder's thinking selection, derived from `OpenAIReasoningIntent` and the
+/// resolved model config. This is what the envelope builder consumes: it fuses
+/// "the agent asked for X" with "the model can actually reason" so the rest of
+/// the translator doesn't re-derive that intersection.
+///
+/// `disabled` is distinct from `absent`: `disabled` means an envelope field IS
+/// emitted (telling the gateway to turn thinking off on a reasoning-capable
+/// model); `absent` means no field at all (gateway default, today's behavior).
+/// Keeping them separate preserves the "agent can force-disable reasoning on
+/// `ultimate`" path without forcing every request to carry a thinking_config.
+nonisolated enum QoderThinkingSelection: Sendable, Equatable {
+    /// No `thinking_config` field in the envelope. Used when the model is not
+    /// reasoning-capable, or when the agent expressed no intent and we want the
+    /// gateway's default for a reasoning model.
+    case absent
+    /// `{disabled: {}}` — agent explicitly asked to turn thinking off on a
+    /// reasoning-capable model.
+    case disabled
+    /// `{enabled: {effort: <tier>}}` — agent asked for a specific effort level
+    /// on a reasoning-capable model. Only emitted when the agent's intent is
+    /// enabled AND the model is reasoning-capable.
+    case enabled(effort: String)
 }
 
 // MARK: - Normalized Qoder-shape message (translator → envelope builder)
@@ -272,11 +352,20 @@ nonisolated enum QoderChatTranslator {
         // text path (no tools) so the tools branch of the hash is a no-op;
         // tool-bearing requests hash the canonical tools JSON for cache
         // affinity (Phase 2b fix — previously always "" broke affinity).
+        // The thinking selection is hashed too: two requests to the same
+        // reasoning model with different effort tiers can legitimately
+        // diverge, so conflating them under one cache key would be a
+        // correctness bug. `.absent` hashes as a stable empty marker.
+        let thinking = resolveThinking(
+            intent: request.reasoningIntent,
+            modelReasoning: modelConfig.isReasoning
+        )
         let recordID = stableChatRecordID(
             model: modelKey,
             messages: normalizedMessages,
             toolsJSON: toolsJSON,
-            maxTokens: maxTokens
+            maxTokens: maxTokens,
+            thinking: thinking
         )
 
         // Session ID per ADR 0005 §1: stable across same user + same model +
@@ -303,6 +392,7 @@ nonisolated enum QoderChatTranslator {
             messages: normalizedMessages,
             tools: transformedTools,
             lastUserText: lastUserText,
+            thinking: thinking,
             businessID: businessID,
             businessBeginAtMS: businessBeginAt
         )
@@ -339,8 +429,8 @@ nonisolated enum QoderChatTranslator {
         return hexPrefix16(hash.finalize())
     }
 
-    /// `stableChatRecordID(model, messages, tools, maxTokens)`: sha256 over
-    /// `qoder-record \0 model [\0 role][\0 content]... [\0 toolsJSON] \0 mt=N`,
+    /// `stableChatRecordID(model, messages, tools, maxTokens, thinking)`: sha256 over
+    /// `qoder-record \0 model [\0 role][\0 content]... [\0 toolsJSON] \0 mt=N \0 th=...`,
     /// first 16 hex chars. Mirrors pi's `stableChatRecordID` exactly.
     ///
     /// Content-hashing rule matches pi's JS truthiness: role is hashed if
@@ -356,7 +446,8 @@ nonisolated enum QoderChatTranslator {
         model: String,
         messages: [QoderMessage],
         toolsJSON: String,
-        maxTokens: Int
+        maxTokens: Int,
+        thinking: QoderThinkingSelection = .absent
     ) -> String {
         var hash = SHA256()
         hash.update(data: Data("qoder-record".utf8))
@@ -391,7 +482,32 @@ nonisolated enum QoderChatTranslator {
         }
         hash.update(data: Data([0]))
         hash.update(data: Data("mt=\(maxTokens)".utf8))
+        // Thinking selection: distinct effort tiers (and the disabled vs.
+        // absent distinction) produce different cache keys, since they can
+        // legitimately yield different completions for the same prompt.
+        // IMPORTANT: `.absent` contributes NOTHING to the hash — not even the
+        // `\0th=` separator — so the default path (agent sent no reasoning
+        // field) hashes byte-identically to pre-2026-08 behavior. This
+        // preserves pi parity and existing cache keys; only requests that
+        // explicitly set a thinking selection shift their key.
+        let marker = thinkingCacheMarker(thinking)
+        if !marker.isEmpty {
+            hash.update(data: Data([0]))
+            hash.update(data: Data("th=\(marker)".utf8))
+        }
         return hexPrefix16(hash.finalize())
+    }
+
+    /// Stable string marker for the thinking selection in the recordID hash.
+    /// `.absent` → "" (no marker appended → default-path hash unchanged);
+    /// `.disabled` → "off"; `.enabled(effort:)` → the effort tier verbatim.
+    /// Kept simple so the hash input is auditable and the cache keys predictable.
+    private static func thinkingCacheMarker(_ thinking: QoderThinkingSelection) -> String {
+        switch thinking {
+        case .absent: return ""
+        case .disabled: return "off"
+        case .enabled(let effort): return effort
+        }
     }
 
     /// Lowercased hex of a SHA256 digest, truncated to 16 chars. Hoisted so
@@ -537,6 +653,7 @@ nonisolated enum QoderChatTranslator {
         messages: [QoderMessage],
         tools: [[String: Any]],
         lastUserText: String,
+        thinking: QoderThinkingSelection,
         businessID: String,
         businessBeginAtMS: Int
     ) -> [String: Any] {
@@ -583,12 +700,11 @@ nonisolated enum QoderChatTranslator {
                 "features": [],
                 "text": lastUserText,
             ],
-            "model_config": [
-                "key": modelKey,
-                "is_reasoning": modelConfig.isReasoning,
-                "max_output_tokens": modelConfig.maxOutputTokens,
-                "source": modelConfig.source,
-            ],
+            "model_config": modelConfigJSONObject(
+                modelKey: modelKey,
+                modelConfig: modelConfig,
+                thinking: thinking
+            ),
             "business": [
                 "product": "cli",
                 "version": "1.0.0",
@@ -599,6 +715,82 @@ nonisolated enum QoderChatTranslator {
                 "begin_at": businessBeginAtMS,
             ],
         ] as [String: Any]
+    }
+
+    /// Build the `model_config` envelope block, including `thinking_config`
+    /// when the thinking selection is non-`.absent`. The gateway reads
+    /// `thinking_config` to decide whether to invoke chain-of-thought and at
+    /// what effort tier; omitting it (the `.absent` path) lets the gateway
+    /// apply its own default — today's behavior for requests that carry no
+    /// agent reasoning intent.
+    ///
+    /// The `thinking_config` shape mirrors what the live `/model/list` catalog
+    /// advertises under each reasoning-capable model:
+    ///   `{disabled: {}}` or `{enabled: {effort: "low"|"medium"|"high"|"xhigh"|"max"}}`.
+    private static func modelConfigJSONObject(
+        modelKey: String,
+        modelConfig: QoderModelConfig,
+        thinking: QoderThinkingSelection
+    ) -> [String: Any] {
+        var config: [String: Any] = [
+            "key": modelKey,
+            "is_reasoning": modelConfig.isReasoning,
+            "max_output_tokens": modelConfig.maxOutputTokens,
+            "source": modelConfig.source,
+        ]
+        switch thinking {
+        case .absent:
+            break  // no thinking_config field → gateway default
+        case .disabled:
+            config["thinking_config"] = ["disabled": [String: Any]()] as [String: Any]
+        case .enabled(let effort):
+            config["thinking_config"] = ["enabled": ["effort": effort]] as [String: Any]
+        }
+        return config
+    }
+
+    /// Fuse the agent's reasoning intent with the model's reasoning capability
+    /// into the envelope-level thinking selection. This is the single place
+    /// where "what the agent asked" meets "what the model can do":
+    ///
+    ///   - Non-reasoning model → `.absent` always. The gateway can't make
+    ///     `qoder/auto` reason regardless of intent; sending a thinking_config
+    ///     would be noise at best.
+    ///   - Reasoning model + `.absent` intent → `.absent`. The gateway applies
+    ///     its own default effort (e.g. `high` for `ultimate`), matching
+    ///     pre-2026-08 behavior so existing requests are unchanged. **This is
+    ///     the common case** — most CLI agents send no reasoning field today.
+    ///   - Reasoning model + `.disabled` intent → `.disabled`. Emits
+    ///     `{disabled: {}}`, letting an agent force off thinking on
+    ///     `qoder/ultimate` per-request.
+    ///   - Reasoning model + `.enabled(effort:)` with a tier → `.enabled(effort:)`.
+    ///   - Reasoning model + `.enabled(effort: nil)` → `.absent`. Agent asked
+    ///     for thinking but named no tier; let the gateway pick its default.
+    ///
+    /// Split out from `translate` so the rule is auditable in one place and
+    /// unit-testable without spinning up a full envelope build.
+    static func resolveThinking(
+        intent: OpenAIReasoningIntent,
+        modelReasoning: Bool
+    ) -> QoderThinkingSelection {
+        // A non-reasoning model can't think regardless of what the agent asked.
+        guard modelReasoning else { return .absent }
+        switch intent {
+        case .absent:
+            // No intent → gateway default. Must NOT become .disabled here —
+            // that was the bug when intent was a two-field struct (absent and
+            // disabled both collapsed to enabled:false and fell through to the
+            // disable branch). The enum makes the distinction structural.
+            return .absent
+        case .disabled:
+            return .disabled
+        case .enabled(let effort):
+            if let effort {
+                return .enabled(effort: effort)
+            }
+            // Enabled but no tier named — let the gateway pick its default.
+            return .absent
+        }
     }
 
     /// Serialize one normalized Qoder message to its JSON-object form.
@@ -670,7 +862,130 @@ nonisolated enum QoderChatTranslator {
         }
         // OpenAI carries max tokens under either spelling.
         let maxTokens = (dict["max_tokens"] as? Int) ?? (dict["max_completion_tokens"] as? Int)
-        return OpenAIChatRequest(model: model, messages: messages, tools: tools, maxTokens: maxTokens)
+        let reasoningIntent = Self.parseReasoningIntent(from: dict)
+        return OpenAIChatRequest(
+            model: model,
+            messages: messages,
+            tools: tools,
+            maxTokens: maxTokens,
+            reasoningIntent: reasoningIntent
+        )
+    }
+
+    // MARK: - Reasoning intent parsing
+
+    /// Parse the agent's reasoning intent from whichever vocabulary it speaks.
+    /// Precedence (first non-`.absent` wins): `reasoning_effort` (OpenAI
+    /// shortcut) → `reasoning: {...}` (OpenAI object) → `thinking: {...}`
+    /// (Anthropic-style). Returns `.absent` when the request carries none of
+    /// these — the common case, since most CLI agents don't set any reasoning
+    /// field today.
+    ///
+    /// Tolerant of shape variation: an unrecognized effort string clamps to the
+    /// nearest Qoder tier rather than rejecting the request, so an agent that
+    /// invents `"ultra"` still gets a usable mapping. Unknown object shapes
+    /// fall through to `.absent` (the gateway's default behavior) rather than
+    /// failing — reasoning intent is metadata, not a request requirement.
+    private static func parseReasoningIntent(from dict: [String: Any]) -> OpenAIReasoningIntent {
+        // 1. `reasoning_effort: "low"|"medium"|"high"` — OpenAI's shortcut form.
+        //    Codex CLI and several agent frameworks send this. The "off"-family
+        //    aliases (`none`/`off`/`minimal`) map to `.disabled` rather than a
+        //    tier — an agent saying "no reasoning" means disable, not low effort.
+        if let effortStr = dict["reasoning_effort"] as? String, !effortStr.isEmpty {
+            if isDisableAlias(effortStr) { return .disabled }
+            return .enabled(effort: clampEffort(effortStr))
+        }
+        // 2. `reasoning: {effort: "...", exclude: bool}` — OpenAI's object form.
+        //    NOTE on `exclude`: in OpenAI semantics `exclude: true` means
+        //    "exclude reasoning *content from the response*" while the model
+        //    STILL reasons — it's a response-shape flag, not a thinking toggle.
+        //    Qoder's `thinking_config` controls whether the model reasons, so
+        //    mapping `exclude` to `{disabled: {}}` would wrongly change model
+        //    behavior. We therefore ignore `exclude` for the thinking decision
+        //    and let the SSE reparser keep emitting reasoning_content (the agent
+        //    can choose to drop it). Effort, if present, still wins.
+        if let reasoning = dict["reasoning"] as? [String: Any] {
+            if let effortStr = reasoning["effort"] as? String, !effortStr.isEmpty {
+                if isDisableAlias(effortStr) { return .disabled }
+                return .enabled(effort: clampEffort(effortStr))
+            }
+            // `reasoning: {}` or `{exclude: ...}` with no effort → no signal.
+            // Falls through to the thinking-shape check below, then .absent.
+        }
+        // 3. `thinking: {type: "enabled"|"disabled", budget_tokens: N}` — the
+        //    Anthropic-style shape some agents send. `type: "disabled"` is a
+        //    true thinking toggle (unlike OpenAI's `exclude`), so it maps to
+        //    `.disabled`. When enabled, derive an effort from budget_tokens.
+        if let thinking = dict["thinking"] as? [String: Any] {
+            let type = (thinking["type"] as? String) ?? ""
+            switch type {
+            case "disabled":
+                return .disabled
+            case "enabled":
+                if let budget = thinking["budget_tokens"] as? Int, budget > 0 {
+                    return .enabled(effort: effortForBudget(budget))
+                }
+                // enabled with no budget → let the gateway pick its default.
+                return .enabled(effort: nil)
+            default:
+                break
+            }
+        }
+        return .absent
+    }
+
+    /// Whether an effort-string value is really a "turn thinking off" signal
+    /// rather than a tier. Split out so `parseReasoningIntent` can short-circuit
+    /// to `.disabled` before `clampEffort` would otherwise fold `"none"` down
+    /// to `"low"` (which would enable thinking when the agent asked for none).
+    private static func isDisableAlias(_ raw: String) -> Bool {
+        switch raw.lowercased() {
+        case "none", "off", "disable", "disabled", "false":
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Map an arbitrary effort string onto one of Qoder's five tiers
+    /// (`low/medium/high/xhigh/max`, per the live `/model/list` catalog).
+    /// Recognized strings map verbatim; unknowns clamp to the closest known
+    /// tier by name. The mapping is deliberately generous — agents that send
+    /// `"ultra"`, `"max"`, `"extreme"` etc. still get a sensible tier.
+    ///
+    /// Callers should check `isDisableAlias` first — this function assumes the
+    /// input is a real effort request, not a disguised disable. Kept as a pure
+    /// function so tests can pin golden vectors per input.
+    private static func clampEffort(_ raw: String) -> String {
+        let known: Set<String> = ["low", "medium", "high", "xhigh", "max"]
+        let lowered = raw.lowercased()
+        if known.contains(lowered) { return lowered }
+        // Aliases observed across agent frameworks.
+        switch lowered {
+        case "minimal":
+            return "low"
+        case "standard", "normal", "default", "auto":
+            return "medium"
+        case "ultra", "extreme", "maximum", "best", "strong":
+            return "max"
+        default:
+            // Unknown but non-empty: round up to `medium` (Qoder's gateway
+            // default for most reasoning models) rather than guessing low/high.
+            return "medium"
+        }
+    }
+
+    /// Map an Anthropic-style `budget_tokens` to the nearest Qoder effort tier.
+    /// Rough banding — the live catalog doesn't expose per-tier token budgets,
+    /// so we use conventional ranges. Tighter budgets → lower effort.
+    private static func effortForBudget(_ budget: Int) -> String {
+        switch budget {
+        case ..<4096: return "low"
+        case ..<16384: return "medium"
+        case ..<65536: return "high"
+        case ..<262144: return "xhigh"
+        default: return "max"
+        }
     }
 
     private static func parseMessage(_ dict: [String: Any], idx: Int) throws -> OpenAIChatMessage {
