@@ -355,13 +355,12 @@ nonisolated struct QoderSSEReparser {
                 //    we additionally flush on a non-empty `name` so the canonical
                 //    OpenAI opening frame `{name, arguments:""}` still streams.
                 //
-                //    OpenAI's streaming schema requires every emitted
-                //    `tool_calls[].function` to be an object, so a header-only
-                //    delta MUST be buffered, never re-emitted as-is (a stray
-                //    `{"type":"function","index":0}` makes strict clients reject
-                //    the whole turn — observed against the ZCode agent's zod
-                //    validator). The buffered id/type ride the first function-
-                //    bearing chunk for this index.
+                //    Individual OpenAI streaming tool-call chunks may be sparse,
+                //    but strict downstream consumers can reject a header-only
+                //    delta (a stray `{"type":"function","index":0}` made the
+                //    ZCode agent's zod validator reject the whole turn). Buffer
+                //    that compatibility-sensitive preamble; its id/type ride
+                //    the first function-bearing chunk for this index.
                 if let toolCalls = delta["tool_calls"] as? [Any], !toolCalls.isEmpty {
                     for raw in toolCalls {
                         guard let tc = raw as? [String: Any] else { continue }
@@ -453,11 +452,11 @@ nonisolated struct QoderSSEReparser {
     /// Emission rules (mirrors pi's stream.ts ~407-435, broadened to also flush
     /// on a non-empty `name`):
     /// - A header-only delta (`{index, id, type}`, no `function`) is buffered
-    ///   into `state` and produces NO chunk. OpenAI's streaming schema requires
-    ///   `tool_calls[].function` to be an object on every emitted entry, so
-    ///   re-emitting `{"type":"function","index":0}` makes strict clients reject
-    ///   the whole turn (observed: ZCode agent zod validator,
-    ///   `function: expected object, received undefined`).
+    ///   into `state` and produces NO chunk. Although OpenAI permits sparse
+    ///   streaming fragments, re-emitting `{"type":"function","index":0}`
+    ///   makes strict downstream clients reject the whole turn (observed: the
+    ///   ZCode agent's zod validator, `function: expected object, received
+    ///   undefined`).
     /// - The first function-bearing delta for an index (a non-empty `name`
     ///   and/or a non-empty `arguments`) emits the opening frame: it carries
     ///   the buffered `id`/`type` from any header-only preamble, plus `name`

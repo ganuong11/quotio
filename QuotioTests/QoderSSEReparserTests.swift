@@ -479,6 +479,63 @@ final class QoderSSEReparserTests: XCTestCase {
         )
     }
 
+    /// A name-only delta after a suppressed header becomes the opening frame;
+    /// the following arguments delta remains sparse and uses the same index.
+    /// This mirrors a valid incremental Chat Completions tool-call sequence:
+    /// clients concatenate `function.arguments` across emitted chunks.
+    func testToolCallNameAndArgumentsArriveInSeparateDeltas() throws {
+        var reparser = QoderSSEReparser(created: 1)
+        let headerOnly = qoderLine(innerWithToolCalls([[
+            "index": 0, "id": "call_1", "type": "function",
+        ]]))
+        let nameOnly = qoderLine(innerWithToolCalls([[
+            "index": 0,
+            "function": ["name": "get_weather"],
+        ]]))
+        let arguments = qoderLine(innerWithToolCalls([[
+            "index": 0,
+            "function": ["arguments": "{\"city\":\"Paris\"}"],
+        ]]))
+        let stop = qoderLine([
+            "choices": [["delta": [:], "finish_reason": "stop"]],
+        ])
+
+        var out = try reparser.feed(Data(headerOnly.utf8))
+        out.append(try reparser.feed(Data(nameOnly.utf8)))
+        out.append(try reparser.feed(Data(arguments.utf8)))
+        out.append(try reparser.feed(Data(stop.utf8)))
+        out.append(try reparser.finish())
+        let chunks = openAIChunks(out)
+        let toolChunks = chunks.filter {
+            (($0["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["tool_calls"] != nil
+        }
+
+        // The header-only delta is suppressed for strict downstream clients.
+        XCTAssertEqual(toolChunks.count, 2)
+
+        let first = ((toolChunks[0]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["tool_calls"] as? [[String: Any]]
+        XCTAssertEqual(first?[0]["index"] as? Int, 0)
+        XCTAssertEqual(first?[0]["id"] as? String, "call_1")
+        XCTAssertEqual(first?[0]["type"] as? String, "function")
+        let firstFunction = first?[0]["function"] as? [String: Any]
+        XCTAssertEqual(firstFunction?["name"] as? String, "get_weather")
+        XCTAssertNil(firstFunction?["arguments"])
+
+        let second = ((toolChunks[1]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["tool_calls"] as? [[String: Any]]
+        XCTAssertEqual(second?[0]["index"] as? Int, 0)
+        XCTAssertNil(second?[0]["id"])
+        XCTAssertNil(second?[0]["type"])
+        let secondFunction = second?[0]["function"] as? [String: Any]
+        XCTAssertEqual(secondFunction?["arguments"] as? String, "{\"city\":\"Paris\"}")
+
+        let finishChunk = chunks.first { ($0["choices"] as? [[String: Any]])?[0]["finish_reason"] != nil }
+        XCTAssertEqual(
+            (finishChunk?["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String,
+            "tool_calls"
+        )
+        XCTAssertTrue(String(data: out, encoding: .utf8)?.hasSuffix("data: [DONE]\n\n") == true)
+    }
+
     /// A meaningful upstream finish_reason ("length") is preserved even when
     /// tool_calls streamed — only a generic "stop" is overridden.
     func testToolCallsPreserveMeaningfulFinishReason() throws {
