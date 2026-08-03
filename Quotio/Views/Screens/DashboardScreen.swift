@@ -25,11 +25,20 @@ struct DashboardScreen: View {
         guard modeManager.isLocalProxyMode else { return false }
         return !isSetupComplete
     }
-    
+
+    /// Whether at least one provider is connected. `connectedProviders` is the
+    /// canonical, mode-aware "connected" set (auth files in proxy mode, plus
+    /// vault-backed Qoder which has no CPA auth file). Using `authFiles.isEmpty`
+    /// here would leave a Qoder-only proxy user stuck on "Connect AI Provider"
+    /// even though Qoder is connected and listed on the Providers screen.
+    private var hasConnectedProvider: Bool {
+        !viewModel.connectedProviders.isEmpty
+    }
+
     private var isSetupComplete: Bool {
         viewModel.proxyManager.isBinaryInstalled &&
         viewModel.proxyManager.proxyStatus.running &&
-        !viewModel.authFiles.isEmpty &&
+        hasConnectedProvider &&
         viewModel.agentSetupViewModel.agentStatuses.contains(where: { $0.configured })
     }
     
@@ -579,8 +588,8 @@ struct DashboardScreen: View {
                 icon: "person.2.badge.key",
                 title: "onboarding.addProvider".localized(),
                 description: "onboarding.addProviderDesc".localized(),
-                isCompleted: !viewModel.authFiles.isEmpty,
-                actionLabel: viewModel.authFiles.isEmpty ? "providers.addProvider".localized() : nil
+                isCompleted: hasConnectedProvider,
+                actionLabel: hasConnectedProvider ? nil : "providers.addProvider".localized()
             ),
             GettingStartedStep(
                 id: "agent",
@@ -684,7 +693,13 @@ struct DashboardScreen: View {
             VStack(alignment: .leading, spacing: 12) {
                 FlowLayout(spacing: 8) {
                     ForEach(viewModel.connectedProviders) { provider in
-                        ProviderChip(provider: provider, count: viewModel.authFilesByProvider[provider]?.count ?? 0)
+                        // Qoder has no CPA auth file, so authFilesByProvider
+                        // undercounts it in proxy mode; read its vault accounts
+                        // instead so the ×N badge (shown only when >1) is right.
+                        let count = (provider == .qoder && modeManager.isLocalProxyMode)
+                            ? viewModel.monitorAccounts.lazy.filter { $0.provider == .qoder }.count
+                            : viewModel.authFilesByProvider[provider]?.count ?? 0
+                        ProviderChip(provider: provider, count: count)
                     }
                     
                     ForEach(viewModel.disconnectedProviders.filter(\.supportsLocalProxySetup)) { provider in

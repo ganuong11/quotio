@@ -80,6 +80,30 @@ struct ProvidersScreen: View {
             }
         }
 
+        // Qoder is vault-backed and routed direct from the vault in proxy mode
+        // (ProxyBridge + QoderFailoverRouter); it never becomes a CPA auth file
+        // (cliProxyType(.qoder) == nil), so the proxy/else branches above can
+        // never include it. Surface it from monitorAccounts in Local Proxy mode
+        // *regardless of whether the proxy is running* — otherwise a Qoder
+        // account added in monitor mode is invisible here after a mode switch
+        // (and on a cold start in proxy mode). Monitor mode already lists it
+        // via the branch above; remote mode shows the remote server's accounts,
+        // not the local vault, so neither is touched here. The merge is scoped
+        // to .qoder so CPA-exported providers (claude/codex/…) are not
+        // double-listed alongside their auth-file rows.
+        if modeManager.isLocalProxyMode {
+            for account in viewModel.monitorAccounts where account.provider == .qoder {
+                let state = viewModel.monitorStatus(for: account)
+                groups[.qoder, default: []].append(
+                    AccountRowData.from(
+                        monitorAccount: account,
+                        status: state.status,
+                        statusMessage: state.message
+                    )
+                )
+            }
+        }
+
         // Add auto-detected accounts (Cursor, Trae)
         // API-key providers are added from their own storage below.
         for (provider, quotas) in viewModel.providerQuotas where !modeManager.isMonitorMode {
@@ -506,7 +530,11 @@ struct ProvidersScreen: View {
         // Only proxy accounts can be deleted via API
         guard account.canDelete else { return }
 
-        if modeManager.isMonitorMode, case .monitor = account.source {
+        // Source-based, not mode-based: a vault/monitor account is deleted via
+        // the coordinator regardless of operating mode. Gating on isMonitorMode
+        // left this a silent no-op in proxy mode (the fall-through authFiles
+        // lookup can never match a vault row).
+        if case .monitor = account.source {
             await viewModel.deleteMonitorAccount(accountID: account.id)
             return
         }
@@ -547,7 +575,9 @@ struct ProvidersScreen: View {
     }
 
     private func toggleAccountDisabled(_ account: AccountRowData) async {
-        if modeManager.isMonitorMode, case .monitor = account.source {
+        // Source-based, not mode-based: see deleteAccount above. Without this a
+        // vault row's disable toggle silently did nothing in proxy mode.
+        if case .monitor = account.source {
             await viewModel.setMonitorAccountDisabled(!account.isDisabled, accountID: account.id)
             return
         }

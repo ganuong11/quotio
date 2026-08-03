@@ -398,7 +398,17 @@ final class QuotaViewModel {
 
         // Always refresh quotas directly first (works without proxy)
         await refreshQuotasUnified()
-        
+
+        // Populate monitorAccounts in Local Proxy mode too. Qoder is vault-
+        // backed and routed direct from the vault (ProxyBridge + router) and
+        // has no CPA auth file, so ProvidersScreen surfaces it from
+        // monitorAccounts; without this it stays empty on a cold start in
+        // proxy mode and the Qoder row never appears (and the onboarding
+        // dedup guard can't see it either). Dashboard / menu-bar / badge reads
+        // of monitorAccounts are gated on isMonitorMode, so this is inert
+        // outside the Providers screen.
+        monitorAccounts = await monitorCoordinator.discoverAccounts(merging: providerQuotas)
+
         let autoStartProxy = UserDefaults.standard.bool(forKey: "autoStartProxy")
         if autoStartProxy && proxyManager.isBinaryInstalled {
             await startProxy()
@@ -1018,7 +1028,23 @@ final class QuotaViewModel {
             providerQuotas.removeValue(forKey: .clinePass)
         }
     }
-    
+
+    /// Refresh Qoder quota from the vault. Qoder is vault-backed and its
+    /// fetcher hits openapi.qoder.sh directly (no CPA dependency), so this
+    /// works in any mode. Without it, proxy-mode refresh paths
+    /// (refreshQuotasUnified on cold start, refreshAllQuotas on auto-refresh)
+    /// never populate providerQuotas[.qoder] and the Quota screen shows no
+    /// Qoder tab until the user passes through Monitor mode (whose
+    /// refreshQuotasDirectly is the only path that previously fetched it).
+    private func refreshQoderQuotasInternal() async {
+        let quotas = await qoderFetcher.fetchAllQuotas()
+        if !quotas.isEmpty {
+            providerQuotas[.qoder] = quotas
+        } else {
+            providerQuotas.removeValue(forKey: .qoder)
+        }
+    }
+
     /// Refresh Warp quota using API keys from WarpService
     private func refreshWarpQuotasInternal() async {
         let warpTokens = await MainActor.run {
@@ -1487,7 +1513,19 @@ final class QuotaViewModel {
         if modeManager.isMonitorMode {
             return Array(Set(monitorAccounts.map(\.provider))).sorted { $0.displayName < $1.displayName }
         }
-        return Array(Set(authFiles.compactMap { $0.providerType })).sorted { $0.displayName < $1.displayName }
+        var providers = Set(authFiles.compactMap { $0.providerType })
+        if modeManager.isLocalProxyMode,
+           monitorAccounts.contains(where: { $0.provider == .qoder }) {
+            // Qoder is vault-backed and routed direct from the vault in proxy
+            // mode, but it has no CPA auth file (cliProxyType(.qoder) == nil),
+            // so the authFiles set above never includes it. Without this it
+            // falls into disconnectedProviders and renders as a grey "+" chip
+            // on the dashboard even though it is connected (and listed) on the
+            // Providers screen. Remote mode is intentionally untouched: its
+            // dashboard reflects the remote server, not the local vault.
+            providers.insert(.qoder)
+        }
+        return Array(providers).sorted { $0.displayName < $1.displayName }
     }
     
     var disconnectedProviders: [AIProvider] {
@@ -1496,7 +1534,17 @@ final class QuotaViewModel {
         }
     }
     
-    var totalAccounts: Int { authFiles.count }
+    var totalAccounts: Int {
+        let proxyCount = authFiles.count
+        guard modeManager.isLocalProxyMode else { return proxyCount }
+        // Qoder has no CPA auth file, so authFiles undercounts the dashboard
+        // "Accounts" KPI in proxy mode by exactly the Qoder vault accounts.
+        // Add them so the KPI matches the Providers screen (which lists Qoder
+        // from monitorAccounts). readyAccounts is left auth-file-only: there is
+        // no vault "ready" notion (monitor mode's own dashboard shows only a
+        // tracked total), so fabricating one here would be inconsistent.
+        return proxyCount + monitorAccounts.lazy.filter { $0.provider == .qoder }.count
+    }
     var readyAccounts: Int { authFiles.filter { $0.isReady }.count }
     
     func startProxy() async {
@@ -1748,7 +1796,7 @@ final class QuotaViewModel {
         }
         let providers: Set<AIProvider> = modeManager.isRemoteProxyMode
             ? [.gemini]
-            : [.antigravity, .codex, .copilot, .claude, .glm, .warp, .kiro, .clinePass, .gemini]
+            : [.antigravity, .codex, .copilot, .claude, .glm, .warp, .kiro, .clinePass, .gemini, .qoder]
         guard beginBatchRefresh(providers: providers) else { return }
         defer { endBatchRefresh(providers: providers) }
 
@@ -1772,8 +1820,9 @@ final class QuotaViewModel {
             async let warp: () = refreshWarpQuotasInternal()
             async let kiro: () = refreshKiroQuotasInternal()
             async let clinePass: () = refreshClinePassQuotasInternal()
+            async let qoder: () = refreshQoderQuotasInternal()
 
-            _ = await (antigravity, openai, copilot, claudeCode, glm, warp, kiro, clinePass, geminiCLI)
+            _ = await (antigravity, openai, copilot, claudeCode, glm, warp, kiro, clinePass, geminiCLI, qoder)
         } else {
             _ = await geminiCLI
         }
@@ -1799,6 +1848,13 @@ final class QuotaViewModel {
 
         let providers: Set<AIProvider> = [
             .antigravity, .codex, .copilot, .claude, .glm, .warp, .kiro, .gemini, .clinePass,
+            // Qoder is vault-backed and its fetcher hits openapi.qoder.sh
+            // directly (no CPA dependency), so it must be refreshed in proxy
+            // mode too. Without this, a cold start in Local Proxy mode never
+            // populates providerQuotas[.qoder] and the Quota screen shows no
+            // Qoder tab until the user passes through Monitor mode (which uses
+            // refreshQuotasDirectly and does include .qoder).
+            .qoder,
         ]
         guard beginBatchRefresh(providers: providers) else { return }
         defer { endBatchRefresh(providers: providers) }
@@ -1817,8 +1873,9 @@ final class QuotaViewModel {
         async let kiro: () = refreshKiroQuotasInternal()
         async let geminiCLI: () = refreshGeminiCLIQuotasInternal()
         async let clinePass: () = refreshClinePassQuotasInternal()
+        async let qoder: () = refreshQoderQuotasInternal()
 
-        _ = await (antigravity, codex, copilot, claudeCode, glm, warp, kiro, geminiCLI, clinePass)
+        _ = await (antigravity, codex, copilot, claudeCode, glm, warp, kiro, geminiCLI, clinePass, qoder)
 
         checkQuotaNotifications()
         pruneMenuBarItems()
