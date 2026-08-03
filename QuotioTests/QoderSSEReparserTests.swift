@@ -406,6 +406,79 @@ final class QoderSSEReparserTests: XCTestCase {
         )
     }
 
+    /// Regression: an upstream `tool_calls` delta that carries `id`/`type`/
+    /// `index` but NO `function` object (the first frame of a tool stream —
+    /// Qoder sometimes opens with `{"type":"function","index":0}` before the
+    /// name/arguments arrive) MUST NOT be re-emitted as-is. OpenAI's streaming
+    /// schema requires `choices[].delta.tool_calls[].function` to be an object
+    /// whenever the entry is present, so emitting `{"type":"function","index":0}`
+    /// makes strict clients (the ZCode agent's zod validator) reject the whole
+    /// turn with `invalid_union / function: expected object, received undefined`.
+    ///
+    /// The id/type are buffered server-side; the first chunk the agent sees for
+    /// a tool_call must carry a non-empty `function` (name, arguments, or both).
+    /// See `Turn execution failed ... Type validation failed` (qoder/qmodel_38max).
+    func testToolCallDeltaWithoutFunctionIsNotEmitted() throws {
+        var reparser = QoderSSEReparser(created: 1)
+        // First upstream delta: id/type/index only — no function payload yet.
+        let headerOnly = qoderLine(innerWithToolCalls([[
+            "index": 0, "id": "call_1", "type": "function",
+        ]]))
+        // Second upstream delta: function.name + arguments fragment.
+        let nameAndArgs = qoderLine(innerWithToolCalls([[
+            "index": 0,
+            "function": ["name": "get_weather", "arguments": "{\"city\":\"Paris\"}"],
+        ]]))
+        var out = try reparser.feed(Data(headerOnly.utf8))
+        out.append(try reparser.feed(Data(nameAndArgs.utf8)))
+        let chunks = openAIChunks(out)
+
+        // The first (function-less) delta MUST NOT produce an OpenAI chunk.
+        // Find the first chunk that carries a tool_calls delta.
+        let toolChunks = chunks.filter {
+            (($0["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["tool_calls"] != nil
+        }
+        XCTAssertEqual(toolChunks.count, 1, "only the function-bearing delta should be emitted")
+        let entry = ((toolChunks[0]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["tool_calls"] as? [[String: Any]]
+        XCTAssertEqual(entry?.count, 1)
+        // The emitted entry MUST carry a non-empty `function` object — the
+        // field the zod validator complained was missing.
+        let fn = entry?[0]["function"] as? [String: Any]
+        XCTAssertNotNil(fn, "emitted tool_call entry must carry a function object")
+        XCTAssertFalse((fn ?? [:]).isEmpty, "function object must not be empty")
+        // The buffered id/type from the header-only delta ride this chunk.
+        XCTAssertEqual(entry?[0]["id"] as? String, "call_1")
+        XCTAssertEqual(entry?[0]["type"] as? String, "function")
+        XCTAssertEqual(fn?["name"] as? String, "get_weather")
+        XCTAssertEqual(fn?["arguments"] as? String, "{\"city\":\"Paris\"}")
+    }
+
+    /// Regression companion: the `finish_reason: "tool_calls"` override must
+    /// still fire when tool_calls were seen, even if the only emitted chunk
+    /// carried the buffered-then-merged payload (i.e. the header-only delta
+    /// contributed to `toolCallsState` even though it produced no chunk).
+    func testToolCallHeaderOnlyStillDrivesFinishOverride() throws {
+        var reparser = QoderSSEReparser(created: 1)
+        let headerOnly = qoderLine(innerWithToolCalls([[
+            "index": 0, "id": "call_1", "type": "function",
+        ]]))
+        let args = qoderLine(innerWithToolCalls([[
+            "index": 0, "function": ["arguments": "{}"],
+        ]]))
+        let stop = qoderLine([
+            "choices": [["delta": [:], "finish_reason": "stop"]],
+        ])
+        var out = try reparser.feed(Data(headerOnly.utf8))
+        out.append(try reparser.feed(Data(args.utf8)))
+        out.append(try reparser.feed(Data(stop.utf8)))
+        let chunks = openAIChunks(out)
+        let finishChunk = chunks.first { ($0["choices"] as? [[String: Any]])?[0]["finish_reason"] != nil }
+        XCTAssertEqual(
+            (finishChunk?["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String,
+            "tool_calls"
+        )
+    }
+
     /// A meaningful upstream finish_reason ("length") is preserved even when
     /// tool_calls streamed — only a generic "stop" is overridden.
     func testToolCallsPreserveMeaningfulFinishReason() throws {

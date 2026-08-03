@@ -348,20 +348,33 @@ nonisolated struct QoderSSEReparser {
                 }
 
                 // 3. tool_calls (Phase 2b). Index-keyed state machine ported
-                //    from stream.ts ~407-435. The first delta per index
-                //    carries id/type/name; argument fragments stream after.
+                //    from stream.ts ~407-435. Upstream opens a tool-call with a
+                //    header-only delta (`{index, id, type}`, no `function`), then
+                //    follows with `function.name` + `function.arguments`
+                //    fragments. Pi only acts when `function.arguments` arrives;
+                //    we additionally flush on a non-empty `name` so the canonical
+                //    OpenAI opening frame `{name, arguments:""}` still streams.
+                //
+                //    OpenAI's streaming schema requires every emitted
+                //    `tool_calls[].function` to be an object, so a header-only
+                //    delta MUST be buffered, never re-emitted as-is (a stray
+                //    `{"type":"function","index":0}` makes strict clients reject
+                //    the whole turn — observed against the ZCode agent's zod
+                //    validator). The buffered id/type ride the first function-
+                //    bearing chunk for this index.
                 if let toolCalls = delta["tool_calls"] as? [Any], !toolCalls.isEmpty {
                     for raw in toolCalls {
                         guard let tc = raw as? [String: Any] else { continue }
                         let index = (tc["index"] as? Int) ?? 0
                         var state = toolCallsState[index] ?? QoderToolCallState()
-                        // First sighting of this index carries id/type/name;
-                        // later deltas only carry argument fragments. OpenAI
-                        // clients reconstruct the call from the first delta +
-                        // concatenated fragments, so we re-emit each delta
-                        // verbatim (true streaming).
-                        out.append(buildToolCallChunk(index: index, delta: tc))
+                        // Accumulate id/type/name from this delta into state
+                        // before deciding whether to emit, so a header-only
+                        // delta is captured even if it produces no chunk.
                         state.recordDelta(tc)
+                        if let chunk = buildToolCallChunk(index: index, state: state, delta: tc) {
+                            out.append(chunk)
+                            state.emittedHeader = true
+                        }
                         toolCallsState[index] = state
                     }
                 }
@@ -433,28 +446,57 @@ nonisolated struct QoderSSEReparser {
         return emitChunk(choice: choice, usage: nil)
     }
 
-    /// Build a tool-call delta chunk (`delta.tool_calls`). Re-emits the upstream
-    /// delta entry verbatim so a fragmenting stream (id+name first, then
-    /// argument fragments) reaches the agent in OpenAI streaming shape. The
-    /// emitted payload carries only fields present in `tcDelta` (matching
-    /// OpenAI incremental streaming — clients tolerate sparse deltas).
+    /// Build a tool-call delta chunk (`delta.tool_calls`) for one upstream
+    /// delta. Returns nil (→ no chunk emitted) when the delta carries no usable
+    /// `function` payload.
+    ///
+    /// Emission rules (mirrors pi's stream.ts ~407-435, broadened to also flush
+    /// on a non-empty `name`):
+    /// - A header-only delta (`{index, id, type}`, no `function`) is buffered
+    ///   into `state` and produces NO chunk. OpenAI's streaming schema requires
+    ///   `tool_calls[].function` to be an object on every emitted entry, so
+    ///   re-emitting `{"type":"function","index":0}` makes strict clients reject
+    ///   the whole turn (observed: ZCode agent zod validator,
+    ///   `function: expected object, received undefined`).
+    /// - The first function-bearing delta for an index (a non-empty `name`
+    ///   and/or a non-empty `arguments`) emits the opening frame: it carries
+    ///   the buffered `id`/`type` from any header-only preamble, plus `name`
+    ///   and/or the first `arguments` fragment.
+    /// - Subsequent argument-fragment deltas emit a sparse chunk carrying only
+    ///   `{index, function:{arguments}}` — `id`/`type`/`name` ride the opening
+    ///   frame only (OpenAI streaming convention; clients concatenate
+    ///   `function.arguments` across chunks).
     private func buildToolCallChunk(
         index: Int,
+        state: QoderToolCallState,
         delta tcDelta: [String: Any]
-    ) -> Data {
-        var entry: [String: Any] = ["index": index]
-        if let id = tcDelta["id"] as? String, !id.isEmpty { entry["id"] = id }
-        if let type = tcDelta["type"] as? String, !type.isEmpty { entry["type"] = type }
-        if let fn = tcDelta["function"] as? [String: Any] {
-            var fnOut: [String: Any] = [:]
-            if let name = fn["name"] as? String, !name.isEmpty { fnOut["name"] = name }
-            if let args = fn["arguments"] as? String { fnOut["arguments"] = args }
-            if !fnOut.isEmpty { entry["function"] = fnOut }
+    ) -> Data? {
+        // Pull any function payload this delta carries.
+        let fnDelta = tcDelta["function"] as? [String: Any] ?? [:]
+        let nameDelta = (fnDelta["name"] as? String) ?? ""
+        // `arguments` may be "" (legitimate first-frame sentinel) or a fragment;
+        // only treat a present key as a payload signal (an absent key with a
+        // present-but-empty name is a header-only delta in disguise).
+        let hasArgumentsFragment = fnDelta["arguments"] is String
+        let hasName = !nameDelta.isEmpty
+
+        // No usable function payload yet → buffer only, emit nothing.
+        guard state.emittedHeader || hasName || hasArgumentsFragment else { return nil }
+
+        var fnOut: [String: Any] = [:]
+        if hasName { fnOut["name"] = nameDelta }
+        if let args = fnDelta["arguments"] as? String { fnOut["arguments"] = args }
+        guard !fnOut.isEmpty else { return nil }
+
+        var entry: [String: Any] = ["index": index, "function": fnOut]
+        // id/type ride the OPENING frame only. Once `emittedHeader` is set
+        // (after this call returns), later argument-fragment deltas skip this
+        // and emit sparse `{index, function:{arguments}}` chunks.
+        if !state.emittedHeader {
+            if !state.id.isEmpty { entry["id"] = state.id }
+            if !state.type.isEmpty { entry["type"] = state.type }
         }
-        // Defensive: if a malformed upstream delta carries no recognizable
-        // fields, drop it (don't emit an index-only no-op chunk that could
-        // confuse strict OpenAI clients).
-        guard entry.count > 1 else { return Data() }
+
         let choice: [String: Any] = [
             "index": 0,
             "delta": ["tool_calls": [entry]],
@@ -515,16 +557,23 @@ nonisolated struct QoderSSEReparser {
 /// ever needs a fully-assembled `toolcall_end` shape.
 nonisolated struct QoderToolCallState: Sendable {
     var id: String = ""
+    var type: String = ""
     var name: String = ""
     /// Concatenated argument fragments (a JSON string built up across deltas).
     /// Unused by the current streaming re-emit but retained for parity with
     /// pi and for the diagnostic/state-completeness it provides.
     var arguments: String = ""
+    /// True once this index has emitted its opening frame. Set after
+    /// `buildToolCallChunk` emits; later deltas (argument fragments) stream
+    /// through regardless of the `function.name`/header check.
+    var emittedHeader: Bool = false
 
-    /// Record fields from one upstream `delta.tool_calls[]` entry. Called after
-    /// the chunk is emitted so the state reflects what the agent has received.
+    /// Record fields from one upstream `delta.tool_calls[]` entry. Called before
+    /// the chunk is built so a header-only delta's id/type are captured even
+    /// when it produces no chunk.
     mutating func recordDelta(_ tc: [String: Any]) {
         if let id = tc["id"] as? String, !id.isEmpty { self.id = id }
+        if let type = tc["type"] as? String, !type.isEmpty { self.type = type }
         if let fn = tc["function"] as? [String: Any] {
             if let name = fn["name"] as? String, !name.isEmpty { self.name = name }
             if let args = fn["arguments"] as? String { self.arguments += args }
