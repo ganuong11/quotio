@@ -39,9 +39,17 @@ import Foundation
 /// translator result (request IDs for logging). The HTTP response is 2xx by
 /// construction here — non-2xx never leaves the router.
 nonisolated struct QoderOpenedStream: Sendable {
-    /// Drive the upstream byte stream. `onChunk` receives each raw buffer the
-    /// gateway yields; return false to stop early. Throws on transport failure.
-    let pump: @Sendable (@Sendable (Data) async throws -> Bool) async throws -> Void
+    /// The leading upstream bytes the router already consumed during its
+    /// pre-handoff peek (it pulled the first chunk to detect an in-envelope
+    /// quota signal). ProxyBridge must feed these through `QoderSSEReparser`
+    /// *before* driving `pump`, or the agent would lose the stream's opening
+    /// bytes. Empty when the peek consumed nothing (e.g. stream ended clean
+    /// on the first chunk boundary, or production never buffered).
+    let bufferedPrefix: Data
+    /// Drive the *remaining* upstream byte stream (everything after
+    /// `bufferedPrefix`). `onChunk` receives each raw buffer the gateway yields;
+    /// return false to stop early. Throws on transport failure.
+    let pump: @Sendable (QoderChunkReceiver) async throws -> Void
     let accountID: String
     let translatorResult: QoderTranslationResult
 }
@@ -353,13 +361,20 @@ actor QoderFailoverRouter {
             throw QoderAccountFailure(kind: .transient, status: nil, detail: error.localizedDescription)
         }
 
-        // Read the HTTP status and apply the rotation policy. 2xx hands off to
-        // ProxyBridge; non-2xx is rotation-eligible (except where noted).
+        // Read the HTTP status and apply the rotation policy. Non-2xx is
+        // rotation-eligible directly. For 2xx we must ALSO peek the first SSE
+        // chunk: Qoder's gateway returns HTTP 200 even when an account is
+        // quota-exhausted, carrying the signal *inside* the stream (either as
+        // an envelope with `statusCodeValue != 200`, or as a silent stall
+        // where no content frame ever arrives). The peek happens before any
+        // byte reaches the agent, so rotation here is still clean — this is
+        // NOT the "mid-stream, cannot rotate" case from ADR 0006 §2 (that
+        // applies only once ProxyBridge has written the 200 head to the agent).
         let status = stream.response.statusCode
         if (200..<300).contains(status) {
-            return QoderOpenedStream(
-                pump: stream.pump,
-                accountID: account.id,
+            return try await confirmStreamAndHandOff(
+                stream: stream,
+                account: account,
                 translatorResult: translatorResult
             )
         }
@@ -381,6 +396,144 @@ actor QoderFailoverRouter {
                 "Qoder gateway returned HTTP \(status) (non-rotatable)."
             )
         }
+    }
+
+    // MARK: - Pre-handoff peek (in-envelope quota/auth detection)
+
+    /// How long to wait for the first SSE chunk before declaring a silent
+    /// stall. Qoder normally emits the opening frame near-instantly; a
+    /// persistent stall on an account the dashboard reports as exhausted is
+    /// quota, not a transient network blip. Tuned to avoid false-rotating on a
+    /// genuinely slow first byte (e.g. a cold model load) while still bounding
+    /// the user-visible hang the pre-fix bug produced (15s+ agent timeouts).
+    private static let firstChunkTimeout: UInt64 = 2_000_000_000  // 2s in ns
+
+    /// Peek the first chunk of a 2xx gateway stream before handing it off to
+    /// ProxyBridge. Returns the opened stream (carrying the consumed prefix) on
+    /// a clean first chunk; throws `QoderAccountFailure` so the existing
+    /// rotation policy applies when the quota/auth signal rides inside the
+    /// stream.
+    ///
+    /// Three branches:
+    ///  1. First chunk carries a non-200 `statusCodeValue` envelope → classify
+    ///     by that status and throw (429→quota, 401/403→auth, 5xx→transient).
+    ///  2. No chunk within `firstChunkTimeout` (silent stall, the live symptom
+    ///     on exhausted accounts) → throw `.quota`. The account is cooled down
+    ///     and the next candidate is tried immediately.
+    ///  3. First chunk is clean (content, or a benign non-envelope line, or the
+    ///     stream ended on `[DONE]`) → hand off, carrying the consumed bytes as
+    ///     `bufferedPrefix` so ProxyBridge doesn't lose them.
+    ///
+    /// Rotation here is clean: ProxyBridge has not yet written anything to the
+    /// agent socket (the 200 SSE head is written only after `openStream`
+    /// returns). ADR 0006 §2's "cannot rotate mid-stream" rule applies further
+    /// down the pipe, not at this seam.
+    private func confirmStreamAndHandOff(
+        stream: QoderGatewayStream,
+        account: MonitorAccount,
+        translatorResult: QoderTranslationResult
+    ) async throws -> QoderOpenedStream {
+        let firstChunk: Data?
+        do {
+            firstChunk = try await withThrowingTaskGroup(of: Data?.self) { group in
+                group.addTask { try await stream.nextChunk() }
+                group.addTask {
+                    try await Task.sleep(nanoseconds: Self.firstChunkTimeout)
+                    return nil
+                }
+                // `group.next()` returns `Data??` (optional element wrapping the
+                // optional payload). Unwrap the outer layer; the inner is the
+                // real signal (nil = stream ended or timeout).
+                if let result = try await group.next() {
+                    group.cancelAll()
+                    return result
+                }
+                group.cancelAll()
+                return nil
+            }
+        } catch {
+            // nextChunk threw (transport drop mid-peek) — transient path.
+            throw QoderAccountFailure(kind: .transient, status: nil, detail: error.localizedDescription)
+        }
+
+        // Branch 2: silent stall. The gateway returned 200 but never yielded a
+        // first chunk within the timeout — the observed shape of an exhausted
+        // account. Classify as quota so the account is cooled down and the next
+        // candidate is tried right away.
+        guard let prefix = firstChunk, !prefix.isEmpty else {
+            throw QoderAccountFailure(kind: .quota, status: 429, detail: "silent stall")
+        }
+
+        // Branch 1: probe the prefix for a non-200 in-envelope signal. Reuses
+        // the reparser's proven parse path — feeds the bytes through a
+        // throwaway reparser and catches `.upstreamStatus`. A malformed line
+        // (`.malformedSSELine`) is swallowed: the first chunk may be a partial
+        // SSE frame split across TCP segments, and the reparser will re-buffer
+        // it correctly once ProxyBridge feeds the full stream. Only a definite
+        // non-200 status trips rotation here.
+        if let signal = QoderFailoverRouter.probeForUpstreamStatus(in: prefix) {
+            switch signal {
+            case 429:
+                throw QoderAccountFailure(kind: .quota, status: signal)
+            case 401, 403:
+                throw QoderAccountFailure(kind: .auth, status: signal)
+            case 500...599:
+                throw QoderAccountFailure(kind: .transient, status: signal)
+            default:
+                // Other non-200 codes inside the envelope are request-level
+                // rejections, same as the HTTP-status path — rotating accounts
+                // won't fix a malformed envelope.
+                throw QoderFailoverError.requestRejected(
+                    "Qoder upstream returned status \(signal) (non-rotatable)."
+                )
+            }
+        }
+
+        // Branch 3: clean. Hand off, carrying the consumed prefix so ProxyBridge
+        // feeds it through the reparser before driving the remainder. Wrap
+        // `stream.pump` in an explicit closure: `QoderGatewayStream` is a class,
+        // so a bare method reference would carry `Self` and fail the
+        // `@Sendable` closure conformance the `QoderOpenedStream.pump` field
+        // requires. The class itself is `@unchecked Sendable`.
+        let streamRef = stream
+        return QoderOpenedStream(
+            bufferedPrefix: prefix,
+            pump: { onChunk in try await streamRef.pump(onChunk) },
+            accountID: account.id,
+            translatorResult: translatorResult
+        )
+    }
+
+    /// Pure probe: does `chunk` contain an SSE frame whose envelope carries a
+    /// non-200 `statusCodeValue`? Returns the status code if so, nil otherwise.
+    /// Nonisolated + pure so it's trivially testable and callable from the
+    /// actor-isolated peek path without a hop.
+    ///
+    /// Mirrors the parse the reparser will do later, but only extracts the
+    /// status — we deliberately don't consume the bytes here (ProxyBridge still
+    /// needs them). Implemented locally rather than by feeding the reparser and
+    /// catching `.upstreamStatus`, because the reparser is a `mutating struct`
+    /// that would have to be constructed and discarded per probe; a focused
+    /// extractor is clearer and avoids the throw-as-control-flow smell.
+    private nonisolated static func probeForUpstreamStatus(in chunk: Data) -> Int? {
+        guard let text = String(data: chunk, encoding: .utf8) else { return nil }
+        // Normalize CRLF so `firstIndex(of: "\n")` splits reliably.
+        let normalized = text.replacingOccurrences(of: "\r\n", with: "\n")
+                             .replacingOccurrences(of: "\r", with: "\n")
+        for rawLine in normalized.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard line.hasPrefix("data:") else { continue }
+            let dataStr = String(line.dropFirst("data:".count)).trimmingCharacters(in: .whitespaces)
+            guard !dataStr.isEmpty, dataStr != "[DONE]" else { continue }
+            guard let lineData = dataStr.data(using: .utf8),
+                  let envelope = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                  let statusCodeValue = envelope["statusCodeValue"] as? Int,
+                  statusCodeValue != 200 else {
+                continue
+            }
+            return statusCodeValue
+        }
+        return nil
     }
 
     // MARK: - Decision policy

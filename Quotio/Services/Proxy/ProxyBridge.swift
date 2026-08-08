@@ -996,6 +996,30 @@ final class ProxyBridge {
             // Track the agent connection so the closure can send to it.
             let agentConn = originalConnection
 
+            // Feed the router's pre-handoff peek prefix through the reparser
+            // first. The router consumed the leading chunk to detect an
+            // in-envelope quota signal; those bytes must still reach the agent,
+            // so we replay them before driving the remainder pump.
+            if !opened.bufferedPrefix.isEmpty {
+                box.totalBytes += opened.bufferedPrefix.count
+                let prefixChunks: Data
+                do {
+                    prefixChunks = try box.reparser.feed(opened.bufferedPrefix)
+                } catch {
+                    // The router already probed the prefix for a non-200
+                    // envelope; a gate trip here would be a second-order
+                    // condition (e.g. malformed line the router's focused
+                    // probe didn't trip on). Terminate the same way as a
+                    // mid-stream gate.
+                    box.failed = true
+                    Log.proxy("Qoder prefix gate tripped: \(error.localizedDescription)")
+                    prefixChunks = Data()
+                }
+                if !prefixChunks.isEmpty {
+                    try? await Self.sendToAgent(prefixChunks, on: agentConn)
+                }
+            }
+
             do {
                 try await opened.pump { rawChunk in
                     box.totalBytes += rawChunk.count

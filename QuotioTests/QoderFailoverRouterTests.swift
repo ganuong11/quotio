@@ -92,6 +92,18 @@ private actor MockGatewayClient: QoderGatewayClientProtocol {
         /// Optional transport error to throw instead of returning a response.
         /// Used to test the transient-retry path.
         let transportError: Error?
+        /// When true, the 2xx stream never yields a chunk (silent stall). Models
+        /// the observed live behavior of a quota-exhausted account: HTTP 200 +
+        /// headers, then no bytes. The router's peek timeout should fire and
+        /// rotate. Mutually exclusive with a non-empty `body`.
+        let stalls: Bool
+
+        init(status: Int, body: Data = Data(), transportError: Error? = nil, stalls: Bool = false) {
+            self.status = status
+            self.body = body
+            self.transportError = transportError
+            self.stalls = stalls
+        }
     }
 
     /// Scripted responses, drained in order across all accounts.
@@ -135,20 +147,41 @@ private actor MockGatewayClient: QoderGatewayClientProtocol {
             headerFields: nil
         )!
         let bodyData = response.body
-        return QoderGatewayStream(response: http) { onChunk in
-            // Yield the scripted body in one chunk. Tests don't need streaming
-            // realism — the router just hands the pump to ProxyBridge, which
-            // is exercised separately by the reparser tests.
-            if !bodyData.isEmpty {
-                _ = try await onChunk(bodyData)
+        // A stalled response never yields (silent stall) — the router's peek
+        // timeout must fire and rotate. We block on an indefinite `Task.sleep`
+        // (the router cancels the peek via its task-group timeout after 2s).
+        if response.stalls {
+            return QoderGatewayStream(response: http) { () -> Data? in
+                try? await Task.sleep(nanoseconds: 60 * 1_000_000_000)
+                return nil
             }
+        }
+        // Yield the scripted body in one pull, then nil (stream end). The router
+        // peeks the first chunk via `nextChunk`; ProxyBridge drives the
+        // remainder via `pump`. A single pull source models "whole body in one
+        // chunk" — the router's peek consumes it, and the remainder pump sees
+        // nil immediately. Tests don't need streaming realism; the reparser
+        // tests exercise byte pumping separately. The `yielded` flag lives in a
+        // Sendable box so the `@Sendable` pull source can mutate it (mirrors the
+        // production `AsyncBytesBox` pattern).
+        let box = MockYieldBox()
+        return QoderGatewayStream(response: http) { () -> Data? in
+            if box.consume() || bodyData.isEmpty { return nil }
+            return bodyData
         }
     }
 }
 
-private extension MockGatewayClient.Response {
-    init(status: Int, body: Data = Data()) {
-        self.init(status: status, body: body, transportError: nil)
+/// One-shot Sendable flag for the mock gateway's pull source: returns true
+/// once (the first pull), false thereafter. Models "yield the scripted body in
+/// one chunk, then stream end." Mirrors the production `AsyncBytesBox`
+/// single-owner pattern.
+private final class MockYieldBox: @unchecked Sendable {
+    private var consumed = false
+    func consume() -> Bool {
+        if consumed { return true }
+        consumed = true
+        return false
     }
 }
 
@@ -327,6 +360,85 @@ final class QoderFailoverRouterTests: XCTestCase {
         await gateway.seed(.init(status: 200, body: Data("data: [DONE]\n\n".utf8)))
         let opened2 = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
         XCTAssertEqual(opened2.accountID, secondary.id, "primary should be in cooldown")
+    }
+
+    // MARK: - Quota exhausted: HTTP 200 with non-2xx inside the stream
+
+    // Regression for the reported bug: "doesn't switch to other qoder account
+    // even when the current account quota is full (100%)". Observed against the
+    // live gateway with three 100%-quota accounts: the gateway returns HTTP 200
+    // + the SSE response head, and the quota-exhaustion signal arrives *inside*
+    // the stream — either as an envelope with `statusCodeValue != 200`, or as
+    // a silent stall where the first SSE frame never carries chat content. The
+    // router currently treats any HTTP 2xx as success at `openStream` time and
+    // hands the stream to ProxyBridge; ProxyBridge then either trips the
+    // reparser's `statusCodeValue` gate (→ mid-stream abort, no rotation) or
+    // blocks forever on a pump that never yields content (→ agent timeout).
+    //
+    // The two tests below model both observed failure shapes. They are RED
+    // today and document the gap; the fix makes the router detect quota
+    // exhaustion on the *first* SSE chunk (before any byte reaches the agent)
+    // and rotate instead of handing off.
+
+    /// Shape 1: HTTP 200, but the first streamed SSE frame's envelope carries
+    /// `statusCodeValue: 429`. The router must rotate to the next account
+    /// instead of handing a 200-quota-error stream to the agent.
+    func testQuotaExhaustedInEnvelopeRotatesToNextAccount() async throws {
+        let vault = InMemoryCredentialStore()
+        let primary = makeAccount(key: "primary@example.com")
+        let secondary = makeAccount(key: "secondary@example.com")
+        await vault.seed(primary, makeCredential(accountID: primary.id, token: "jt-primary"))
+        await vault.seed(secondary, makeCredential(accountID: secondary.id, token: "jt-secondary"))
+
+        // Primary: HTTP 200, but the streamed SSE frame is a quota-exhaustion
+        // envelope. Secondary: HTTP 200 with a clean `[DONE]`.
+        let quotaEnvelope = """
+        data: {"statusCodeValue":429,"body":"\\"quota exceeded\\""}
+
+        """.data(using: .utf8)!
+
+        let gateway = MockGatewayClient()
+        await gateway.seed([
+            .init(status: 200, body: quotaEnvelope),
+            .init(status: 200, body: Data("data: [DONE]\n\n".utf8)),
+        ])
+        let router = makeRouter(
+            vault: vault, pat: MockPATRefresher(), gateway: gateway,
+            metadata: makeMetadataStore()
+        )
+
+        let opened = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
+        XCTAssertEqual(opened.accountID, secondary.id, "should rotate to secondary after in-envelope 429")
+        let callCount = await gateway.callCount
+        XCTAssertEqual(callCount, 2, "two attempts: primary (envelope-429) then secondary (200)")
+    }
+
+    /// Shape 2 (the live symptom): HTTP 200 + SSE headers, then the gateway
+    /// never yields a content frame — the agent blocks until its read timeout.
+    /// Observed against a real 100%-quota account ("ss aa"). The router's peek
+    /// must time out (2s) and rotate to the next account instead of handing
+    /// off a stalled stream.
+    func testSilentStallRotatesToNextAccount() async throws {
+        let vault = InMemoryCredentialStore()
+        let primary = makeAccount(key: "primary@example.com")
+        let secondary = makeAccount(key: "secondary@example.com")
+        await vault.seed(primary, makeCredential(accountID: primary.id, token: "jt-primary"))
+        await vault.seed(secondary, makeCredential(accountID: secondary.id, token: "jt-secondary"))
+
+        let gateway = MockGatewayClient()
+        await gateway.seed([
+            .init(status: 200, stalls: true),  // primary: 200 then silence
+            .init(status: 200, body: Data("data: [DONE]\n\n".utf8)),  // secondary: clean
+        ])
+        let router = makeRouter(
+            vault: vault, pat: MockPATRefresher(), gateway: gateway,
+            metadata: makeMetadataStore()
+        )
+
+        let opened = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
+        XCTAssertEqual(opened.accountID, secondary.id, "should rotate to secondary after a silent stall on primary")
+        let callCount = await gateway.callCount
+        XCTAssertEqual(callCount, 2, "two attempts: primary (stall) then secondary (200)")
     }
 
     // MARK: - All accounts exhausted → throw

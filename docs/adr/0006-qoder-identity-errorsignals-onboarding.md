@@ -27,7 +27,18 @@ the official Qoder CLI or pi provider is also installed on the machine.
 | HTTP 401/403 (after re-exchange) | Mark PAT revoked: disable account, notify user, silently rotate to next account |
 | HTTP 5xx | Transient: retry same account with backoff, do NOT rotate |
 | Network timeout | Transient: retry same account |
-| SSE `statusCodeValue !== 200` mid-stream | Cannot rotate cleanly (stream started); terminate with error |
+| HTTP 200 + non-200 `statusCodeValue` on the **first** SSE chunk | Rotate (the 200 head has NOT been written to the agent yet — the router peeks the leading bytes before handing the stream off). Classify by the in-envelope status: 429 → quota, 401/403 → auth, 5xx → transient. |
+| HTTP 200 + silent stall (no first chunk within the peek timeout) | Rotate as quota. Observed on exhausted accounts; the gateway returns 200 + headers then never yields content. |
+| SSE `statusCodeValue !== 200` **mid-stream** (after the first clean chunk) | Cannot rotate cleanly (the 200 head + earlier chunks were already written to the agent); terminate with error. |
+
+> **Clarification (2026-08):** the "cannot rotate cleanly" rule applies only
+> once ProxyBridge has written the `200 OK` SSE head to the agent socket. The
+> router peeks the first upstream chunk *before* that write — so detection of a
+> quota/auth signal (or a silent stall) on the opening chunk CAN rotate. The
+> pre-fix bug was that the router decided success from the HTTP status alone
+> and never inspected the leading bytes; the fix added a bounded peek
+> (`QoderFailoverRouter.confirmStreamAndHandOff`) that closes the gap while
+> preserving the mid-stream no-rotate invariant.
 
 Failover is **invisible to the agent** (transparent retry). No
 `X-Qoder-Account-Rotated` header is surfaced. Rationale: the OpenAI proxy
