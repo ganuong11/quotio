@@ -160,6 +160,83 @@ final class QoderChatTranslatorTests: XCTestCase {
         XCTAssertEqual(out[0].toolCallID, "tc1")
     }
 
+    /// A tool result carrying an image is forwarded: the text note rides the
+    /// `tool` message (string content, as the gateway requires) and the image
+    /// follows as a separate `user` message with a leading label. Without this
+    /// the image was dropped by `contentText` and the model saw only the note,
+    /// then reported it could not see images. (pi-provider-qoder PR #14.)
+    func testTransformForwardsToolResultImages() {
+        let msgs = [
+            OpenAIChatMessage(
+                role: "tool",
+                content: .parts([
+                    .text("Read image file [image/png]"),
+                    .imageURL(URL(string: "data:image/png;base64,abc123")!),
+                ]),
+                toolCalls: nil,
+                toolCallID: "call_1"
+            ),
+        ]
+        let out = QoderChatTranslator.transformMessagesForQoder(msgs)
+        XCTAssertEqual(out.count, 2)
+        // First: the tool message, string-only content.
+        XCTAssertEqual(out[0].role, "tool")
+        XCTAssertEqual(out[0].content, .text("Read image file [image/png]"))
+        XCTAssertEqual(out[0].toolCallID, "call_1")
+        // Second: a user message with the label + the image.
+        XCTAssertEqual(out[1].role, "user")
+        guard let content = out[1].content, case .parts(let parts) = content else {
+            return XCTFail("expected parts content on the follow-up user message")
+        }
+        XCTAssertEqual(parts.count, 2)
+        guard case .text(let label) = parts[0] else {
+            return XCTFail("first part must be the text label")
+        }
+        XCTAssertEqual(label, "[1 image returned by the previous tool call]")
+        XCTAssertEqual(parts[1], .imageURL("data:image/png;base64,abc123"))
+    }
+
+    /// Several images from one tool call share one follow-up `user` message;
+    /// the label counts them.
+    func testTransformForwardsMultipleToolResultImages() {
+        let msgs = [
+            OpenAIChatMessage(
+                role: "tool",
+                content: .parts([
+                    .text("two shots"),
+                    .imageURL(URL(string: "data:image/png;base64,one")!),
+                    .imageURL(URL(string: "data:image/jpeg;base64,two")!),
+                ]),
+                toolCalls: nil,
+                toolCallID: "call_1"
+            ),
+        ]
+        let out = QoderChatTranslator.transformMessagesForQoder(msgs)
+        XCTAssertEqual(out.count, 2)
+        XCTAssertEqual(out[1].role, "user")
+        guard let content = out[1].content, case .parts(let parts) = content else {
+            return XCTFail("expected parts content on the follow-up user message")
+        }
+        XCTAssertEqual(parts.count, 3)
+        guard case .text(let label) = parts[0] else {
+            return XCTFail("first part must be the text label")
+        }
+        XCTAssertEqual(label, "[2 images returned by the previous tool call]")
+        XCTAssertEqual(parts[1], .imageURL("data:image/png;base64,one"))
+        XCTAssertEqual(parts[2], .imageURL("data:image/jpeg;base64,two"))
+    }
+
+    /// A text-only tool result stays a single `tool` message — the common case
+    /// must not gain a spurious follow-up.
+    func testTransformToolResultWithoutImagesIsSingleMessage() {
+        let msgs = [
+            OpenAIChatMessage(role: "tool", content: .text("plain text result"), toolCalls: nil, toolCallID: "call_1"),
+        ]
+        let out = QoderChatTranslator.transformMessagesForQoder(msgs)
+        XCTAssertEqual(out.count, 1)
+        XCTAssertEqual(out[0].role, "tool")
+    }
+
     /// Unknown roles are skipped (pi parity).
     func testTransformSkipsUnknownRole() {
         let msgs = [

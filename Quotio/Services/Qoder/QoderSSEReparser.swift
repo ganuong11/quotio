@@ -386,7 +386,14 @@ nonisolated struct QoderSSEReparser {
                 // generic "stop", force the correct value so the agent knows
                 // to execute the tool calls. A meaningful upstream finish_reason
                 // ("length", "content_filter") wins.
-                let effective = (!toolCallsState.isEmpty && finishReason == "stop")
+                // Guard on blocks that actually reached the agent, not on the
+                // state dict being non-empty. A malformed/empty tool_calls delta
+                // ({function:{}}) or a header-only delta whose function never
+                // arrives populates `toolCallsState` but emits no chunk; claiming
+                // "tool_calls" then would hand the agent a finish_reason it can't
+                // act on with nothing to execute. Mirrors pi-provider-qoder PR #14
+                // (`emittedStart`) and CLIProxyAPI's `SawToolCall` guard.
+                let effective = (toolCallsState.values.contains { $0.emittedHeader } && finishReason == "stop")
                     ? "tool_calls"
                     : finishReason
                 stashedFinishReason = effective

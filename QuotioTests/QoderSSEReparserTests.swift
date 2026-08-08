@@ -557,6 +557,38 @@ final class QoderSSEReparserTests: XCTestCase {
         )
     }
 
+    /// Regression (pi-provider-qoder PR #14): a tool_calls delta that carries
+    /// neither id, name, nor arguments (`{function:{}}`) must NOT trigger the
+    /// `finish_reason` override. It populates `toolCallsState` but emits no
+    /// chunk the agent can act on; claiming "tool_calls" with nothing to run
+    /// dead-ends the turn. The override fires only when a chunk actually
+    /// reached the agent (`emittedHeader`).
+    func testEmptyToolCallDeltaDoesNotClaimToolUse() throws {
+        var reparser = QoderSSEReparser(created: 1)
+        let malformed = qoderLine(innerWithToolCalls([[
+            "index": 0,
+            "function": [:] as [String: Any],
+        ]]))
+        let stop = qoderLine([
+            "choices": [["delta": [:], "finish_reason": "stop"]],
+        ])
+        var out = try reparser.feed(Data(malformed.utf8))
+        out.append(try reparser.feed(Data(stop.utf8)))
+        let chunks = openAIChunks(out)
+        // No tool_calls chunk should have been emitted.
+        let toolChunks = chunks.filter {
+            (($0["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["tool_calls"] != nil
+        }
+        XCTAssertTrue(toolChunks.isEmpty, "a function-less delta must emit no tool_calls chunk")
+        // finish_reason stays "stop" — not overridden to "tool_calls".
+        let finishChunk = chunks.first { ($0["choices"] as? [[String: Any]])?[0]["finish_reason"] != nil }
+        XCTAssertEqual(
+            (finishChunk?["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String,
+            "stop",
+            "no emitted tool call → finish_reason must stay \"stop\", not \"tool_calls\""
+        )
+    }
+
     // MARK: - finish_reason + [DONE]
 
     /// finish_reason on its own chunk emits a chunk carrying finish_reason,

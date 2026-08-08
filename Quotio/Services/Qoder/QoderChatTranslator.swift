@@ -586,6 +586,26 @@ nonisolated enum QoderChatTranslator {
                     toolCalls: [],
                     toolCallID: msg.toolCallID
                 ))
+                // A tool result may carry images (a screenshot or image-reader
+                // tool returns a text note + an image block). The Qoder
+                // gateway's `tool` role content is a plain string with no place
+                // for image parts, so `contentText` above drops them; without a
+                // follow-up the model sees only the note and reports it cannot
+                // see images. Emit them as a separate `user` message carrying a
+                // leading label + `image_url` parts (the same shape the user
+                // branch builds). Ported from pi-provider-qoder PR #14; ADR 0004.
+                let images = contentImages(msg.content)
+                if !images.isEmpty {
+                    let label = "[\(images.count) image\(images.count == 1 ? "" : "s") returned by the previous tool call]"
+                    var parts: [QoderContentPart] = [.text(label)]
+                    parts.append(contentsOf: images.map { .imageURL($0.absoluteString) })
+                    out.append(QoderMessage(
+                        role: "user",
+                        content: .parts(parts),
+                        toolCalls: [],
+                        toolCallID: nil
+                    ))
+                }
             default:
                 // Unknown role: skip, matching pi's implicit behavior for
                 // roles it doesn't branch on.
@@ -1168,7 +1188,8 @@ nonisolated enum QoderChatTranslator {
     /// Flatten an OpenAIContent to plain text, dropping image parts to "".
     /// Phase 2b: used for system/assistant/tool content (never image-bearing)
     /// and for `lastUserMessageText`'s text-only summary. User image content
-    /// is handled separately by `transformUserContent`.
+    /// is handled separately by `transformUserContent`; tool-result images are
+    /// surfaced by `contentImages` and emitted as a follow-up user message.
     private static func contentText(_ content: OpenAIContent?) -> String? {
         guard let content else { return nil }
         switch content {
@@ -1179,6 +1200,20 @@ nonisolated enum QoderChatTranslator {
                 if case .text(let t) = part { return t }
                 return nil
             }.joined()
+        }
+    }
+
+    /// The image URLs carried by a message's content, in order. Empty when
+    /// there are none. A `role: "tool"` result from an image-returning tool
+    /// (screenshot, image reader) carries `image_url` parts alongside the text
+    /// note; these can't ride the Qoder gateway's string-only `tool` content,
+    /// so `transformMessagesForQoder` re-emits them as a follow-up `user`
+    /// message. (pi-provider-qoder PR #14.)
+    private static func contentImages(_ content: OpenAIContent?) -> [URL] {
+        guard case .parts(let parts)? = content else { return [] }
+        return parts.compactMap { part -> URL? in
+            if case .imageURL(let url) = part { return url }
+            return nil
         }
     }
 
