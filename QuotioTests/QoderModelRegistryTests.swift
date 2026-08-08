@@ -15,13 +15,18 @@ import XCTest
 final class QoderModelRegistryTests: XCTestCase {
 
     func testKnownIDsMatchADR0003() {
-        // The 12 known global IDs from ADR 0003 §2. Drift here is silent
-        // (the gateway adds/removes models under these keys), so this test
-        // documents the Phase 2a snapshot.
+        // The known global IDs. ADR 0003 §2 seeded this with 12 IDs at Phase 2a;
+        // the gateway adds/removes models under these keys (drift is silent), so
+        // `QoderModelRegistry.entries` is the live source of truth and this test
+        // documents the current snapshot. Updated when the registry is refreshed.
         let expected: Set<String> = [
             "auto", "ultimate", "performance", "efficient", "lite",
-            "qmodel", "qmodel_latest", "dmodel", "dfmodel",
-            "gm51model", "kmodel", "mmodel",
+            "qmodel", "qmodel_latest", "qmodel_38max",
+            "dmodel", "dfmodel",
+            "gm51model",
+            "kmodel", "kmodel_latest",
+            "mmodel",
+            "cmodel",
         ]
         XCTAssertEqual(QoderModelRegistry.knownIDs, expected)
     }

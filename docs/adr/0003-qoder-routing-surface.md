@@ -19,9 +19,11 @@ Three facets, all chosen for minimum surface in Phase 2:
    to CPA unchanged. The prefix is stripped before the ID is sent upstream
    (`qoder/auto` → `auto`).
 2. **Model catalog is hardcoded** in Phase 2 as a Swift constant seeding the
-   routing whitelist (~12 known global IDs: `auto`, `ultimate`, `performance`,
-   `efficient`, `lite`, `qmodel`, `qmodel_latest`, `dmodel`, `dfmodel`,
-   `gm51model`, `kmodel`, `mmodel`). Unknown `qoder/<id>` is forwarded anyway —
+   routing whitelist (15 known global IDs as of the 2026-08-03 catalog refresh:
+   `auto`, `ultimate`, `performance`, `efficient`, `lite`, `qmodel`,
+   `qmodel_latest`, `qmodel_38max`, `dmodel`, `dfmodel`, `gm51model`, `kmodel`,
+   `kmodel_latest`, `mmodel`, `cmodel`; see `QoderModelRegistry.entries` for the
+   live list). Unknown `qoder/<id>` is forwarded anyway —
    the catalog is a display hint, not a gate; Qoder rejects invalid IDs upstream.
 3. **`/v1/models` passes through to CPA untouched.** Qoder models are not
    advertised to CLI agents via the OpenAI catalog endpoint. Users hardcode
