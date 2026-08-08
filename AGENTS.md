@@ -6,7 +6,7 @@ Quotio is a native macOS menu bar app for managing CLIProxyAPI: OAuth for multip
 
 - Swift 6, SwiftUI, macOS 15+, Xcode 16+
 - Sparkle via Swift Package Manager
-- No dedicated automated test suite currently exists
+- Automated tests in `QuotioTests/` (XCTest); run via `xcodebuild test` — see "Validate changes"
 
 ## Where to look
 

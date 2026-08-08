@@ -97,12 +97,26 @@ private actor MockGatewayClient: QoderGatewayClientProtocol {
         /// headers, then no bytes. The router's peek timeout should fire and
         /// rotate. Mutually exclusive with a non-empty `body`.
         let stalls: Bool
+        /// When non-empty, the 2xx stream yields each frame as a separate pull
+        /// (one `Data` per call), modeling how the production chunker surfaces
+        /// the first complete SSE frame on the first pull and the remainder on
+        /// later pulls. Used by the gap #1 regression to prove a healthy
+        /// slow-but-arriving first frame is NOT falsely classified as a stall.
+        /// Mutually exclusive with `stalls` and a non-empty `body`.
+        let trickle: [Data]
 
-        init(status: Int, body: Data = Data(), transportError: Error? = nil, stalls: Bool = false) {
+        init(
+            status: Int,
+            body: Data = Data(),
+            transportError: Error? = nil,
+            stalls: Bool = false,
+            trickle: [Data] = []
+        ) {
             self.status = status
             self.body = body
             self.transportError = transportError
             self.stalls = stalls
+            self.trickle = trickle
         }
     }
 
@@ -150,10 +164,25 @@ private actor MockGatewayClient: QoderGatewayClientProtocol {
         // A stalled response never yields (silent stall) — the router's peek
         // timeout must fire and rotate. We block on an indefinite `Task.sleep`
         // (the router cancels the peek via its task-group timeout after 2s).
+        // Plain `try` (not `try?`): the cancellation throws `CancellationError`,
+        // modeling production `AsyncBytes.Iterator.next()` which propagates
+        // cancellation. This keeps the mock faithful to the real wire behavior
+        // (a stall genuinely cancels a throw, not a swallowed return). The
+        // router's peek absorbs the cancellation defensively; even though
+        // SE-0304 discards post-return child errors today, the mock exercising
+        // the throw path guards against a future refactor that consumes it.
         if response.stalls {
             return QoderGatewayStream(response: http) { () -> Data? in
-                try? await Task.sleep(nanoseconds: 60 * 1_000_000_000)
+                try await Task.sleep(nanoseconds: 60 * 1_000_000_000)
                 return nil
+            }
+        }
+        // Trickle mode: yield each frame as its own pull. Models the production
+        // chunker's first-pull frame-boundary flush + subsequent bulk pulls.
+        if !response.trickle.isEmpty {
+            let box = MockTrickleBox(response.trickle)
+            return QoderGatewayStream(response: http) { () -> Data? in
+                await box.next()
             }
         }
         // Yield the scripted body in one pull, then nil (stream end). The router
@@ -182,6 +211,22 @@ private final class MockYieldBox: @unchecked Sendable {
         if consumed { return true }
         consumed = true
         return false
+    }
+}
+
+/// Sendable box for trickle mode: yields each scripted frame in order across
+/// pulls, then nil at stream end. `actor` so the `@Sendable` pull closure can
+/// mutate `index` safely.
+private actor MockTrickleBox {
+    private let frames: [Data]
+    private var index = 0
+
+    init(_ frames: [Data]) { self.frames = frames }
+
+    func next() -> Data? {
+        guard index < frames.count else { return nil }
+        defer { index += 1 }
+        return frames[index]
     }
 }
 
@@ -439,6 +484,49 @@ final class QoderFailoverRouterTests: XCTestCase {
         XCTAssertEqual(opened.accountID, secondary.id, "should rotate to secondary after a silent stall on primary")
         let callCount = await gateway.callCount
         XCTAssertEqual(callCount, 2, "two attempts: primary (stall) then secondary (200)")
+    }
+
+    // MARK: - Healthy slow first byte must NOT falsely rotate (gap #1)
+
+    /// Gap #1 regression: a healthy account whose first SSE frame is small (well
+    /// under 8KB) must surface to the router's peek and be accepted — NOT
+    /// falsely classified as a silent stall. Pre-fix, the production chunker
+    /// buffered the first pull to 8KB, so a small first frame stayed invisible
+    /// to the peek until 8KB accumulated; combined with the 2s peek timeout,
+    /// healthy slow-first-byte requests (reasoning models, long context — TTFT
+    /// routinely 2-11s) were mis-rotated to `.quota`. The fix flushes the first
+    /// pull at the SSE frame boundary, so the peek sees the frame immediately.
+    ///
+    /// This models the gateway as the production chunker now sees it: the first
+    /// complete SSE frame arrives as the first pull (small), then the remainder.
+    /// The router should accept primary on the first attempt (callCount = 1).
+    func testHealthyFirstFrameDoesNotFalselyRotate() async throws {
+        let vault = InMemoryCredentialStore()
+        let primary = makeAccount(key: "primary@example.com")
+        let secondary = makeAccount(key: "secondary@example.com")
+        await vault.seed(primary, makeCredential(accountID: primary.id, token: "jt-primary"))
+        await vault.seed(secondary, makeCredential(accountID: secondary.id, token: "jt-secondary"))
+
+        // A small healthy opening frame (~80 bytes, far below 8KB) carrying a
+        // status-200 envelope, then the closing [DONE] frame. The router's peek
+        // must see the first frame as a clean chunk and hand off — not rotate.
+        let openingFrame = """
+        data: {"statusCodeValue":200,"body":"{\\"id\\":\\"test\\",\\"model\\":\\"qoder/auto\\"}"}
+
+        """.data(using: .utf8)!
+        let gateway = MockGatewayClient()
+        await gateway.seed([
+            .init(status: 200, trickle: [openingFrame, Data("data: [DONE]\n\n".utf8)]),
+        ])
+        let router = makeRouter(
+            vault: vault, pat: MockPATRefresher(), gateway: gateway,
+            metadata: makeMetadataStore()
+        )
+
+        let opened = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
+        XCTAssertEqual(opened.accountID, primary.id, "healthy first frame should be accepted, not rotated away")
+        let callCount = await gateway.callCount
+        XCTAssertEqual(callCount, 1, "should not attempt the secondary — primary was healthy")
     }
 
     // MARK: - All accounts exhausted → throw

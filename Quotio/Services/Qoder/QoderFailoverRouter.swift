@@ -436,7 +436,30 @@ actor QoderFailoverRouter {
         let firstChunk: Data?
         do {
             firstChunk = try await withThrowingTaskGroup(of: Data?.self) { group in
-                group.addTask { try await stream.nextChunk() }
+                // The peek task absorbs cancellation locally and returns nil.
+                // Today, once this group's body returns normally after
+                // `cancelAll()`, Swift (SE-0304 "Proposal history") *discards*
+                // errors thrown by the cancelled child rather than rethrowing
+                // them — so the outer `catch` below never sees a cancellation
+                // error and the `.quota` branch fires correctly. The local
+                // catch here is defensive: the discard rule is subtle and
+                // *not* type-enforced. If a future refactor adds a second
+                // `group.next()` (or `waitForAll()`) to consume the peek task's
+                // result, a `CancellationError`/`URLError(.cancelled)` from the
+                // cancelled `nextChunk()` would escape through that consumption
+                // and land in the outer catch → misclassified `.transient`.
+                // Absorbing cancellation at the source keeps that refactor safe.
+                // A real (non-cancellation) transport drop still throws and is
+                // caught by the outer catch as `.transient`.
+                group.addTask {
+                    do {
+                        return try await stream.nextChunk()
+                    } catch is CancellationError {
+                        return nil
+                    } catch let urlError as URLError where urlError.code == .cancelled {
+                        return nil
+                    }
+                }
                 group.addTask {
                     try await Task.sleep(nanoseconds: Self.firstChunkTimeout)
                     return nil

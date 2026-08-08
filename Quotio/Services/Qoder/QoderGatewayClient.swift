@@ -202,43 +202,61 @@ final class QoderGatewayClient: QoderGatewayClientProtocol, @unchecked Sendable 
             throw QoderGatewayError.nonHTTPResponse
         }
         // Capture the byte stream behind a single-owner pull source. The
-        // iterator lives inside a Sendable box so the pull closure can mutate
-        // it across `@Sendable` boundaries without the compiler's
-        // "mutation of captured var in concurrently-executing code" error;
-        // single-owner is guaranteed because only this closure holds the box
-        // and pull calls are serialized by the router/ProxyBridge handoff
-        // contract (peek completes before pump begins). The router pulls the
-        // first buffer via `nextChunk` to peek for an in-envelope quota signal;
-        // ProxyBridge then drives the remainder via `pump`. Both go through
-        // this one closure, so bytes the peek consumed are not replayed. We
-        // buffer into ~8KB chunks so the reparser sees reasonable frame sizes
-        // rather than one byte per await (AsyncBytes iterates byte-by-byte).
-        let iteratorBox = AsyncBytesBox(rawBytes)
+        // iterator and the chunker's first-pull flag live inside a Sendable box
+        // (`AsyncBytesSource`) so the pull closure can mutate them across
+        // `@Sendable` boundaries without the compiler's "mutation of captured
+        // var in concurrently-executing code" error; single-owner is guaranteed
+        // because only this closure holds the box and pull calls are serialized
+        // by the router/ProxyBridge handoff contract (peek completes before
+        // pump begins). The router pulls the first buffer via `nextChunk` to
+        // peek for an in-envelope quota signal; ProxyBridge drives the remainder
+        // via `pump`. Both go through this one closure, so bytes the peek
+        // consumed are not replayed.
+        //
+        // The first pull flushes at the first complete SSE frame (see
+        // `QoderGatewayChunker`); later pulls flush at ~8KB so the reparser sees
+        // reasonable frame sizes rather than one byte per await (AsyncBytes
+        // iterates byte-by-byte). This decouples the router's 2s peek timeout
+        // from the bulk threshold — without it the peek would measure
+        // time-to-8KB and false-rotate healthy slow-first-byte requests.
+        let source = AsyncBytesSource(rawBytes)
         return QoderGatewayStream(response: http) { () -> Data? in
-            var buffer = Data()
-            let flushThreshold = 8192
-            while let byte = try await iteratorBox.next() {
-                buffer.append(byte)
-                if buffer.count >= flushThreshold {
-                    return buffer
-                }
-            }
-            return buffer.isEmpty ? nil : buffer
+            try await source.nextChunk()
         }
     }
 }
 
+/// Single-owner Sendable box holding a `URLSession.AsyncBytes` iterator plus the
+/// `QoderGatewayChunker`'s first-pull flag. The production `QoderGatewayClient`
+/// creates one per stream and confines all pulls to the `nextChunk` closure.
+/// `nonisolated` so the pull source (called from the router's actor and
+/// ProxyBridge's Task) isn't forced onto the MainActor. `@unchecked Sendable`
+/// because the iterator isn't Sendable, but access is serialized by the
+/// stream's single-owner contract (peek completes before pump begins).
+private nonisolated final class AsyncBytesSource: @unchecked Sendable {
+    private let iteratorBox: AsyncBytesBox
+    /// Chunker first-pull flag. `true` until the first `nextChunk` call returns.
+    private var firstPull = true
+
+    init(_ bytes: URLSession.AsyncBytes) {
+        self.iteratorBox = AsyncBytesBox(bytes)
+    }
+
+    func nextChunk() async throws -> Data? {
+        try await QoderGatewayChunker.nextChunk(
+            nextByte: { [iteratorBox] in try await iteratorBox.next() },
+            firstPull: &firstPull
+        )
+    }
+}
+
 /// Single-owner Sendable box holding a `URLSession.AsyncBytes` iterator. The
-/// production `QoderGatewayClient` creates one per stream and confines all
-/// `next()` calls to the pull source closure. `@unchecked Sendable` because
-/// `URLSession.AsyncBytes.Iterator` is not itself Sendable, but access is
-/// serialized by the stream's single-owner contract (the router's peek
-/// completes before ProxyBridge's pump begins; they never race).
-/// Single-owner box holding a `URLSession.AsyncBytes` iterator. `nonisolated`
-/// so the pull-source closure (called from the router's actor and ProxyBridge's
-/// Task) isn't forced onto the MainActor. `@unchecked Sendable` because the
-/// iterator isn't Sendable, but access is serialized by the stream's
-/// single-owner contract (peek completes before pump begins).
+/// production `QoderGatewayClient` creates one per stream (inside
+/// `AsyncBytesSource`) and confines all `next()` calls to the pull-source
+/// closure. `nonisolated` so the pull-source closure isn't forced onto the
+/// MainActor. `@unchecked Sendable` because the iterator isn't Sendable, but
+/// access is serialized by the stream's single-owner contract (peek completes
+/// before pump begins).
 private nonisolated final class AsyncBytesBox: @unchecked Sendable {
     private var iterator: URLSession.AsyncBytes.Iterator
 
