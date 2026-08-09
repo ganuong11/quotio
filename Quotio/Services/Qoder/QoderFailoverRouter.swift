@@ -20,11 +20,27 @@
 //
 //  Rotation policy (ADR 0006 §2):
 //    - 429 + quota body            → cooldown this account, rotate to next.
+//                                    Honor a server-supplied `Retry-After`
+//                                    (delta-seconds) when present, clamped to
+//                                    `[cooldownTTL, retryAfterCeiling]` (issue
+//                                    #12); fall back to `cooldownTTL` otherwise.
 //    - 401/403 (first occurrence)  → one-shot PAT re-exchange (machineID-
 //                                    preserving), retry same account.
 //    - 401/403 (after re-exchange) → disable account persistently, post a
 //                                    reliable user-visible notification, rotate.
 //    - 5xx / network               → retry same account once with short backoff.
+//    - Silent stall (HTTP 200, no first chunk within the peek timeout):
+//                                    strong-evidence threshold (issue #12). On
+//                                    the first N-1 stalls we rotate to the next
+//                                    account for request progress but DO NOT
+//                                    cool the stalled account down — a slow cold
+//                                    start / network delay must not be able to
+//                                    cool a healthy account. Only on the Nth
+//                                    consecutive stall (`silentStallStrikeThreshold`,
+//                                    default 2) is quota applied and the account
+//                                    cooled. The counter resets on the next
+//                                    clean first frame from that account, and
+//                                    also resets whenever cooldown is applied.
 //    - SSE statusCodeValue ≠ 200   → cannot rotate mid-stream; ProxyBridge
 //                                    terminates. (This path throws here only
 //                                    when detected on the initial response.)
@@ -117,12 +133,48 @@ nonisolated protocol QoderPATRefreshing: Sendable {
     ) async throws -> MonitorOAuthCredential
 }
 
-actor QoderFailoverRouter {
+/// Failover tuning (issue #12). All values default to the pre-issue behavior;
+/// production wires `.default` from the single call site in `QuotaViewModel`,
+/// tests inject overrides via `Configuration(silentStallStrikeThreshold: 1, …)`
+/// to exercise the strike/Retry-After paths deterministically.
+nonisolated struct QoderFailoverRouterConfiguration: Sendable {
     /// How long a quota-exhausted account stays in cooldown. Short on purpose:
     /// quota windows on Qoder are per-minute, and the cooldown only needs to
     /// outlive a burst. ADR 0005 consequence note flags persistent cooldown as
     /// a follow-up; in-memory is the tracer.
-    private static let cooldownTTL: TimeInterval = 60
+    let cooldownTTL: TimeInterval
+    /// Consecutive silent-stall strikes before a cooldown is applied (issue #12
+    /// acceptance criterion: a single slow-but-healthy first frame must NOT
+    /// cool the account). Default 2: one stall rotates for progress, the second
+    /// consecutive stall treats the account as quota-exhausted.
+    let silentStallStrikeThreshold: Int
+    /// Floor applied to a server-supplied `Retry-After` so a sub-second hint
+    /// doesn't under-cool an exhausted account. Equal to `cooldownTTL`.
+    let retryAfterFloor: TimeInterval
+    /// Ceiling applied to a server-supplied `Retry-After` so a misbehaving
+    /// server can't park an account indefinitely. RFC 7231 §7.1.3 permits
+    /// arbitrarily large values; 300s keeps a single bad hint bounded.
+    let retryAfterCeiling: TimeInterval
+
+    init(
+        cooldownTTL: TimeInterval = 60,
+        silentStallStrikeThreshold: Int = 2,
+        retryAfterFloor: TimeInterval? = nil,
+        retryAfterCeiling: TimeInterval = 300
+    ) {
+        self.cooldownTTL = cooldownTTL
+        self.silentStallStrikeThreshold = silentStallStrikeThreshold
+        // Floor defaults to cooldownTTL when not explicitly provided so callers
+        // overriding `cooldownTTL` don't have to also override the floor.
+        self.retryAfterFloor = retryAfterFloor ?? cooldownTTL
+        self.retryAfterCeiling = retryAfterCeiling
+    }
+
+    /// Default production policy (mirrors the pre-issue #12 constants).
+    static let `default` = QoderFailoverRouterConfiguration()
+}
+
+actor QoderFailoverRouter {
 
     /// How long to back off before retrying the same account on a transient
     /// (5xx / network) error. ADR 0006 §2.
@@ -133,6 +185,15 @@ actor QoderFailoverRouter {
     /// evicted on read. In-memory only — lost on restart.
     private var cooldowns: [String: Date] = [:]
 
+    /// Per-account consecutive silent-stall strike count (issue #12). A stall
+    /// (HTTP 200, no first chunk within the peek timeout) is weak quota
+    /// evidence — a slow cold start looks identical. We rotate immediately on
+    /// each stall for request progress, but only apply a cooldown once the
+    /// threshold is reached. Reset to 0 on the next clean first frame from this
+    /// account (see `confirmStreamAndHandOff`) and whenever a cooldown is
+    /// applied (see `applyCooldown`). In-memory only — lost on restart.
+    private var silentStallStrikes: [String: Int] = [:]
+
     /// Accounts we've already done a one-shot 401 re-exchange for within the
     /// current `openStream` call. Cleared per-call (not persistent) — the
     /// "one re-exchange" rule is per-failure-event, not per-account-lifetime.
@@ -142,17 +203,20 @@ actor QoderFailoverRouter {
     private let metadata: MonitorMetadataStore
     private let patService: any QoderPATRefreshing
     private let gateway: any QoderGatewayClientProtocol
+    private let configuration: QoderFailoverRouterConfiguration
 
     init(
         vault: any MonitorCredentialStore,
         metadata: MonitorMetadataStore = .shared,
         patService: any QoderPATRefreshing,
-        gateway: any QoderGatewayClientProtocol
+        gateway: any QoderGatewayClientProtocol,
+        configuration: QoderFailoverRouterConfiguration = .default
     ) {
         self.vault = vault
         self.metadata = metadata
         self.patService = patService
         self.gateway = gateway
+        self.configuration = configuration
     }
 
     // MARK: - Public entry point
@@ -269,11 +333,30 @@ actor QoderFailoverRouter {
                         } catch let failure2 as QoderAccountFailure {
                             // Second failure on the same account after re-
                             // exchange. If it's another 401/403, the PAT is
-                            // revoked — disable + notify + rotate.
+                            // revoked — disable + notify + rotate. A quota 429
+                            // cools the account. A silent stall is deliberately
+                            // NOT cooled here, consistent with the two-strike
+                            // weak-evidence policy in `decideAction`: a single
+                            // stall right after a fresh token (cold start, slow
+                            // first byte) must not be able to cool the account.
+                            // We still bump the strike counter so a *pattern*
+                            // of stalls on this account accrues — but a
+                            // post-reexchange stall alone won't trip the
+                            // threshold unless strikes already accumulated.
                             if failure2.isAuthFailure {
                                 await disableAndNotifyRevoked(account: account)
                             } else if failure2.isQuota {
-                                applyCooldown(accountID: account.id)
+                                applyCooldown(
+                                    accountID: account.id,
+                                    retryAfterSeconds: failure2.retryAfterSeconds
+                                )
+                            } else if failure2.isSilentStall {
+                                let prior = silentStallStrikes[account.id, default: 0]
+                                let strikes = prior + 1
+                                silentStallStrikes[account.id] = strikes
+                                if strikes >= configuration.silentStallStrikeThreshold {
+                                    applyCooldown(accountID: account.id)
+                                }
                             }
                             continue
                         }
@@ -286,10 +369,19 @@ actor QoderFailoverRouter {
                         continue
                     }
                 case .cooldownAndRotate:
-                    applyCooldown(accountID: account.id)
+                    applyCooldown(
+                        accountID: account.id,
+                        retryAfterSeconds: failure.retryAfterSeconds
+                    )
                     continue
                 case .disableNotifyAndRotate:
                     await disableAndNotifyRevoked(account: account)
+                    continue
+                case .rotateWithoutCooldown:
+                    // Issue #12: silent stall below the strike threshold. The
+                    // strike bump already happened in `decideAction`; here we
+                    // just rotate without cooling so a slow-but-healthy first
+                    // frame doesn't trip the account out for `cooldownTTL`.
                     continue
                 case .retrySameOnce:
                     // Transient (5xx/network). Retry the same account once
@@ -399,7 +491,17 @@ actor QoderFailoverRouter {
 
         switch status {
         case 429:
-            throw QoderAccountFailure(kind: .quota, status: status)
+            // Capture a server-supplied cooldown hint. RFC 7231 §7.1.3 allows
+            // `Retry-After` as either delta-seconds or an HTTP-date; we honor
+            // delta-seconds and best-effort HTTP-date (issue #12). Absent or
+            // unparseable → nil → `applyCooldown` falls back to the default.
+            let retryAfter = QoderFailoverRouter.retryAfterSeconds(
+                from: stream.response,
+                capturedAt: Date()
+            )
+            throw QoderAccountFailure(
+                kind: .quota, status: status, retryAfterSeconds: retryAfter
+            )
         case 401, 403:
             throw QoderAccountFailure(kind: .auth, status: status)
         case 500...599:
@@ -436,11 +538,16 @@ actor QoderFailoverRouter {
     ///  1. First chunk carries a non-200 `statusCodeValue` envelope → classify
     ///     by that status and throw (429→quota, 401/403→auth, 5xx→transient).
     ///  2. No chunk within `firstChunkTimeout` (silent stall, the live symptom
-    ///     on exhausted accounts) → throw `.quota`. The account is cooled down
-    ///     and the next candidate is tried immediately.
+    ///     on exhausted accounts) → throw `.silentStall`. The account is NOT
+    ///     cooled down on a single occurrence — a slow-but-healthy first frame
+    ///     is indistinguishable from a stall, so we rotate for progress but
+    ///     only apply a cooldown once `silentStallStrikeThreshold` consecutive
+    ///     stalls accumulate (issue #12). See `decideAction`.
     ///  3. First chunk is clean (content, or a benign non-envelope line, or the
-    ///     stream ended on `[DONE]`) → hand off, carrying the consumed bytes as
-    ///     `bufferedPrefix` so ProxyBridge doesn't lose them.
+    ///     stream ended on `[DONE]`) → reset this account's silent-stall strike
+    ///     counter (a clean frame is positive evidence the account is healthy)
+    ///     and hand off, carrying the consumed bytes as `bufferedPrefix` so
+    ///     ProxyBridge doesn't lose them.
     ///
     /// Rotation here is clean: ProxyBridge has not yet written anything to the
     /// agent socket (the 200 SSE head is written only after `openStream`
@@ -499,11 +606,12 @@ actor QoderFailoverRouter {
         }
 
         // Branch 2: silent stall. The gateway returned 200 but never yielded a
-        // first chunk within the timeout — the observed shape of an exhausted
-        // account. Classify as quota so the account is cooled down and the next
-        // candidate is tried right away.
+        // first chunk within the timeout. Weak quota evidence — a slow cold
+        // start looks identical. Throw `.silentStall` so `decideAction` applies
+        // the two-strike threshold: rotate now, cool only on the Nth
+        // consecutive stall. Issue #12.
         guard let prefix = firstChunk, !prefix.isEmpty else {
-            throw QoderAccountFailure(kind: .quota, status: 429, detail: "silent stall")
+            throw QoderAccountFailure(kind: .silentStall, status: 429, detail: "silent stall")
         }
 
         // Branch 1: probe the prefix for a non-200 in-envelope signal. Reuses
@@ -531,12 +639,15 @@ actor QoderFailoverRouter {
             }
         }
 
-        // Branch 3: clean. Hand off, carrying the consumed prefix so ProxyBridge
-        // feeds it through the reparser before driving the remainder. Wrap
-        // `stream.pump` in an explicit closure: `QoderGatewayStream` is a class,
-        // so a bare method reference would carry `Self` and fail the
-        // `@Sendable` closure conformance the `QoderOpenedStream.pump` field
-        // requires. The class itself is `@unchecked Sendable`.
+        // Branch 3: clean. A real first frame is positive evidence the account
+        // is healthy, so reset its silent-stall strike counter (issue #12).
+        // Then hand off, carrying the consumed prefix so ProxyBridge feeds it
+        // through the reparser before driving the remainder. Wrap `stream.pump`
+        // in an explicit closure: `QoderGatewayStream` is a class, so a bare
+        // method reference would carry `Self` and fail the `@Sendable` closure
+        // conformance the `QoderOpenedStream.pump` field requires. The class
+        // itself is `@unchecked Sendable`.
+        silentStallStrikes.removeValue(forKey: account.id)
         let streamRef = stream
         return QoderOpenedStream(
             bufferedPrefix: prefix,
@@ -583,14 +694,19 @@ actor QoderFailoverRouter {
 
     /// Internal failure classification. `status` is the upstream HTTP code
     /// when available; nil for transport-level failures (network).
+    /// `retryAfterSeconds` carries a server-supplied cooldown hint from a 429's
+    /// `Retry-After` header (delta-seconds); nil means "no hint, use the
+    /// default cooldown." See `applyCooldown` for the clamping rule.
     private struct QoderAccountFailure: Error {
-        enum Kind { case quota, auth, transient }
+        enum Kind { case quota, auth, transient, silentStall }
         let kind: Kind
         let status: Int?
         var detail: String?
+        var retryAfterSeconds: TimeInterval?
 
         var isAuthFailure: Bool { kind == .auth }
         var isQuota: Bool { kind == .quota }
+        var isSilentStall: Bool { kind == .silentStall }
     }
 
     private enum FailureAction {
@@ -598,9 +714,14 @@ actor QoderFailoverRouter {
         case cooldownAndRotate
         case disableNotifyAndRotate
         case retrySameOnce
+        /// Rotate to the next account for request progress, but do NOT apply a
+        /// cooldown yet (issue #12). Used for a silent stall below the
+        /// configured strike threshold — see `openStream` for the strike bump
+        /// and threshold check.
+        case rotateWithoutCooldown
     }
 
-    private nonisolated func decideAction(
+    private func decideAction(
         for failure: QoderAccountFailure,
         account: MonitorAccount,
         reexchangedAccounts: inout Set<String>
@@ -618,6 +739,18 @@ actor QoderFailoverRouter {
             return .reexchangeAndRetry
         case .transient:
             return .retrySameOnce
+        case .silentStall:
+            // Issue #12 two-strike evidence threshold. Bump the consecutive
+            // strike count; if we've now hit the threshold, treat it as quota
+            // (cool + rotate). Otherwise rotate for progress without cooling,
+            // so a single slow-but-healthy first frame can't cool the account.
+            let prior = silentStallStrikes[account.id, default: 0]
+            let strikes = prior + 1
+            silentStallStrikes[account.id] = strikes
+            if strikes >= configuration.silentStallStrikeThreshold {
+                return .cooldownAndRotate
+            }
+            return .rotateWithoutCooldown
         }
     }
 
@@ -662,8 +795,78 @@ actor QoderFailoverRouter {
 
     // MARK: - Cooldown / disable / notify
 
-    private func applyCooldown(accountID: String) {
-        cooldowns[accountID] = Date().addingTimeInterval(Self.cooldownTTL)
+    /// Apply a cooldown to `accountID`. Issue #12: if the caller carries a
+    /// server-supplied `Retry-After` hint (delta-seconds, from a 429), use it
+    /// clamped to `[retryAfterFloor, retryAfterCeiling]` — the floor (= the
+    /// default `cooldownTTL`) prevents a sub-second hint from under-cooling an
+    /// exhausted account, and the ceiling (default 300s) prevents a misbehaving
+    /// server from parking the account indefinitely. Absent/unparseable hint
+    /// → `cooldownTTL`. Resets the silent-stall strike counter so a cooled
+    /// account gets a fresh two-strike budget when it returns.
+    private func applyCooldown(accountID: String, retryAfterSeconds: TimeInterval? = nil) {
+        let ttl: TimeInterval
+        if let retry = retryAfterSeconds {
+            ttl = min(max(retry, configuration.retryAfterFloor), configuration.retryAfterCeiling)
+        } else {
+            ttl = configuration.cooldownTTL
+        }
+        cooldowns[accountID] = Date().addingTimeInterval(ttl)
+        silentStallStrikes.removeValue(forKey: accountID)
+    }
+
+    /// Parse an HTTP `Retry-After` header into seconds (issue #12). RFC 7231
+    /// §7.1.3 permits two forms:
+    ///   - delta-seconds (a non-negative integer, e.g. `"120"`)
+    ///   - HTTP-date (e.g. `"Wed, 21 Oct 2015 07:28:00 GMT"`)
+    /// Delta-seconds is the common case and what the gateway emits today; we
+    /// parse it directly. HTTP-date is best-effort via `parseHTTPDate`.
+    /// Returns nil on a missing/empty header or any parse failure (including
+    /// negative delta-seconds). Successful parses are capped at 86,400s (24h)
+    /// as a sanity ceiling before `applyCooldown`'s `[floor, ceiling]` clamp
+    /// narrows the practical range further. A past HTTP-date clamps to 0
+    /// (the floor in `applyCooldown` is what keeps a 0 from under-cooling).
+    /// Nonisolated + pure so it's trivially testable and callable from the
+    /// actor-isolated attempt path without a hop.
+    nonisolated static func retryAfterSeconds(
+        from response: HTTPURLResponse,
+        capturedAt now: Date
+    ) -> TimeInterval? {
+        // `value(forHTTPHeaderField:)` is case-insensitive per RFC, matching
+        // both `Retry-After` and `retry-after`.
+        guard let raw = response.value(forHTTPHeaderField: "Retry-After")?.trimmingCharacters(in: .whitespaces),
+              !raw.isEmpty else {
+            return nil
+        }
+        // Delta-seconds.
+        if let seconds = TimeInterval(raw), seconds >= 0, seconds.isFinite {
+            return min(seconds, 86_400)  // cap absurd hints at 24h pre-clamp
+        }
+        // HTTP-date (best effort).
+        if let date = QoderFailoverRouter.parseHTTPDate(raw) {
+            let delta = date.timeIntervalSince(now)
+            return delta > 0 ? min(delta, 86_400) : 0
+        }
+        return nil
+    }
+
+    /// Best-effort parse of an RFC 7231 §7.1.1 IMF-fixdate (the HTTP-date form
+    /// permitted in `Retry-After`). `DateFormatter` is not thread-safe, so a
+    /// fresh instance is constructed per parse — this is a rare path (delta-
+    /// seconds is the gateway's actual format and is handled by `retryAfterSeconds`
+    /// directly), and the cost is irrelevant at call rates of ~zero. A fresh
+    /// per-call formatter also keeps the function pure and `Sendable`-safe with
+    /// no synchronization machinery. Nonisolated + pure.
+    private nonisolated static func parseHTTPDate(_ string: String) -> Date? {
+        let formatter = DateFormatter()
+        // en_US_POSIX + GMT = the exact IMF-fixdate locale/zone the RFC
+        // mandates; any other locale would mis-parse fixed-format dates.
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "GMT")
+        // The trailing `GMT` is literal text, so it MUST be quoted (`'GMT'`);
+        // an unquoted `G` is the era designator pattern letter, which would
+        // both corrupt `string(from:)` output and fail to parse real headers.
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss 'GMT'"
+        return formatter.date(from: string)
     }
 
     /// Persistently disable the account (so it's skipped on subsequent
@@ -742,7 +945,7 @@ actor QoderFailoverRouter {
     /// streaming (the opposite of the spec default). Non-streaming requests
     /// are now served by aggregating the SSE upstream into one
     /// `chat.completion` JSON (issue #9, ADR 0014); they are NOT rejected.
-    private nonisolated static func streamRequested(in body: Data) -> Bool {
+        private nonisolated static func streamRequested(in body: Data) -> Bool {
         guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
               let stream = json["stream"] as? Bool else {
             return false

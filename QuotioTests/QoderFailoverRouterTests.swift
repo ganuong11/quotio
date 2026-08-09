@@ -104,19 +104,26 @@ private actor MockGatewayClient: QoderGatewayClientProtocol {
         /// slow-but-arriving first frame is NOT falsely classified as a stall.
         /// Mutually exclusive with `stalls` and a non-empty `body`.
         let trickle: [Data]
+        /// Optional HTTP response headers. Used by the Retry-After test (issue
+        /// #12) to feed a `Retry-After` value into the router's cooldown path
+        /// — the production gateway surfaces headers via `HTTPURLResponse`, and
+        /// so does this mock.
+        let headerFields: [String: String]
 
         init(
             status: Int,
             body: Data = Data(),
             transportError: Error? = nil,
             stalls: Bool = false,
-            trickle: [Data] = []
+            trickle: [Data] = [],
+            headerFields: [String: String] = [:]
         ) {
             self.status = status
             self.body = body
             self.transportError = transportError
             self.stalls = stalls
             self.trickle = trickle
+            self.headerFields = headerFields
         }
     }
 
@@ -158,7 +165,7 @@ private actor MockGatewayClient: QoderGatewayClientProtocol {
             url: qoderChatGatewayURL,
             statusCode: response.status,
             httpVersion: "HTTP/1.1",
-            headerFields: nil
+            headerFields: response.headerFields.isEmpty ? nil : response.headerFields
         )!
         let bodyData = response.body
         // A stalled response never yields (silent stall) — the router's peek
@@ -275,13 +282,15 @@ final class QoderFailoverRouterTests: XCTestCase {
         vault: InMemoryCredentialStore,
         pat: MockPATRefresher,
         gateway: MockGatewayClient,
-        metadata: MonitorMetadataStore
+        metadata: MonitorMetadataStore,
+        configuration: QoderFailoverRouterConfiguration = .default
     ) -> QoderFailoverRouter {
         QoderFailoverRouter(
             vault: vault,
             metadata: metadata,
             patService: pat,
-            gateway: gateway
+            gateway: gateway,
+            configuration: configuration
         )
     }
 
@@ -508,6 +517,241 @@ final class QoderFailoverRouterTests: XCTestCase {
         XCTAssertEqual(opened.accountID, secondary.id, "should rotate to secondary after a silent stall on primary")
         let callCount = await gateway.callCount
         XCTAssertEqual(callCount, 2, "two attempts: primary (stall) then secondary (200)")
+    }
+
+    // MARK: - Silent stall two-strike threshold (issue #12)
+
+    /// Regression for issue #12: a single silent stall must rotate to the next
+    /// account for request progress, but must NOT cool the stalled account
+    /// down. A slow-but-healthy first frame (cold model load, network delay) is
+    /// indistinguishable from a genuine stall at this layer; cooling on a
+    /// single occurrence was false-cooling healthy accounts. The default
+    /// threshold is 2: one stall rotates without cooling; only a second
+    /// consecutive stall applies cooldown.
+    ///
+    /// This test exercises the default-threshold path: primary stalls once,
+    /// rotates to secondary (clean). The next request must still consider
+    /// primary eligible (no cooldown was applied) — primary returns a clean
+    /// 200 and is served, which also resets its strike counter.
+    func testSingleSilentStallRotatesButDoesNotCoolDown() async throws {
+        let vault = InMemoryCredentialStore()
+        let primary = makeAccount(key: "primary@example.com")
+        let secondary = makeAccount(key: "secondary@example.com")
+        await vault.seed(primary, makeCredential(accountID: primary.id, token: "jt-primary"))
+        await vault.seed(secondary, makeCredential(accountID: secondary.id, token: "jt-secondary"))
+
+        let gateway = MockGatewayClient()
+        let router = makeRouter(
+            vault: vault, pat: MockPATRefresher(), gateway: gateway,
+            metadata: makeMetadataStore()
+        )
+
+        // Request 1: primary stalls, secondary serves. Primary is rotated-to-
+        // next but NOT cooled (single strike below the default threshold of 2).
+        await gateway.seed([
+            .init(status: 200, stalls: true),
+            .init(status: 200, body: Data("data: [DONE]\n\n".utf8)),
+        ])
+        let opened1 = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
+        XCTAssertEqual(opened1.accountID, secondary.id, "should rotate to secondary after the stall")
+
+        // Request 2: primary must still be a candidate (no cooldown applied).
+        // First-enabled ordering means primary is tried first; a clean 200
+        // here also proves the strike counter was healthy enough to retry.
+        await gateway.seed(.init(status: 200, body: Data("data: [DONE]\n\n".utf8)))
+        let opened2 = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
+        XCTAssertEqual(
+            opened2.accountID, primary.id,
+            "primary must NOT be in cooldown after a single silent stall (issue #12)"
+        )
+    }
+
+    /// Companion to the regression above: once the consecutive-stall threshold
+    /// is reached, the account IS cooled. Uses `silentStallStrikeThreshold: 1`
+    /// so a single stall trips the threshold — this keeps the test to one ~2s
+    /// peek (the default threshold of 2 would need two peeks = ~4s).
+    func testRepeatedSilentStallsApplyCooldown() async throws {
+        let vault = InMemoryCredentialStore()
+        let primary = makeAccount(key: "primary@example.com")
+        let secondary = makeAccount(key: "secondary@example.com")
+        await vault.seed(primary, makeCredential(accountID: primary.id, token: "jt-primary"))
+        await vault.seed(secondary, makeCredential(accountID: secondary.id, token: "jt-secondary"))
+
+        let gateway = MockGatewayClient()
+        // Threshold 1: the first stall trips the threshold and cools primary.
+        let router = makeRouter(
+            vault: vault, pat: MockPATRefresher(), gateway: gateway,
+            metadata: makeMetadataStore(),
+            configuration: QoderFailoverRouterConfiguration(silentStallStrikeThreshold: 1)
+        )
+
+        // Request 1: primary stalls → threshold reached → cooled → rotate to
+        // secondary (clean).
+        await gateway.seed([
+            .init(status: 200, stalls: true),
+            .init(status: 200, body: Data("data: [DONE]\n\n".utf8)),
+        ])
+        let opened1 = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
+        XCTAssertEqual(opened1.accountID, secondary.id)
+
+        // Request 2: primary is now in cooldown → secondary is served. The
+        // default cooldownTTL (60s) is far longer than this test's wall clock,
+        // so the cooldown is observably in effect without any sleep.
+        await gateway.seed(.init(status: 200, body: Data("data: [DONE]\n\n".utf8)))
+        let opened2 = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
+        XCTAssertEqual(
+            opened2.accountID, secondary.id,
+            "primary must be in cooldown once the stall threshold is reached"
+        )
+    }
+
+    // MARK: - Retry-After honored (issue #12)
+
+    /// A 429 carrying a `Retry-After: <seconds>` header must cool the account
+    /// for that long, clamped to `[cooldownTTL, retryAfterCeiling]`. This test
+    /// makes the honor-vs-ignore distinction observable: `cooldownTTL` is the
+    /// fallback AND the floor, set to 0.1s; `Retry-After: 5` would, if honored,
+    /// keep primary out for ~5s. After sleeping 0.3s (well past the 0.1s
+    /// fallback but far inside the honored 5s window), primary must STILL be
+    /// skipped — which is only true if the header was honored. If Retry-After
+    /// were ignored, the 0.1s fallback would have elapsed and primary would be
+    /// re-served.
+    func test429RetryAfterExtendsCooldownBeyondDefault() async throws {
+        let vault = InMemoryCredentialStore()
+        let primary = makeAccount(key: "primary@example.com")
+        let secondary = makeAccount(key: "secondary@example.com")
+        await vault.seed(primary, makeCredential(accountID: primary.id, token: "jt-primary"))
+        await vault.seed(secondary, makeCredential(accountID: secondary.id, token: "jt-secondary"))
+
+        let gateway = MockGatewayClient()
+        let router = makeRouter(
+            vault: vault, pat: MockPATRefresher(), gateway: gateway,
+            metadata: makeMetadataStore(),
+            // cooldownTTL is the cooldown floor AND the no-header fallback.
+            // 0.1s is short enough that the 0.3s sleep below clears the
+            // fallback but NOT the honored Retry-After: 5 window.
+            configuration: QoderFailoverRouterConfiguration(cooldownTTL: 0.1)
+        )
+
+        // Request 1: primary 429 with Retry-After: 5 → cooled for ~5s, rotate
+        // to secondary (clean).
+        await gateway.seed([
+            .init(status: 429, headerFields: ["Retry-After": "5"]),
+            .init(status: 200, body: Data("data: [DONE]\n\n".utf8)),
+        ])
+        let opened1 = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
+        XCTAssertEqual(opened1.accountID, secondary.id)
+
+        // Sleep past the 0.1s fallback but well inside the honored 5s window.
+        // 0.3s gives 3x margin over the 0.1s fallback to avoid CI flake while
+        // staying far below the 5s honored duration.
+        try await Task.sleep(nanoseconds: 300_000_000)  // 0.3s
+
+        // Request 2: primary must STILL be cooled — only true if Retry-After
+        // was honored (the 0.1s fallback has elapsed by now).
+        await gateway.seed(.init(status: 200, body: Data("data: [DONE]\n\n".utf8)))
+        let opened2 = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
+        XCTAssertEqual(
+            opened2.accountID, secondary.id,
+            "Retry-After: 5 must keep primary in cooldown past the 0.1s fallback window"
+        )
+    }
+
+    /// The `Retry-After` value is clamped to `retryAfterCeiling`. With
+    /// `Retry-After: 9999` and `retryAfterCeiling: 0.2`, the cooldown is clamped
+    /// to ~0.2s. After sleeping 0.4s (past the clamped 0.2s ceiling but far
+    /// inside the raw 9999s), primary must be ELIGIBLE again — which is only
+    /// true if the ceiling was applied. If the raw 9999s were used, primary
+    /// would still be cooled.
+    func test429RetryAfterIsClampedToCeiling() async throws {
+        let vault = InMemoryCredentialStore()
+        let primary = makeAccount(key: "primary@example.com")
+        let secondary = makeAccount(key: "secondary@example.com")
+        await vault.seed(primary, makeCredential(accountID: primary.id, token: "jt-primary"))
+        await vault.seed(secondary, makeCredential(accountID: secondary.id, token: "jt-secondary"))
+
+        let gateway = MockGatewayClient()
+        let router = makeRouter(
+            vault: vault, pat: MockPATRefresher(), gateway: gateway,
+            metadata: makeMetadataStore(),
+            // cooldownTTL: 0.05 is the floor; retryAfterCeiling: 0.2 is the
+            // load-bearing clamp. A raw Retry-After: 9999 would be used as-is
+            // if the ceiling weren't applied.
+            configuration: QoderFailoverRouterConfiguration(
+                cooldownTTL: 0.05,
+                retryAfterCeiling: 0.2
+            )
+        )
+
+        // Primary 429 with an absurd Retry-After: 9999 → clamped to 0.2s
+        // ceiling.
+        await gateway.seed([
+            .init(status: 429, headerFields: ["Retry-After": "9999"]),
+            .init(status: 200, body: Data("data: [DONE]\n\n".utf8)),
+        ])
+        let opened1 = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
+        XCTAssertEqual(opened1.accountID, secondary.id)
+
+        // Sleep past the clamped 0.2s ceiling (0.4s = 2x margin) but far
+        // inside the raw 9999s. If the ceiling were not applied, primary would
+        // still be cooled here.
+        try await Task.sleep(nanoseconds: 400_000_000)  // 0.4s
+
+        // Request 2: primary must be eligible again — only true if the ceiling
+        // clamped the 9999s down to ~0.2s.
+        await gateway.seed(.init(status: 200, body: Data("data: [DONE]\n\n".utf8)))
+        let opened2 = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
+        XCTAssertEqual(
+            opened2.accountID, primary.id,
+            "Retry-After: 9999 must be clamped to the 0.2s ceiling so primary re-enters rotation"
+        )
+    }
+
+    /// When a 429 carries no `Retry-After` (or an unparseable one), the router
+    /// falls back to the default cooldown. Regression guard for the fallback
+    /// path so the Retry-After wiring can't accidentally over-cool every 429.
+    /// Uses cooldownTTL: 0.5s (not the prior flake-prone 0.05s) so the in-
+    /// cooldown assertion has a comfortable margin, then sleeps 0.7s to confirm
+    /// the cooldown clears.
+    func test429WithoutRetryAfterUsesDefaultCooldown() async throws {
+        let vault = InMemoryCredentialStore()
+        let primary = makeAccount(key: "primary@example.com")
+        let secondary = makeAccount(key: "secondary@example.com")
+        await vault.seed(primary, makeCredential(accountID: primary.id, token: "jt-primary"))
+        await vault.seed(secondary, makeCredential(accountID: secondary.id, token: "jt-secondary"))
+
+        let gateway = MockGatewayClient()
+        let router = makeRouter(
+            vault: vault, pat: MockPATRefresher(), gateway: gateway,
+            metadata: makeMetadataStore(),
+            // 0.5s default: long enough that the in-cooldown assertion below is
+            // not flake-prone, short enough that the clearing sleep stays
+            // bounded. Avoids the prior 0.05s TTL where the immediate follow-up
+            // could race the cooldown.
+            configuration: QoderFailoverRouterConfiguration(cooldownTTL: 0.5)
+        )
+
+        // No Retry-After header → default cooldown (0.5s) applies.
+        await gateway.seed([
+            .init(status: 429),
+            .init(status: 200, body: Data("data: [DONE]\n\n".utf8)),
+        ])
+        let opened1 = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
+        XCTAssertEqual(opened1.accountID, secondary.id)
+
+        // Immediate follow-up: primary is still cooled (the 0.5s default hasn't
+        // elapsed). This proves the fallback path applies a cooldown even
+        // without Retry-After.
+        await gateway.seed(.init(status: 200, body: Data("data: [DONE]\n\n".utf8)))
+        let opened2 = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
+        XCTAssertEqual(opened2.accountID, secondary.id, "default cooldown applies when Retry-After is absent")
+
+        // After the 0.5s default elapses, primary is eligible again. 0.7s gives
+        // a 0.2s margin over the 0.5s TTL to avoid CI timing flake.
+        try await Task.sleep(nanoseconds: 700_000_000)  // 0.7s
+        await gateway.seed(.init(status: 200, body: Data("data: [DONE]\n\n".utf8)))
+        let opened3 = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
+        XCTAssertEqual(opened3.accountID, primary.id, "primary eligible again after the short default cooldown elapses")
     }
 
     // MARK: - Healthy slow first byte must NOT falsely rotate (gap #1)
@@ -811,5 +1055,108 @@ final class QoderFailoverRouterTests: XCTestCase {
         let modelConfig = envelope?["model_config"] as? [String: Any]
         XCTAssertEqual(modelConfig?["key"] as? String, "auto",
                        "qoder/ prefix must be stripped before the upstream gateway")
+    }
+
+    // MARK: - Retry-After header parsing (issue #12)
+
+    /// Direct unit tests for `QoderFailoverRouter.retryAfterSeconds` — the
+    /// parse function the 429 path depends on. These are cheap and
+    /// deterministic (no real-time sleeps, no actor hops, no network), so they
+    /// cover the parse matrix the end-to-end Retry-After tests can only spot-
+    /// check. `retryAfterSeconds` is `nonisolated static` and internal (not
+    /// private) so the tests can reach it directly.
+
+    /// Build an `HTTPURLResponse` carrying the given `Retry-After` header
+    /// value, mirroring how the mock gateway and production surface the
+    /// header to the router.
+    private func makeResponse(retryAfter: String?) -> HTTPURLResponse {
+        HTTPURLResponse(
+            url: qoderChatGatewayURL,
+            statusCode: 429,
+            httpVersion: "HTTP/1.1",
+            headerFields: retryAfter.map { ["Retry-After": $0] }
+        )!
+    }
+
+    /// Delta-seconds (the gateway's actual format) parses to that many seconds.
+    func testRetryAfterParsesDeltaSeconds() {
+        XCTAssertEqual(
+            QoderFailoverRouter.retryAfterSeconds(
+                from: makeResponse(retryAfter: "120"), capturedAt: Date()
+            ),
+            120
+        )
+        XCTAssertEqual(
+            QoderFailoverRouter.retryAfterSeconds(
+                from: makeResponse(retryAfter: "0"), capturedAt: Date()
+            ),
+            0
+        )
+    }
+
+    /// An HTTP-date (RFC 7231 §7.1.1 IMF-fixdate) parses to the delta from
+    /// `capturedAt` to the advertised date.
+    func testRetryAfterParsesHTTPDate() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)  // deterministic
+        // 300s in the future relative to `now`.
+        let future = now.addingTimeInterval(300)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "GMT")
+        // Trailing `GMT` is literal — must be quoted (`'GMT'`) or `G` (the era
+        // designator pattern letter) corrupts the output. Mirrors production's
+        // `parseHTTPDate`.
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss 'GMT'"
+        let dateStr = formatter.string(from: future)
+        let parsed = QoderFailoverRouter.retryAfterSeconds(
+            from: makeResponse(retryAfter: dateStr), capturedAt: now
+        )
+        XCTAssertEqual(parsed ?? -1, 300, accuracy: 1.0)
+    }
+
+    /// A past HTTP-date clamps to 0 (the floor in `applyCooldown` is what
+    /// keeps a 0 from under-cooling). Documented behavior in `retryAfterSeconds`.
+    func testRetryAfterPastHTTPDateClampsToZero() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let past = now.addingTimeInterval(-60)  // 60s ago
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "GMT")
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss 'GMT'"
+        let dateStr = formatter.string(from: past)
+        let parsed = QoderFailoverRouter.retryAfterSeconds(
+            from: makeResponse(retryAfter: dateStr), capturedAt: now
+        )
+        XCTAssertEqual(parsed, 0, "past HTTP-date should clamp to 0")
+    }
+
+    /// Negative delta-seconds is invalid per RFC and must yield nil (not 0,
+    /// not abs(value)). This distinguishes "garbage" from "valid 0".
+    func testRetryAfterNegativeReturnsNil() {
+        XCTAssertNil(
+            QoderFailoverRouter.retryAfterSeconds(
+                from: makeResponse(retryAfter: "-5"), capturedAt: Date()
+            )
+        )
+    }
+
+    /// Non-numeric, non-date garbage yields nil rather than throwing or
+    /// returning a sentinel. This is the path that makes the 429 fallback
+    /// to the default cooldown.
+    func testRetryAfterGarbageReturnsNil() {
+        XCTAssertNil(
+            QoderFailoverRouter.retryAfterSeconds(
+                from: makeResponse(retryAfter: "not-a-duration"), capturedAt: Date()
+            )
+        )
+    }
+
+    /// Absent header (nil) yields nil — the no-`Retry-After` fallback path.
+    func testRetryAfterAbsentReturnsNil() {
+        XCTAssertNil(
+            QoderFailoverRouter.retryAfterSeconds(
+                from: makeResponse(retryAfter: nil), capturedAt: Date()
+            )
+        )
     }
 }

@@ -22,13 +22,13 @@ the official Qoder CLI or pi provider is also installed on the machine.
 
 | Signal | Action |
 |---|---|
-| HTTP 429 + quota body | Rotate to next enabled account; cool down this one |
+| HTTP 429 + quota body | Rotate to next enabled account; cool down this one. If the response carries a `Retry-After` header (RFC 7231 §7.1.3 — delta-seconds, best-effort HTTP-date), use it as the cooldown duration clamped to `[cooldownTTL, retryAfterCeiling]` (default `[60s, 300s]`); fall back to `cooldownTTL` (default 60s) when absent or unparseable. (Issue #12.) |
 | HTTP 401/403 (first occurrence) | Re-exchange PAT once, retry same account |
 | HTTP 401/403 (after re-exchange) | Mark PAT revoked: disable account, notify user, silently rotate to next account |
 | HTTP 5xx | Transient: retry same account with backoff, do NOT rotate |
 | Network timeout | Transient: retry same account |
 | HTTP 200 + non-200 `statusCodeValue` on the **first** SSE chunk | Rotate (the 200 head has NOT been written to the agent yet — the router peeks the leading bytes before handing the stream off). Classify by the in-envelope status: 429 → quota, 401/403 → auth, 5xx → transient. |
-| HTTP 200 + silent stall (no first chunk within the peek timeout) | Rotate as quota. Observed on exhausted accounts; the gateway returns 200 + headers then never yields content. |
+| HTTP 200 + silent stall (no first chunk within the peek timeout) | Rotate to the next account for request progress, but **do NOT cool the account down on a single occurrence** (issue #12). A slow-but-healthy first frame (cold model load, network delay) is indistinguishable from an exhausted account at this layer. Track consecutive silent-stall strikes per account; only on the `silentStallStrikeThreshold`-th consecutive stall (default 2, configurable) is the account treated as quota and cooled. The strike counter resets on the next clean first frame from that account and whenever a cooldown is applied. The threshold and cooldown TTL are injectable via `QoderFailoverRouterConfiguration`. |
 | SSE `statusCodeValue !== 200` **mid-stream** (after the first clean chunk) | Cannot rotate cleanly (the 200 head + earlier chunks were already written to the agent); terminate with error. |
 
 > **Clarification (2026-08):** the "cannot rotate cleanly" rule applies only
@@ -85,6 +85,18 @@ whole CN endpoint set).
 
 - **Disable-on-first-401.** Rejected: every ~24h job-token expiry would
   disable the account. Wrong UX. One re-exchange is the safe default.
+- **Single-strike silent stall → cooldown (pre-issue #12 behavior).**
+  Rejected: a silent stall is weak quota evidence. A slow-but-healthy first
+  frame (reasoning models / cold loads, observed TTFT 2-11s) was repeatedly
+  cooled down, starving healthy accounts during a cold start. The new
+  two-strike threshold (issue #12) rotates for progress immediately on the
+  first stall but only cools after `silentStallStrikeThreshold` (default 2)
+  consecutive stalls; a clean first frame resets the counter.
+- **Fixed 60s cooldown, ignore `Retry-After` (pre-issue #12 behavior).**
+  Rejected: the server often knows its own quota window better than a static
+  constant. Issue #12 makes the cooldown TTL configurable and honors a
+  server-supplied `Retry-After`, clamped to a sane range so a misbehaving
+  server can't park an account indefinitely.
 
 ### Onboarding
 
@@ -106,3 +118,14 @@ whole CN endpoint set).
   right UX, but the notification must be reliable (no silent loss).
 - The synchronous exchange call in onboarding blocks the UI for one network
   round-trip. Acceptable; show a spinner.
+- The silent-stall two-strike threshold (issue #12) means a genuinely
+  exhausted-but-stalling account is served twice (rotated-to, then served
+  again on the next request) before it is cooled down — a small, bounded
+  inefficiency that is the explicit cost of not false-cooling healthy slow
+  accounts. The default threshold (2) keeps this to one extra request; it is
+  injectable via `QoderFailoverRouterConfiguration` for tighter or looser
+  policy. Strike state is in-memory and lost on restart.
+- Honoring `Retry-After` means a server that advertises a long quota window
+  (e.g. 300s) can keep an account out of rotation for that whole window. The
+  `retryAfterCeiling` clamp (default 300s, configurable) bounds this so a
+  single bad hint can't park an account indefinitely.
