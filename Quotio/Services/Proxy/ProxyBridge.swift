@@ -1038,6 +1038,11 @@ final class ProxyBridge {
                     var responsesAdapter: QoderResponsesAdapter?   // Issue #11
                     var totalBytes: Int = 0
                     var failed: Bool = false
+                    /// ADR 0010: the specific reason captured at whichever gate
+                    /// tripped `failed`. Surfaced onto the mid-stream SSE error
+                    /// frame so the client sees the real cause instead of a
+                    /// generic "stream ended" message. nil until a gate sets it.
+                    var failureDetail: String?
                     init(_ reparser: QoderSSEReparser, _ responsesAdapter: QoderResponsesAdapter?) {
                         self.reparser = reparser
                         self.responsesAdapter = responsesAdapter
@@ -1079,6 +1084,7 @@ final class ProxyBridge {
                         // probe didn't trip on). Terminate the same way as a
                         // mid-stream gate.
                         box.failed = true
+                        box.failureDetail = error.localizedDescription
                         Log.proxy("Qoder prefix gate tripped: \(error.localizedDescription)")
                         prefixChunks = Data()
                     }
@@ -1107,6 +1113,7 @@ final class ProxyBridge {
                             // Terminate the agent stream; chunks already sent
                             // stand. ADR 0004 documents this wire behavior.
                             box.failed = true
+                            box.failureDetail = error.localizedDescription
                             Log.proxy("Qoder stream gate tripped: \(error.localizedDescription)")
                             return false  // stop pumping
                         }
@@ -1127,6 +1134,13 @@ final class ProxyBridge {
                     }
                 } catch {
                     if !Task.isCancelled {
+                        // ADR 0010: a transport drop (not a client cancellation)
+                        // is a mid-stream failure — record it so the error-frame
+                        // emission below surfaces it instead of silently
+                        // truncating. Cancellations are clean teardowns and must
+                        // not trip the gate.
+                        box.failed = true
+                        box.failureDetail = error.localizedDescription
                         Log.proxy("Qoder upstream stream ended: \(error.localizedDescription)")
                     }
                 }
@@ -1134,6 +1148,38 @@ final class ProxyBridge {
                 totalResponseBytes = box.totalBytes
                 pumpFailed = box.failed
                 reparser = box.reparser  // read back final state for usage capture
+
+                // ADR 0010: a mid-stream failure (after the 200 OK SSE head)
+                // can no longer change the HTTP status. Instead of silently
+                // truncating, emit a terminal error frame BEFORE the close so
+                // the client sees a structured error. Routed through the
+                // Responses adapter when in responsesMode (a Chat-shape frame
+                // on a Responses stream would be malformed); otherwise the
+                // Chat-shape error frame. The terminal-flush block below only
+                // runs on success (`!pumpFailed`), so on failure this frame is
+                // the only terminal the client sees.
+                if pumpFailed {
+                    let errMsg = box.failureDetail ?? "Qoder upstream stream ended before completion."
+                    let frame: Data
+                    if responsesMode, box.responsesAdapter != nil {
+                        // The adapter carries accumulated sequence state; copy
+                        // out, mutate (errorEvent stamps the next sequence
+                        // number), write back so a later access sees it. Same
+                        // in/out mechanics as `box.translate`.
+                        var adapter = box.responsesAdapter!
+                        frame = adapter.errorEvent(message: errMsg)
+                        box.responsesAdapter = adapter
+                    } else {
+                        frame = QoderOpenAIError.sseTerminalFrame(statusCode: 502, message: errMsg)
+                    }
+                    if !frame.isEmpty {
+                        // Await so the error frame lands before the close —
+                        // avoids a race where the close cancels the in-flight
+                        // send. Best-effort: a send failure here just means
+                        // the client already disconnected.
+                        _ = try? await Self.sendToAgent(frame, on: originalConnection)
+                    }
+                }
 
                 // Flush the reparser's terminal chunk ([DONE] + trailing usage).
                 // Issue #11: in responsesMode the terminal OpenAI chunk flows
@@ -1679,38 +1725,38 @@ final class ProxyBridge {
     // MARK: - Error Response
     
     private nonisolated func sendError(to connection: NWConnection, statusCode: Int, message: String) {
-        guard let bodyData = message.data(using: .utf8) else {
-            connection.cancel()
-            return
-        }
-        
-        // Map status code to proper HTTP reason phrase
-        let reasonPhrase: String
-        switch statusCode {
-        case 400: reasonPhrase = "Bad Request"
-        case 404: reasonPhrase = "Not Found"
-        case 500: reasonPhrase = "Internal Server Error"
-        case 502: reasonPhrase = "Bad Gateway"
-        case 503: reasonPhrase = "Service Unavailable"
-        default: reasonPhrase = "Error"
-        }
-        
-        // Build HTTP response with proper CRLF line endings (no leading whitespace)
+        // ADR 0010: build the OpenAI JSON error envelope via the single CPA
+        // builder. Every status (Qoder auth → 401, endpoint gate → 404, parse
+        // failure → 400, upstream → 502, etc.) flows through the same map, so
+        // the bridge and CPA paths return indistinguishable error bodies. The
+        // `message` here is the errText CPA names the parameter; the builder
+        // handles empty → reason-phrase, valid-JSON → verbatim pass-through,
+        // and the status → type/code mapping internally.
+        let bodyData = QoderOpenAIError.body(statusCode: statusCode, message: message)
+
+        // Map status code to proper HTTP reason phrase. This drives the HTTP
+        // status line only — independent of the JSON envelope's type/code
+        // (the builder owns that). Reuses `QoderOpenAIError.reasonPhrase(for:)`
+        // so there is one reason-phrase table, not two (ADR 0010 §Consequences).
+        let reasonPhrase = QoderOpenAIError.reasonPhrase(for: statusCode)
+
+        // Build HTTP response with proper CRLF line endings (no leading whitespace).
+        // Content-Type is now application/json (was text/plain) per ADR 0010.
         let headers = "HTTP/1.1 \(statusCode) \(reasonPhrase)\r\n" +
-            "Content-Type: text/plain\r\n" +
+            "Content-Type: application/json\r\n" +
             "Content-Length: \(bodyData.count)\r\n" +
             "Connection: close\r\n" +
             "\r\n"
-        
+
         guard let headerData = headers.data(using: .utf8) else {
             connection.cancel()
             return
         }
-        
+
         var responseData = Data()
         responseData.append(headerData)
         responseData.append(bodyData)
-        
+
         connection.send(content: responseData, completion: .contentProcessed { _ in
             connection.cancel()
         })

@@ -310,6 +310,28 @@ nonisolated struct QoderResponsesAdapter {
         return out
     }
 
+    /// ADR 0010: emit a Responses `error` event for a mid-stream failure
+    /// (after the `200 OK` head, when the HTTP status can no longer change).
+    /// Called by ProxyBridge when `responsesMode && pumpFailed`. Does NOT go
+    /// through `ingest` — this isn't a `chat.completion.chunk`; the error event
+    /// is built directly via the adapter's `emitEvent` framing and the next
+    /// sequence number. Returns the SSE bytes for the single `error` event;
+    /// Responses has no `[DONE]` sentinel (unlike Chat), so none is appended.
+    /// The Chat-shape streaming path uses `QoderOpenAIError.sseTerminalFrame`
+    /// instead.
+    mutating func errorEvent(message: String, code: String = "internal_server_error") -> Data {
+        // OpenAI Responses `error` event shape: {type, code, message,
+        // sequence_number}. No `param` field — the Responses error event does
+        // not carry one (verified against the streaming-events spec; unlike the
+        // Chat error envelope, which CPA's ErrorDetail also omits).
+        emitEvent("error", payload: [
+            "type": "error",
+            "code": code,
+            "message": message,
+            "sequence_number": nextSequence(),
+        ])
+    }
+
     // MARK: - Event emitters (Chat → Responses)
 
     /// The lazy opener: fires on the first content delta. Emits four events:
