@@ -614,6 +614,85 @@ final class QoderSSEReparserTests: XCTestCase {
         XCTAssertEqual(choices?["finish_reason"] as? String, "stop")
     }
 
+    /// Issue #18 regression: when one upstream frame carries BOTH
+    /// `delta.content` AND `finish_reason` in the same choice, `processLine`
+    /// stashes the finish reason (the immediate-emit path is skipped because
+    /// `producedContentThisLine` is true) and `finish()` must emit it before
+    /// `[DONE]` — else strict OpenAI clients see an unterminated response.
+    /// Contract: a content chunk followed by a finish chunk (real reason),
+    /// then `[DONE]`.
+    func testCombinedContentAndFinishReasonEmittedInFinish() throws {
+        var reparser = QoderSSEReparser()
+        let line = qoderLine([
+            "id": "x", "model": "m",
+            "choices": [["delta": ["content": "done"], "finish_reason": "stop"]],
+        ])
+        var out = try reparser.feed(Data(line.utf8))
+        out.append(try reparser.finish())
+        let text = String(data: out, encoding: .utf8) ?? ""
+        XCTAssertTrue(text.hasSuffix("data: [DONE]\n\n"))
+        let chunks = openAIChunks(out)
+        XCTAssertEqual(chunks.count, 2)
+        // Chunk 0: the content delta.
+        let c0 = (chunks[0]["choices"] as? [[String: Any]])?[0]
+        let d0 = c0?["delta"] as? [String: Any]
+        XCTAssertEqual(d0?["content"] as? String, "done")
+        // Chunk 1: the finish chunk carrying the real finish_reason.
+        let c1 = (chunks[1]["choices"] as? [[String: Any]])?[0]
+        XCTAssertEqual(c1?["finish_reason"] as? String, "stop")
+    }
+
+    /// Issue #18 contract lock: a frame with `delta.reasoning_content` AND
+    /// `finish_reason` in the same choice still emits the finish reason before
+    /// `[DONE]`. This passes BEFORE the fix too (reasoning doesn't set
+    /// `producedContentThisLine`, so the immediate-emit path fires and the
+    /// stash stays nil) — it pins the contract so a future change to the
+    /// reasoning branch can't silently regress combined frames.
+    func testCombinedReasoningAndFinishReason() throws {
+        var reparser = QoderSSEReparser()
+        let line = qoderLine([
+            "id": "x", "model": "m",
+            "choices": [["delta": ["reasoning_content": "thinking..."], "finish_reason": "stop"]],
+        ])
+        var out = try reparser.feed(Data(line.utf8))
+        out.append(try reparser.finish())
+        let chunks = openAIChunks(out)
+        let finishChunk = chunks.first { ($0["choices"] as? [[String: Any]])?[0]["finish_reason"] != nil }
+        XCTAssertEqual(
+            (finishChunk?["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String,
+            "stop"
+        )
+    }
+
+    /// Issue #18 contract lock: a frame with a function-bearing
+    /// `delta.tool_calls` AND `finish_reason: "stop"` in the same choice must
+    /// surface `finish_reason: "tool_calls"` (the override flips "stop" once
+    /// `emittedHeader` is true). Like the reasoning variant, this passes before
+    /// AND after the fix (tool_calls don't set `producedContentThisLine`, so
+    /// the immediate-emit path fires) — it pins the contract so the tool-call
+    /// branch can't silently regress combined frames later.
+    func testCombinedToolCallAndFinishReason() throws {
+        var reparser = QoderSSEReparser()
+        let line = qoderLine([
+            "id": "x", "model": "m",
+            "choices": [[
+                "delta": ["tool_calls": [[
+                    "index": 0, "id": "call_1", "type": "function",
+                    "function": ["name": "f", "arguments": "{}"],
+                ]]],
+                "finish_reason": "stop",
+            ]],
+        ])
+        var out = try reparser.feed(Data(line.utf8))
+        out.append(try reparser.finish())
+        let chunks = openAIChunks(out)
+        let finishChunk = chunks.first { ($0["choices"] as? [[String: Any]])?[0]["finish_reason"] != nil }
+        XCTAssertEqual(
+            (finishChunk?["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String,
+            "tool_calls"
+        )
+    }
+
     /// finish() is idempotent — calling it twice emits [DONE] once.
     func testFinishIdempotent() throws {
         var reparser = QoderSSEReparser()

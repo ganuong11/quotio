@@ -192,6 +192,19 @@ nonisolated struct QoderSSEReparser {
             }
         }
 
+        // Issue #18: emit a finish_reason stashed during a combined content/
+        // reasoning/tool + finish upstream frame (where `producedContentThisLine`
+        // suppressed the immediate emission in processLine). Read the stash
+        // regardless of which channel set it, so content/reasoning/tool
+        // combined frames are covered uniformly. When the upstream sent
+        // finish_reason on its own frame, processLine already emitted and
+        // cleared the stash, so this path is a no-op there.
+        // Terminal ordering: finish chunk → usage chunk (if any) → [DONE].
+        if let reason = stashedFinishReason {
+            out.append(buildChunk(delta: nil, finishReason: reason, usage: nil))
+            stashedFinishReason = nil
+        }
+
         // Trailing usage chunk (OpenAI convention: usage rides on its own
         // final chunk with an empty `choices` array). Only emit if we have
         // stashed usage that wasn't already attached to a content chunk.
