@@ -507,6 +507,16 @@ final class ProxyBridge {
         // isolated and `processRequest` is `nonisolated`.
         let isQoderBound = metadata.model?.hasPrefix("qoder/") == true
 
+        // Issue #11: `/v1/responses` is the OpenAI Responses API. A qoder/ model
+        // on that endpoint routes to a separate Responses adapter
+        // (`QoderResponsesTranslator` input + `QoderResponsesAdapter` output),
+        // reusing the Chat gateway core. The body is synthesized into Chat
+        // Completions shape before reaching the router so COSY/failover/reparser
+        // are identical to the Chat path. Full ADR 0009 method/path enforcement
+        // (404 for qoder-bound requests on wrong paths) is separate foundation
+        // work; this branch only adds the responses routing decision.
+        let isResponsesEndpoint = method == "POST" && path == "/v1/responses"
+
         // Check for virtual model and create fallback context
         Task { @MainActor [weak self] in
             guard let self = self else { return }
@@ -514,17 +524,39 @@ final class ProxyBridge {
             // Qoder branch: route to the failover router and return — the CPA
             // path (fallback + forwardRequest) does not run for qoder/ models.
             if isQoderBound, let router = self.qoderRouter {
+                // Issue #11: Responses API path. Synthesize the Chat body here
+                // (pre-router) so the router/translator/COSY path is byte-
+                // identical to Chat. Parse errors become a 400 — the Responses
+                // body didn't carry model/input/etc. Non-responses qoder
+                // requests keep their body byte-identical (only the new flag +
+                // the synthesized body differ).
+                let effectiveBody: String
+                let responsesMode: Bool
+                if isResponsesEndpoint {
+                    do {
+                        let chatBody = try QoderResponsesTranslator.synthesizeChatBody(from: Data(body.utf8))
+                        effectiveBody = String(data: chatBody, encoding: .utf8) ?? body
+                        responsesMode = true
+                    } catch {
+                        self.sendError(to: connection, statusCode: 400, message: error.localizedDescription)
+                        return
+                    }
+                } else {
+                    effectiveBody = body
+                    responsesMode = false
+                }
                 self.forwardQoderRequest(
                     router: router,
                     method: method,
                     path: path,
                     headers: headers,
-                    body: body,
+                    body: effectiveBody,
                     originalConnection: connection,
                     connectionId: connectionId,
                     startTime: startTime,
                     requestSize: data.count,
-                    requestModel: metadata.model ?? ""
+                    requestModel: metadata.model ?? "",
+                    responsesMode: responsesMode
                 )
                 return
             }
@@ -899,7 +931,8 @@ final class ProxyBridge {
         connectionId: Int,
         startTime: Date,
         requestSize: Int,
-        requestModel: String
+        requestModel: String,
+        responsesMode: Bool = false   // Issue #11
     ) {
         // Extract the proxy API key from `Authorization: Bearer <key>`. The
         // router uses it for session-ID derivation (ADR 0005 §1) and validates
@@ -996,13 +1029,37 @@ final class ProxyBridge {
                 // The onChunk closure captures mutable state via a final-class
                 // holder (closures can't capture `inout` reparser). The holder is
                 // local to this Task, never shared across isolation domains.
+                // Issue #11: when `responsesMode` is set, the box also carries a
+                // `QoderResponsesAdapter` that translates OpenAI
+                // chat.completion.chunk SSE (the reparser's output) into
+                // Responses API events before they reach the agent socket.
                 final class ReparserBox: @unchecked Sendable {
                     var reparser: QoderSSEReparser
+                    var responsesAdapter: QoderResponsesAdapter?   // Issue #11
                     var totalBytes: Int = 0
                     var failed: Bool = false
-                    init(_ reparser: QoderSSEReparser) { self.reparser = reparser }
+                    init(_ reparser: QoderSSEReparser, _ responsesAdapter: QoderResponsesAdapter?) {
+                        self.reparser = reparser
+                        self.responsesAdapter = responsesAdapter
+                    }
+
+                    /// Issue #11: translate OpenAI chat.completion.chunk SSE →
+                    /// Responses API events. nil adapter = pass through (the
+                    /// existing Chat path, byte-identical). The adapter is a
+                    /// value type; this method copies it out, mutates, writes it
+                    /// back so subsequent calls see accumulated state (same
+                    /// in/out mechanics the reparser's `var` already uses here).
+                    /// Best-effort: a translation failure (malformed JSON inside
+                    /// a `data:` frame) returns empty rather than tearing the
+                    /// stream — the reparser's gate owns hard failures.
+                    func translate(_ openAIChunks: Data) -> Data {
+                        guard var adapter = responsesAdapter else { return openAIChunks }
+                        let translated = (try? adapter.ingest(openAIChunks)) ?? Data()
+                        responsesAdapter = adapter
+                        return translated
+                    }
                 }
-                let box = ReparserBox(reparser)
+                let box = ReparserBox(reparser, responsesMode ? QoderResponsesAdapter() : nil)
                 // Track the agent connection so the closure can send to it.
                 let agentConn = originalConnection
 
@@ -1026,7 +1083,14 @@ final class ProxyBridge {
                         prefixChunks = Data()
                     }
                     if !prefixChunks.isEmpty {
-                        try? await Self.sendToAgent(prefixChunks, on: agentConn)
+                        // Issue #11: in responsesMode, translate OpenAI
+                        // chat.completion.chunk SSE → Responses events before
+                        // sending. The adapter is a value type held in the box;
+                        // mutate the box's copy and send the translated bytes.
+                        let toSend = box.translate(prefixChunks)
+                        if !toSend.isEmpty {
+                            try? await Self.sendToAgent(toSend, on: agentConn)
+                        }
                     }
                 }
 
@@ -1047,8 +1111,13 @@ final class ProxyBridge {
                             return false  // stop pumping
                         }
                         if !openAIChunks.isEmpty {
+                            // Issue #11: translate through the responses adapter
+                            // (no-op when not in responsesMode — see box.translate).
+                            let toSend = box.translate(openAIChunks)
                             do {
-                                try await Self.sendToAgent(openAIChunks, on: agentConn)
+                                if !toSend.isEmpty {
+                                    try await Self.sendToAgent(toSend, on: agentConn)
+                                }
                             } catch {
                                 // Agent socket went away — stop pumping cleanly.
                                 return false
@@ -1067,6 +1136,13 @@ final class ProxyBridge {
                 reparser = box.reparser  // read back final state for usage capture
 
                 // Flush the reparser's terminal chunk ([DONE] + trailing usage).
+                // Issue #11: in responsesMode the terminal OpenAI chunk flows
+                // through the adapter first (same translate-then-send path),
+                // THEN `adapter.finish()` emits the Responses terminals
+                // (output_text.done, output_item.done, response.completed). The
+                // finish() call is made exactly once — its contract (see
+                // QoderResponsesAdapter.finish()) is to emit response.completed
+                // and is idempotent on a second call (returns empty).
                 if !pumpFailed {
                     let terminal: Data
                     do {
@@ -1074,8 +1150,26 @@ final class ProxyBridge {
                     } catch {
                         terminal = Data()
                     }
-                    if !terminal.isEmpty {
-                        try? await Self.sendToAgent(terminal, on: originalConnection)
+                    if responsesMode {
+                        if !terminal.isEmpty {
+                            let toSend = box.translate(terminal)
+                            if !toSend.isEmpty {
+                                try? await Self.sendToAgent(toSend, on: originalConnection)
+                            }
+                        }
+                        if box.responsesAdapter != nil {
+                            // finish() is mutating; copy out, finish, then drop.
+                            var adapter = box.responsesAdapter!
+                            let completedData = (try? adapter.finish()) ?? Data()
+                            box.responsesAdapter = nil   // idempotent guard
+                            if !completedData.isEmpty {
+                                try? await Self.sendToAgent(completedData, on: originalConnection)
+                            }
+                        }
+                    } else {
+                        if !terminal.isEmpty {
+                            try? await Self.sendToAgent(terminal, on: originalConnection)
+                        }
                     }
                 }
 
@@ -1095,6 +1189,25 @@ final class ProxyBridge {
                 // identical), then feed the reparser's OpenAI-shape chunks into
                 // a `QoderCompletionAggregator`. Single parser of Qoder's
                 // envelope — no parallel state machine (issue #9 acceptance).
+
+                // Issue #11 Task B: non-streaming Responses shape is a follow-up
+                // (the `{id, object:"response", output:[...], usage}` object
+                // needs a fold from `QoderCompletionAggregator` output, similar
+                // to how Chat non-streaming was done in issue #9). Return an
+                // explicit 501 rather than silently returning a Chat-shaped
+                // object on a Responses endpoint — silent misrouting is worse
+                // than a clear error. Clients should retry with `stream:true`.
+                // The shared metadata recording below still runs (no `return`)
+                // so the request is counted; `httpStatus = nil` marks it as a
+                // non-2xx outcome so the recorder reports `statusCode: nil`.
+                if responsesMode {
+                    httpStatus = nil
+                    self.sendError(to: originalConnection, statusCode: 501,
+                        message: "Non-streaming Responses API is not yet supported; retry with stream:true.")
+                    originalConnection.send(content: nil, isComplete: true, completion: .contentProcessed { _ in
+                        originalConnection.cancel()
+                    })
+                } else {
                 var reparser = QoderSSEReparser()
                 var aggregator = QoderCompletionAggregator()
                 var aggregateFailed = false
@@ -1219,6 +1332,7 @@ final class ProxyBridge {
                     })
                     totalResponseBytes += bodyBytes.count
                 }
+                }   // closes `else` of `if responsesMode` (Issue #11)
             }
 
             // Record completion metadata, including captured usage for the
