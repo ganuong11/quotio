@@ -1294,12 +1294,14 @@ final class QoderChatTranslatorTests: XCTestCase {
 
     /// Production defaults are the values documented in the issue and ADR 0013.
     /// Pins them so a future edit can't silently shrink them.
+    /// (Raised in the "raise translator default limits" change: 999 messages /
+    /// 90 MiB images / 999 tools / 5 MiB tool schemas.)
     func testProductionDefaultsMatchIssue14() {
         let d = QoderTranslatorLimits.default
-        XCTAssertEqual(d.maxMessages, 500)
-        XCTAssertEqual(d.maxImageBytes, 10 * 1024 * 1024)
-        XCTAssertEqual(d.maxTools, 128)
-        XCTAssertEqual(d.maxToolSchemaBytes, 1024 * 1024)
+        XCTAssertEqual(d.maxMessages, 999)
+        XCTAssertEqual(d.maxImageBytes, 90 * 1024 * 1024)
+        XCTAssertEqual(d.maxTools, 999)
+        XCTAssertEqual(d.maxToolSchemaBytes, 5 * 1024 * 1024)
     }
 
     /// Defaults are injectable and a request that's over the tight limit but
