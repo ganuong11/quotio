@@ -1111,4 +1111,63 @@ final class QoderSSEReparserTests: XCTestCase {
         XCTAssertEqual(chunks.filter { ($0["usage"] as? [String: Any]) != nil }.count, 0,
                        "includeUsage=false must suppress the trailing usage chunk")
     }
+
+    // MARK: - ADR 0013 Tier 1 SSE line cap (issue #23)
+
+    /// A line exactly AT the cap terminates fine on its `\n`; the cap fires
+    /// only when the partial-line buffer EXCEEDS it with no terminator in
+    /// sight. Boundary: at-cap → no throw.
+    func testLineExactlyAtCapDoesNotThrow() throws {
+        var reparser = QoderSSEReparser(created: 1700, maxLineBytes: 64)
+        // 64 bytes of `x` followed by `\n` — the line hits the cap exactly.
+        let line = String(repeating: "x", count: 64) + "\n"
+        // Malformed (not a `data:` JSON line) is skipped per pi-parity — the
+        // point is the LINE-CAP path did not fire.
+        _ = try reparser.feed(Data(line.utf8))
+    }
+
+    /// An oversized line (no `\n` terminator) throws `.lineTooLarge` once the
+    /// partial-line buffer exceeds the cap — the ADR 0013 structured
+    /// termination signal ProxyBridge turns into a mid-stream error frame.
+    func testOversizedLineThrowsLineTooLarge() throws {
+        var reparser = QoderSSEReparser(created: 1700, maxLineBytes: 64)
+        // 65 bytes with no `\n` — one over the cap.
+        do {
+            _ = try reparser.feed(Data(String(repeating: "x", count: 65).utf8))
+            XCTFail("expected lineTooLarge")
+        } catch let err as QoderSSEReparserError {
+            guard case .lineTooLarge(let max) = err else {
+                return XCTFail("wrong error: \(err)")
+            }
+            XCTAssertEqual(max, 64)
+        }
+    }
+
+    /// The cap applies to the ACCUMULATED partial line across feeds — a
+    /// misbehaving upstream trickling bytes with no `\n` must still trip it,
+    /// not grow the buffer unbounded.
+    func testOversizedLineAcrossFeedsThrows() throws {
+        var reparser = QoderSSEReparser(created: 1700, maxLineBytes: 64)
+        // Two feeds of 40 bytes each (80 > 64), neither carrying `\n`.
+        _ = try reparser.feed(Data(String(repeating: "a", count: 40).utf8))
+        do {
+            _ = try reparser.feed(Data(String(repeating: "a", count: 40).utf8))
+            XCTFail("expected lineTooLarge on the second feed")
+        } catch let err as QoderSSEReparserError {
+            guard case .lineTooLarge = err else { return XCTFail("wrong error: \(err)") }
+        }
+    }
+
+    /// A legitimately huge line under the cap passes through — the default
+    /// 1 MiB cap must not truncate real payloads. Feeds a 100 KiB line under
+    /// a 1 MiB-equivalent cap and asserts it survives.
+    func testLargeLegitimateLinePasses() throws {
+        var reparser = QoderSSEReparser(created: 1700, maxLineBytes: 200_000)
+        // A 100 KiB `data:` line (well under cap) with a proper terminator.
+        let payload = String(repeating: "y", count: 100_000)
+        let line = "data: " + payload + "\n\n"
+        // Malformed JSON → skipped per pi-parity; the assertion is that no
+        // lineTooLarge fired (the line is legitimately large but under cap).
+        _ = try reparser.feed(Data(line.utf8))
+    }
 }

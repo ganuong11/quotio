@@ -43,6 +43,13 @@ nonisolated enum QoderSSEReparserError: Error, LocalizedError {
     /// SSE line shouldn't kill the stream); we surface them so ProxyBridge can
     /// decide — most callers will log-and-continue via the throwing `feed`.
     case malformedSSELine(snippet: String)
+    /// A single SSE line exceeded the ADR 0013 Tier 1 line cap
+    /// (`QoderSSEReparser.maxSSELineBytes`). Deliberately carries NO snippet —
+    /// the offending line is by definition huge and must not ride an error
+    /// message. ProxyBridge surfaces this as the mid-stream terminal error
+    /// frame (streaming, head already written) or a true 502 (non-streaming,
+    /// head not yet written).
+    case lineTooLarge(maxBytes: Int)
 
     var errorDescription: String? {
         switch self {
@@ -53,6 +60,8 @@ nonisolated enum QoderSSEReparserError: Error, LocalizedError {
                 : "Qoder upstream returned status \(status): \(capped)"
         case .malformedSSELine(let snippet):
             return "Qoder SSE: malformed line (\(String(snippet.prefix(120))))."
+        case .lineTooLarge(let max):
+            return "Qoder SSE: a single line exceeded \(max) bytes."
         }
     }
 }
@@ -70,6 +79,19 @@ nonisolated enum QoderSSEReparserError: Error, LocalizedError {
 /// default isolation is MainActor; a pure synchronous value type opts out
 /// explicitly, like `QoderWAFEncoder` / `QoderCOSYSigner`).
 nonisolated struct QoderSSEReparser {
+    /// ADR 0013 Tier 1 cap on a single SSE line. If the accumulated line
+    /// buffer (bytes received since the last `\n`) exceeds this size, `feed`
+    /// throws `.lineTooLarge` and ProxyBridge terminates the stream with a
+    /// structured mid-stream error frame. Bounds the reparser against a
+    /// misbehaving upstream that never emits `\n`. Legit upstream lines are
+    /// Qoder-enveloped single deltas — far below this — so the cap is only
+    /// headroom, not a truncation risk.
+    static let maxSSELineBytes: Int = 1 * 1024 * 1024
+
+    /// Instance cap (defaults to `maxSSELineBytes`; tests inject a small value
+    /// to hit boundary conditions without allocating megabytes).
+    private let maxLineBytes: Int
+
     /// Bytes received but not yet terminated by `\n`. SSE frames can split
     /// across TCP segments, so partial trailing lines must survive a `feed`
     /// call (advisor watch-item).
@@ -155,17 +177,19 @@ nonisolated struct QoderSSEReparser {
     /// initializer to assert byte-exact OpenAI chunk output. `includeUsage`
     /// defaults to false (issue #19: spec default — no trailing usage chunk
     /// unless the client opted in via `stream_options.include_usage: true`).
-    init(includeUsage: Bool = false) {
+    init(includeUsage: Bool = false, maxLineBytes: Int = QoderSSEReparser.maxSSELineBytes) {
         self.created = Int(Date().timeIntervalSince1970.rounded(.down))
         self.includeUsage = includeUsage
+        self.maxLineBytes = maxLineBytes
     }
 
     /// Test initializer pinning the `created` timestamp. `includeUsage` defaults
     /// to false to keep the existing test fixtures (which were written before
     /// the gate) asserting the no-usage-chunk shape unless they opt in.
-    init(created: Int, includeUsage: Bool = false) {
+    init(created: Int, includeUsage: Bool = false, maxLineBytes: Int = QoderSSEReparser.maxSSELineBytes) {
         self.created = created
         self.includeUsage = includeUsage
+        self.maxLineBytes = maxLineBytes
     }
 
     // MARK: - Feed
@@ -270,6 +294,13 @@ nonisolated struct QoderSSEReparser {
             // SSE lines end with `\n`. Pi splits on `\n` then `.trim()`s, so
             // `\r\n` and bare `\r` are handled by trimming. We mirror that.
             guard let nlIndex = buffer.firstIndex(of: "\n") else {
+                // ADR 0013 Tier 1 line cap: the buffer here holds the one
+                // partial line received so far (no `\n` yet). If it exceeds the
+                // cap, the upstream is emitting an unbounded line — terminate
+                // with a structured error rather than buffering forever.
+                if buffer.utf8.count > maxLineBytes {
+                    throw QoderSSEReparserError.lineTooLarge(maxBytes: maxLineBytes)
+                }
                 if terminal && !buffer.isEmpty {
                     let leftover = buffer
                     buffer.removeAll(keepingCapacity: false)
