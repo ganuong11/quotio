@@ -2199,7 +2199,7 @@ extension CLIProxyManager {
             version: ProxyBinarySource.plusLocalVersion,
             sha256: ProxyBinarySource.plusLocalSHA256,
             localFilePath: bundledBinaryPath,
-            releaseNotes: "Bundled CLIProxyAPI 7.2.113 with xAI Grok support."
+            releaseNotes: "Bundled CLIProxyAPI 7.2.124 with xAI Grok support."
         )
     }
 

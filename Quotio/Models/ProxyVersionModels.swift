@@ -15,8 +15,8 @@ nonisolated enum ProxyBinarySource: String, Codable, CaseIterable, Identifiable,
 
     static let userDefaultsKey = "selectedProxyBinarySource"
     static let explicitSelectionDefaultsKey = "hasExplicitProxyBinarySourceSelection"
-    static let plusLocalVersion = "7.2.113-0"
-    static let plusLocalSHA256 = "a6918ba49b95a6740998735f6882d6b789fcd9b26b0ef486e7a9d8ac730c11ff"
+    static let plusLocalVersion = "7.2.124-0"
+    static let plusLocalSHA256 = "2a301b56b7dec8952d464a27f5efd24daeb0511b7295772016f79cb310451475"
     static let plusLocalBinaryName = "cli-proxy-api-plus"
     static let plusLocalResourceSubdirectory = "Proxy"
 
@@ -41,7 +41,7 @@ nonisolated enum ProxyBinarySource: String, Codable, CaseIterable, Identifiable,
     var shortDescription: String {
         switch self {
         case .plusLocal:
-            return "Bundled 7.2.113-0 with xAI Grok support"
+            return "Bundled 7.2.124-0 with xAI Grok support"
         case .upstream:
             return "Latest maintained upstream releases"
         }
@@ -50,7 +50,7 @@ nonisolated enum ProxyBinarySource: String, Codable, CaseIterable, Identifiable,
     var selectionDescription: String {
         switch self {
         case .plusLocal:
-            return "CLIProxyAPIPlus (bundled 7.2.113-0)"
+            return "CLIProxyAPIPlus (bundled 7.2.124-0)"
         case .upstream:
             return "CLIProxyAPI (latest upstream)"
         }
