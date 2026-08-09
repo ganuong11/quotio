@@ -308,10 +308,10 @@ nonisolated struct QoderTranslatorLimits: Sendable, Equatable {
 
     /// Production defaults (see per-field docs for sizing rationale).
     static let `default` = QoderTranslatorLimits(
-        maxMessages: 500,
-        maxImageBytes: 10 * 1024 * 1024,
-        maxTools: 128,
-        maxToolSchemaBytes: 1024 * 1024
+        maxMessages: 999,
+        maxImageBytes: 90 * 1024 * 1024,
+        maxTools: 999,
+        maxToolSchemaBytes: 5 * 1024 * 1024
     )
 }
 
