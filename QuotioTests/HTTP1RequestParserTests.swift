@@ -267,6 +267,20 @@ final class HTTP1RequestParserTests: XCTestCase {
         XCTAssertEqual(err, .bodyTooLarge(maxBytes: 16))
     }
 
+    /// Tier 1's body cap must stay above the Tier 2 image cap's *wire*
+    /// footprint. `QoderTranslatorLimits.maxImageBytes` measures decoded image
+    /// bytes, but inline images travel as base64 data URLs (~4/3x on the
+    /// wire). If the body cap dips below `maxImageBytes * 4/3` (+ the largest
+    /// tool schema + JSON overhead), a request that Tier 2 would legitimately
+    /// accept gets 413'd at the parser before the translator's own cap is
+    /// ever consulted. Pins the tier ordering.
+    func testBodyCapStaysAboveImageCapWireFootprint() {
+        let limits = QoderTranslatorLimits.default
+        let imageWireFootprint = limits.maxImageBytes * 4 / 3
+        let worstCaseBody = imageWireFootprint + limits.maxToolSchemaBytes + 1024 * 1024
+        XCTAssertGreaterThan(HTTP1RequestParser.defaultMaxBodyBytes, worstCaseBody)
+    }
+
     func testMalformedRequestLine_returnsError() {
         let raw = "NOT-A-VALID-REQUEST-LINE\r\n\r\n"
         expectError(.malformedRequestLine(snippet: "NOT-A-VALID-REQUEST-LINE"), chunks: [data(raw)])

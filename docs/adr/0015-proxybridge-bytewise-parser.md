@@ -104,10 +104,13 @@ This parser is where ADR 0013's Tier 1 receive-path caps finally land:
 - The Qoder and CPA paths share the cap (both flow through `receiveRequest`),
   as ADR 0013 §Decision requires.
 
-Concrete defaults: `maxHeaderBytes = 64 KiB` (65536), `maxBodyBytes = 64 MiB`
-(67 108 864). Both are injectable via `HTTP1RequestParser(maxHeaderBytes:
-maxBodyBytes:)` for tests. Sized with generous headroom over any plausible
-CLI-agent request (large multimodal / tool payloads fit comfortably).
+Concrete defaults: `maxHeaderBytes = 64 KiB` (65536), `maxBodyBytes = 192 MiB`
+(201 326 592). Both are injectable via `HTTP1RequestParser(maxHeaderBytes:
+maxBodyBytes:)` for tests. `maxBodyBytes` was raised from the original 64 MiB
+to stay above the Tier 2 translator image cap's wire footprint
+(`maxImageBytes` measures decoded bytes; base64 inflates ~4/3× on the wire) —
+otherwise Tier 1 would 413 before the translator's own cap was ever consulted.
+`testBodyCapStaysAboveImageCapWireFootprint` pins the relationship.
 
 ### CPA pass-through preservation
 

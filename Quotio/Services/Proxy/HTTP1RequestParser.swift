@@ -171,9 +171,14 @@ nonisolated struct HTTP1RequestParser {
     /// ADR 0013 Tier 1 cap on the request body. Applies identically to
     /// Content-Length framing and to accumulated chunked body bytes — the
     /// body-exhaustion vector does not care which framing the client chose
-    /// (ADR 0013 §Decision). Sized to cover large multimodal / tool payloads
-    /// with headroom.
-    static let defaultMaxBodyBytes: Int = 64 * 1024 * 1024
+    /// (ADR 0013 §Decision). Sized above the Tier 2 translator image cap's
+    /// wire footprint: `QoderTranslatorLimits.maxImageBytes` measures decoded
+    /// image bytes, and a max-size base64 data URL inflates ~4/3× on the
+    /// wire — this cap must stay above `maxImageBytes * 4/3` (+ tool schema
+    /// + JSON overhead) or Tier 1 413s before the translator's own cap is
+    /// ever consulted. `testBodyCapStaysAboveImageCapWireFootprint` pins the
+    /// relationship.
+    static let defaultMaxBodyBytes: Int = 192 * 1024 * 1024
 
     private let maxHeaderBytes: Int
     private let maxBodyBytes: Int
