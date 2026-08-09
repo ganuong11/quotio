@@ -97,6 +97,21 @@ nonisolated struct QoderSSEReparser {
     /// call (advisor watch-item).
     private var buffer: String = ""
 
+    /// Trailing bytes of a multi-byte UTF-8 sequence split across a feed
+    /// boundary. The transport splits chunks on byte-count thresholds (the
+    /// gateway chunker's frame-boundary first pull, 8KB bulk pulls, and TCP
+    /// segments before that), so a split point can land between a UTF-8 lead
+    /// byte and its continuation byte. `String(data:encoding:.utf8)` decodes
+    /// a chunk all-or-nothing, so decoding each feed in isolation throws
+    /// `.malformedSSELine("<non-UTF8 chunk>")` on an otherwise healthy stream
+    /// (observed: ZCode turns dying mid-stream on exactly this). `feed`
+    /// decodes the longest valid UTF-8 prefix and stashes the dangling
+    /// continuation bytes here for stitching into the next feed. Bounded to 3
+    /// bytes (UTF-8 sequences are at most 4; a valid prefix always consumes
+    /// the lead byte), so an invalid trailing byte surfaces as a genuine
+    /// decode failure on the NEXT feed rather than buffering forever.
+    private var pendingUTF8: Data = Data()
+
     /// Response ID from the first chunk carrying `inner.id`. Stamped on every
     /// emitted OpenAI chunk so agents can correlate (OpenAI clients expect a
     /// stable `id`).
@@ -198,14 +213,49 @@ nonisolated struct QoderSSEReparser {
     /// OpenAI-shape SSE bytes to write to the agent socket. Returns empty
     /// `Data` when no complete frame is available yet (buffering).
     ///
+    /// Chunk boundaries are byte-count driven (frame-boundary first pull, 8KB
+    /// bulk pulls, TCP segments below that), so they can land INSIDE a
+    /// multi-byte UTF-8 character. `String(data:encoding:.utf8)` is
+    /// all-or-nothing, so decoding each feed in isolation would throw on a
+    /// healthy stream; instead `feed` decodes the longest valid UTF-8 prefix
+    /// and stashes the dangling trailing bytes in `pendingUTF8` for the next
+    /// feed. Truly invalid UTF-8 (unfixable within 3 peeled bytes) still
+    /// throws `.malformedSSELine`.
+    ///
     /// Throws on `statusCodeValue != 200` and malformed JSON lines. A thrown
     /// error does NOT corrupt the reparser state — the caller may continue
     /// feeding if it chooses to swallow `.malformedSSELine` (pi's behavior).
     mutating func feed(_ data: Data) throws -> Data {
-        if data.isEmpty { return Data() }
-        guard let chunk = String(data: data, encoding: .utf8) else {
-            throw QoderSSEReparserError.malformedSSELine(snippet: "<non-UTF8 chunk>")
+        // Stitch any dangling UTF-8 continuation bytes from the previous feed
+        // before decoding (see `pendingUTF8`).
+        var raw = data
+        if !pendingUTF8.isEmpty {
+            raw = pendingUTF8 + data
+            pendingUTF8 = Data()
         }
+        if raw.isEmpty { return Data() }
+
+        // Decode the longest valid UTF-8 prefix of `raw`. A split multi-byte
+        // sequence leaves 1-3 trailing bytes that cannot decode alone; peel
+        // them off into `pendingUTF8` one at a time. UTF-8 sequences are at
+        // most 4 bytes, so a genuine split is fixable in at most 3 peels —
+        // more than that means the chunk carries invalid UTF-8 somewhere
+        // earlier, which must surface as an error instead of buffering
+        // garbage indefinitely.
+        var decodable = raw
+        var stash = Data()
+        var chunk: String
+        while true {
+            if let decoded = String(data: decodable, encoding: .utf8) {
+                chunk = decoded
+                break
+            }
+            guard stash.count < 3, !decodable.isEmpty else {
+                throw QoderSSEReparserError.malformedSSELine(snippet: "<non-UTF8 chunk>")
+            }
+            stash.insert(decodable.removeLast(), at: 0)
+        }
+        pendingUTF8 = stash
         buffer.append(chunk)
         // Normalize line endings: SSE allows `\r\n` and bare `\r`. Swift String
         // treats `\r\n` as one grapheme cluster, so `firstIndex(of: "\n")`

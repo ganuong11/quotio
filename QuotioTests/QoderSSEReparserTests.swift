@@ -139,6 +139,36 @@ final class QoderSSEReparserTests: XCTestCase {
         XCTAssertEqual(((chunks[1]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["content"] as? String, "Hello")
     }
 
+    /// A chunk boundary landing INSIDE a multi-byte UTF-8 character must not
+    /// kill the stream. The upstream transport splits TCP segments on byte-
+    /// count thresholds (production chunker: frame-boundary first pull, 8192
+    /// bulk pulls), so a split point can land anywhere — including between a
+    /// UTF-8 lead byte and its continuation byte. The reparser must hold the
+    /// dangling trailing bytes and stitch them with the next feed. Regression
+    /// test for a production failure: ZCode turns died with
+    /// `Qoder SSE: malformed line (<non-UTF8 chunk>)` when an 8KB bulk chunk
+    /// split a multibyte character.
+    func testUTF8SequenceSplitAcrossFeeds() throws {
+        var reparser = QoderSSEReparser(created: 1)
+        let line = qoderLine([
+            "id": "x", "model": "m",
+            "choices": [["index": 0, "delta": ["content": "Héllo"]]],
+        ])
+        let bytes = Array(line.utf8)
+        // 'é' is two UTF-8 bytes (C3 A9); find the first occurrence and split
+        // BETWEEN them so the first feed ends on a dangling lead byte.
+        let start = try XCTUnwrap(bytes.indices.first { i in
+            i + 1 < bytes.count && bytes[i] == 0xC3 && bytes[i + 1] == 0xA9
+        })
+        let out1 = try reparser.feed(Data(bytes[0...start]))      // ends on 0xC3
+        XCTAssertTrue(out1.isEmpty, "dangling UTF-8 lead byte must buffer, not throw or emit")
+        let out2 = try reparser.feed(Data(bytes[(start + 1)...])) // starts on 0xA9
+        let chunks = openAIChunks(out2)
+        // ADR 0011: opener + content = 2 chunks.
+        XCTAssertEqual(chunks.count, 2)
+        XCTAssertEqual(((chunks[1]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["content"] as? String, "Héllo")
+    }
+
     /// `\r\n` line endings are tolerated (SSE spec allows them). ADR 0011 §4:
     /// opener + content = 2 chunks.
     func testHandlesCRLFLineEndings() throws {

@@ -37,9 +37,12 @@
 //    frame sizes rather than one byte per await).
 //
 //  The reparser splits on `\n` and buffers partial trailing lines across feeds
-//  (`QoderSSEReparser.swift:76, 216`), so a small first chunk followed by large
+//  (`QoderSSEReparser.buffer`), so a small first chunk followed by large
 //    bulk chunks is framing-safe. CRLF split across the chunk boundary is
-//    handled per-feed (`QoderSSEReparser.swift:163-164`).
+//    handled per-feed (the `\r\n` → `\n` collapse in `feed`). Multi-byte UTF-8
+//    characters split across a chunk boundary are handled the same way —
+//    `feed()` decodes the longest valid prefix and stashes the dangling
+//    trailing bytes for the next feed (see `pendingUTF8`).
 //
 
 import Foundation
