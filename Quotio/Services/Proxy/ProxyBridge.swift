@@ -499,28 +499,26 @@ final class ProxyBridge {
 
         let metadata = extractMetadata(method: method, path: path, body: body)
 
-        // Qoder branch (ADR 0001): a request whose body `model:` starts with
-        // `qoder/` is intercepted here and routed direct to api3.qoder.sh,
-        // bypassing CPA entirely. The CPA path (createFallbackContext +
-        // forwardRequest below) is untouched. The branch is gated on the
-        // `qoderRouter` being wired (QuotaViewModel sets it at proxy start); a
-        // qoder/ request with no router falls through to CPA, which will 404
-        // — preferable to silently swallowing it.
+        // Qoder branch (ADR 0001, gated per ADR 0009 / issue #20): a request
+        // whose body `model:` starts with `qoder/` is intercepted here and
+        // routed direct to api3.qoder.sh, bypassing CPA entirely — but only
+        // for an allowlisted (method, path) combination. A qoder/ model on a
+        // non-allowlisted surface (e.g. /v1/completions, a GET) is `.rejected`
+        // with a Qoder-owned 404 (QoderOpenAIError → model_not_found); it does
+        // NOT fall through to CPA, which cannot correctly serve a qoder/ model
+        // (ADR 0009). The branch is still gated on `qoderRouter` being wired
+        // (QuotaViewModel sets it at proxy start); a qoder/ request with no
+        // router falls through to CPA, which will 404 — preferable to silently
+        // swallowing it (existing behavior preserved).
         //
-        // The router read happens inside the MainActor Task below (alongside
-        // the rest of the request setup) because `qoderRouter` is MainActor-
-        // isolated and `processRequest` is `nonisolated`.
-        let isQoderBound = metadata.model?.hasPrefix("qoder/") == true
-
-        // Issue #11: `/v1/responses` is the OpenAI Responses API. A qoder/ model
-        // on that endpoint routes to a separate Responses adapter
-        // (`QoderResponsesTranslator` input + `QoderResponsesAdapter` output),
-        // reusing the Chat gateway core. The body is synthesized into Chat
-        // Completions shape before reaching the router so COSY/failover/reparser
-        // are identical to the Chat path. Full ADR 0009 method/path enforcement
-        // (404 for qoder-bound requests on wrong paths) is separate foundation
-        // work; this branch only adds the responses routing decision.
-        let isResponsesEndpoint = method == "POST" && path == "/v1/responses"
+        // `QoderRouteGate.resolve` (issue #20, ADR 0009) is the single source
+        // of truth for the conjunctive allowlist (model prefix AND method AND
+        // path). It strips the query string before path comparison, so a
+        // `POST /v1/chat/completions?timeout=30` still matches. The router
+        // read happens inside the MainActor Task below (alongside the rest of
+        // the request setup) because `qoderRouter` is MainActor-isolated and
+        // `processRequest` is `nonisolated`.
+        let route = QoderRouteGate.resolve(method: method, path: path, model: metadata.model)
 
         // Check for virtual model and create fallback context
         Task { @MainActor [weak self] in
@@ -528,13 +526,29 @@ final class ProxyBridge {
 
             // Qoder branch: route to the failover router and return — the CPA
             // path (fallback + forwardRequest) does not run for qoder/ models.
-            if isQoderBound, let router = self.qoderRouter {
-                // Issue #11: Responses API path. Synthesize the Chat body here
-                // (pre-router) so the router/translator/COSY path is byte-
-                // identical to Chat. Parse errors become a 400 — the Responses
-                // body didn't carry model/input/etc. Non-responses qoder
-                // requests keep their body byte-identical (only the new flag +
-                // the synthesized body differ).
+            // `.notQoder` (no qoder/ prefix) skips this branch entirely; the
+            // `qoderRouter == nil` fall-through to CPA is preserved (see above).
+            if route != .notQoder, let router = self.qoderRouter {
+                // ADR 0009 / issue #20: qoder/ model on a non-allowlisted
+                // method/path is rejected with a Qoder-owned 404. The error
+                // flows through `QoderOpenAIError.body` (ADR 0010), which maps
+                // 404 → type `invalid_request_error`, code `model_not_found`.
+                guard route != .rejected else {
+                    self.sendError(
+                        to: connection,
+                        statusCode: 404,
+                        message: "Qoder models are only supported on POST /v1/chat/completions and POST /v1/responses."
+                    )
+                    return
+                }
+
+                // Issue #11: Responses API path (route == .responses).
+                // Synthesize the Chat body here (pre-router) so the
+                // router/translator/COSY path is byte-identical to Chat. Parse
+                // errors become a 400 — the Responses body didn't carry
+                // model/input/etc. Chat (route == .chat) requests keep their
+                // body byte-identical (only the synthesized body + the flag
+                // differ).
                 //
                 // Issue #15: the body reaches this branch as `Data` straight
                 // from the parser — no `Data(body.utf8)` round-trip here, no
@@ -542,7 +556,7 @@ final class ProxyBridge {
                 // Chat body is also `Data`.
                 let effectiveBody: Data
                 let responsesMode: Bool
-                if isResponsesEndpoint {
+                if route == .responses {
                     do {
                         effectiveBody = try QoderResponsesTranslator.synthesizeChatBody(from: body)
                         responsesMode = true
@@ -743,7 +757,21 @@ final class ProxyBridge {
     }
     
     // MARK: - Metadata Extraction
-    
+
+    /// Extract the `model` field from a JSON request body, if any. Shared by
+    /// `extractMetadata` (telemetry + routing) and — via its result — the
+    /// Qoder route gate (issue #20, ADR 0009). Content-type-agnostic by
+    /// construction: it takes only the body bytes and never reads headers, so
+    /// the gate sees the same model regardless of the client's declared
+    /// Content-Type. Pinned by `QoderRouteGateTests`
+    /// `.testContentTypeIsImmaterialToGateInput`.
+    nonisolated static func extractModel(from body: Data) -> String? {
+        guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
+            return nil
+        }
+        return json["model"] as? String
+    }
+
     private nonisolated func extractMetadata(method: String, path: String, body: Data) -> (provider: String?, model: String?, method: String, path: String) {
         // Detect provider from path
         var provider: String?
@@ -761,11 +789,8 @@ final class ProxyBridge {
 
         // Extract model from JSON body. Issue #15: body is `Data` (from the
         // parser); no `.data(using: .utf8)` round-trip.
-        var model: String?
-        if let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
-           let modelValue = json["model"] as? String {
-            model = modelValue
-
+        let model = Self.extractModel(from: body)
+        if let modelValue = model {
             // Infer provider from model name if not already detected
             if provider == nil {
                 if FallbackFormatConverter.isClaudeModel(modelValue) {
