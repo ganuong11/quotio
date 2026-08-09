@@ -274,4 +274,153 @@ final class QoderCompletionAggregatorTests: XCTestCase {
         XCTAssertEqual(json["model"] as? String, "qoder/auto")
         XCTAssertEqual(json["created"] as? Int, 99)
     }
+
+    // MARK: - Responses object (issue #26)
+
+    /// Fold a content stream into the non-streaming Responses object and pin
+    /// the full required shape: `id`, `object`, `created_at`, `status`,
+    /// `model`, `output` (one message item with an `output_text` part +
+    /// `annotations: []`), and the usage mapping to Responses vocabulary.
+    func testResponsesObjectBasicShape() throws {
+        var agg = QoderCompletionAggregator()
+        try agg.ingest(sseFrame(contentChunk("Hello ", id: "chatcmpl-1", created: 1700)))
+        try agg.ingest(sseFrame(contentChunk("world", id: "chatcmpl-1", created: 1700)))
+        try agg.ingest(sseFrame(finishChunk("stop")))
+        try agg.ingest(sseFrame(usageChunk([
+            "prompt_tokens": 11, "completion_tokens": 5, "total_tokens": 16,
+        ])))
+
+        let resp = agg.responsesObject(requestModel: "qoder/auto")
+
+        XCTAssertEqual(resp["id"] as? String, "chatcmpl-1")
+        XCTAssertEqual(resp["object"] as? String, "response")
+        XCTAssertEqual(resp["created_at"] as? Int, 1700)
+        XCTAssertEqual(resp["status"] as? String, "completed")
+        XCTAssertEqual(resp["model"] as? String, "qoder/auto")
+
+        let output = try XCTUnwrap(resp["output"] as? [[String: Any]])
+        XCTAssertEqual(output.count, 1)
+        let message = output[0]
+        XCTAssertEqual(message["id"] as? String, "msg_chatcmpl-1")
+        XCTAssertEqual(message["type"] as? String, "message")
+        XCTAssertEqual(message["status"] as? String, "completed")
+        XCTAssertEqual(message["role"] as? String, "assistant")
+        let content = try XCTUnwrap(message["content"] as? [[String: Any]])
+        XCTAssertEqual(content.count, 1)
+        XCTAssertEqual(content[0]["type"] as? String, "output_text")
+        XCTAssertEqual(content[0]["text"] as? String, "Hello world")
+        XCTAssertEqual((content[0]["annotations"] as? [Any])?.isEmpty, true)
+
+        // Usage mapped to Responses vocabulary (issue #26 acceptance):
+        // prompt_tokens→input_tokens, completion_tokens→output_tokens.
+        let usage = try XCTUnwrap(resp["usage"] as? [String: Any])
+        XCTAssertEqual(usage["input_tokens"] as? Int, 11)
+        XCTAssertEqual(usage["output_tokens"] as? Int, 5)
+        XCTAssertEqual(usage["total_tokens"] as? Int, 16)
+        XCTAssertNil(usage["prompt_tokens"])
+        XCTAssertNil(usage["completion_tokens"])
+    }
+
+    /// A pure tool-call stream (no content) has NO message item — matching the
+    /// streaming adapter's `response.completed` (message item only when content
+    /// streamed). Function_call ids start at `fc_0` when the message item is
+    /// absent.
+    func testResponsesObjectPureToolCallHasNoMessageItem() throws {
+        var agg = QoderCompletionAggregator()
+        let opener: [String: Any] = [
+            "id": "chatcmpl-t", "object": "chat.completion.chunk", "created": 1700, "model": "auto",
+            "choices": [["index": 0, "delta": ["tool_calls": [[
+                "index": 0, "id": "call_1", "type": "function",
+                "function": ["name": "get_weather", "arguments": "{\"loc\":\"SF\"}"],
+            ]]]]],
+        ]
+        try agg.ingest(sseFrame(opener))
+        try agg.ingest(sseFrame(finishChunk("tool_calls")))
+
+        let resp = agg.responsesObject(requestModel: "qoder/auto")
+        let output = try XCTUnwrap(resp["output"] as? [[String: Any]])
+        XCTAssertEqual(output.count, 1)
+        let item = output[0]
+        XCTAssertEqual(item["id"] as? String, "fc_0")
+        XCTAssertEqual(item["type"] as? String, "function_call")
+        XCTAssertEqual(item["status"] as? String, "completed")
+        XCTAssertEqual(item["call_id"] as? String, "call_1")
+        XCTAssertEqual(item["name"] as? String, "get_weather")
+        XCTAssertEqual(item["arguments"] as? String, "{\"loc\":\"SF\"}")
+    }
+
+    /// Content + tool calls: the message item precedes the function_call items
+    /// and the tool ids shift to the message-occupies-0 layout (`fc_1`,
+    /// `fc_2`, ...), matching the streaming adapter's `nextOutputIndexForTool`
+    /// allocation (base 1 once the message item exists).
+    func testResponsesObjectMessageThenToolCallIdsStartAtOne() throws {
+        var agg = QoderCompletionAggregator()
+        try agg.ingest(sseFrame(contentChunk("checking…", id: "chatcmpl-m")))
+        let a: [String: Any] = [
+            "id": "chatcmpl-m", "object": "chat.completion.chunk", "created": 1700, "model": "auto",
+            "choices": [["index": 0, "delta": ["tool_calls": [[
+                "index": 0, "id": "call_0", "type": "function",
+                "function": ["name": "a", "arguments": "1"],
+            ]]]]],
+        ]
+        let b: [String: Any] = [
+            "id": "chatcmpl-m", "object": "chat.completion.chunk", "created": 1700, "model": "auto",
+            "choices": [["index": 0, "delta": ["tool_calls": [[
+                "index": 1, "id": "call_1", "type": "function",
+                "function": ["name": "b", "arguments": "2"],
+            ]]]]],
+        ]
+        try agg.ingest(sseFrame(a))
+        try agg.ingest(sseFrame(b))
+        try agg.ingest(sseFrame(finishChunk("tool_calls")))
+
+        let resp = agg.responsesObject(requestModel: "qoder/auto")
+        let output = try XCTUnwrap(resp["output"] as? [[String: Any]])
+        XCTAssertEqual(output.count, 3)
+        XCTAssertEqual(output[0]["type"] as? String, "message")
+        XCTAssertEqual(output[1]["id"] as? String, "fc_1")
+        XCTAssertEqual(output[2]["id"] as? String, "fc_2")
+        // Ascending Chat-index order regardless of arrival order.
+        XCTAssertEqual(output[1]["name"] as? String, "a")
+        XCTAssertEqual(output[2]["name"] as? String, "b")
+    }
+
+    /// No usage chunk arrived → `usage` is JSON null (matching the streaming
+    /// adapter's `response.completed`, which emits null rather than omitting).
+    func testResponsesObjectNullUsageWhenAbsent() throws {
+        var agg = QoderCompletionAggregator()
+        try agg.ingest(sseFrame(contentChunk("hi")))
+        try agg.ingest(sseFrame(finishChunk("stop")))
+
+        let resp = agg.responsesObject(requestModel: "qoder/auto")
+        XCTAssertTrue(resp["usage"] is NSNull)
+    }
+
+    /// No id/created arrived from the stream → fallbacks (`resp_qoder`, now).
+    func testResponsesObjectFallbackIdAndCreatedAt() throws {
+        var agg = QoderCompletionAggregator()
+        // Feed a frame carrying no id/created keys at all.
+        let bare: [String: Any] = [
+            "object": "chat.completion.chunk",
+            "choices": [["index": 0, "delta": ["content": "x"]]],
+        ]
+        try agg.ingest(sseFrame(bare))
+        // Bare finish frame too — `finishChunk` carries id/created and would
+        // stamp them, defeating the fallback under test.
+        let bareFinish: [String: Any] = [
+            "object": "chat.completion.chunk",
+            "choices": [["index": 0, "finish_reason": "stop"]],
+        ]
+        try agg.ingest(sseFrame(bareFinish))
+
+        let resp = agg.responsesObject(requestModel: "qoder/auto")
+        XCTAssertEqual(resp["id"] as? String, "resp_qoder")
+        // `created_at` falls back to "now"; assert within 2s to avoid a
+        // second-boundary race between the fold and the assertion.
+        let createdAt = try XCTUnwrap(resp["created_at"] as? Int)
+        let now = Int(Date().timeIntervalSince1970.rounded(.down))
+        XCTAssertLessThanOrEqual(abs(createdAt - now), 2)
+        let message = try XCTUnwrap((resp["output"] as? [[String: Any]])?.first)
+        XCTAssertEqual(message["id"] as? String, "msg_resp_qoder")
+    }
 }

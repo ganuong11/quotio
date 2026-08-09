@@ -10,7 +10,9 @@
 //      stay byte-identical to the Chat path);
 //    - the streaming branch feeds the reparser's OpenAI-chunk output through
 //      `QoderResponsesAdapter` to emit Responses events;
-//    - the non-streaming branch returns a 501 placeholder (follow-up issue).
+//    - the non-streaming branch folds the aggregator output into a Responses
+//      `response` object (issue #26; the fold itself is pinned in
+//      QoderCompletionAggregatorTests).
 //
 //  `processRequest` / `forwardQoderRequest` are MainActor-isolated methods on
 //  the ProxyBridge `@Observable` tied to live `NWConnection`s, so the dispatch

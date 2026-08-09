@@ -1290,7 +1290,7 @@ final class ProxyBridge {
 
                 capturedUsageDict = reparser.capturedUsage
             } else {
-                // --- Non-streaming: aggregate SSE → one chat.completion JSON. ---
+                // --- Non-streaming: aggregate SSE → one JSON object. ---
                 // The head is written AFTER aggregation so Content-Length is
                 // exact (a non-streaming client expects a complete JSON body,
                 // not a chunked/trickled one). Pump the upstream through the
@@ -1300,24 +1300,12 @@ final class ProxyBridge {
                 // a `QoderCompletionAggregator`. Single parser of Qoder's
                 // envelope — no parallel state machine (issue #9 acceptance).
 
-                // Issue #11 Task B: non-streaming Responses shape is a follow-up
-                // (the `{id, object:"response", output:[...], usage}` object
-                // needs a fold from `QoderCompletionAggregator` output, similar
-                // to how Chat non-streaming was done in issue #9). Return an
-                // explicit 501 rather than silently returning a Chat-shaped
-                // object on a Responses endpoint — silent misrouting is worse
-                // than a clear error. Clients should retry with `stream:true`.
-                // The shared metadata recording below still runs (no `return`)
-                // so the request is counted; `httpStatus = nil` marks it as a
-                // non-2xx outcome so the recorder reports `statusCode: nil`.
-                if responsesMode {
-                    httpStatus = nil
-                    self.sendError(to: originalConnection, statusCode: 501,
-                        message: "Non-streaming Responses API is not yet supported; retry with stream:true.")
-                    originalConnection.send(content: nil, isComplete: true, completion: .contentProcessed { _ in
-                        originalConnection.cancel()
-                    })
-                } else {
+                // Issue #26: `/v1/responses` requests (`responsesMode`) share
+                // this aggregation path and branch only at emit time below —
+                // the Chat path folds into a `chat.completion` object
+                // (issue #9), the Responses path into a `response` object.
+                // The issue #11 Task B 501 placeholder is gone with this.
+                //
                 // Issue #19: non-streaming completions always carry `usage`
                 // (OpenAI includes it unconditionally in non-streaming
                 // responses — `stream_options` applies to streaming only).
@@ -1421,7 +1409,13 @@ final class ProxyBridge {
                         originalConnection.cancel()
                     })
                 } else {
-                    let json = aggregator.completionJSON(requestModel: requestModel)
+                    // Issue #26: emit-time branch. Chat folds into a
+                    // `chat.completion` object; Responses folds into a
+                    // `response` object. Same aggregated content/usage — only
+                    // the envelope differs.
+                    let json: [String: Any] = responsesMode
+                        ? aggregator.responsesObject(requestModel: requestModel)
+                        : aggregator.completionJSON(requestModel: requestModel)
                     capturedUsageDict = aggregator.capturedUsage ?? reparser.capturedUsage
                     let bodyBytes: Data
                     // Compact JSON — OpenAI returns non-streaming completions
@@ -1448,7 +1442,6 @@ final class ProxyBridge {
                     })
                     totalResponseBytes += bodyBytes.count
                 }
-                }   // closes `else` of `if responsesMode` (Issue #11)
             }
 
             // Record completion metadata, including captured usage for the

@@ -214,6 +214,80 @@ nonisolated struct QoderCompletionAggregator {
         return json
     }
 
+    /// Build the non-streaming OpenAI **Responses** object (issue #26):
+    /// `{id:"resp_...", object:"response", created_at, status:"completed",
+    /// model, output:[message item + function_call items],
+    /// usage:{input_tokens, output_tokens, total_tokens}}`.
+    ///
+    /// Analog of `completionJSON(requestModel:)` for the `/v1/responses`
+    /// endpoint: same aggregated content/tool-calls/usage, Responses envelope.
+    /// Shape conventions mirror the streaming adapter's `response.completed`
+    /// event (`QoderResponsesAdapter`):
+    ///   - message item only when content actually streamed (a pure tool-call
+    ///     response has no message item);
+    ///   - `output_text` part via `QoderResponsesAdapter.outputTextPart` (single
+    ///     source of truth for the part schema);
+    ///   - `msg_<id>` / `fc_<index>` item ids, same as the streaming items;
+    ///   - usage mapped `prompt_tokens`→`input_tokens` /
+    ///     `completion_tokens`→`output_tokens` via `QoderResponsesAdapter
+    ///     .mapUsage` (the same translation as the streaming surface), NSNull
+    ///     when none arrived (matching the streaming `response.completed`).
+    ///
+    /// `requestModel` echoes the model the agent requested (with the `qoder/`
+    /// prefix), as OpenAI echoes the request model on the response.
+    func responsesObject(requestModel: String) -> [String: Any] {
+        // The upstream chunk id (e.g. `chatcmpl-...`) rides the Response id
+        // slot — the streaming adapter stamps its `responseID` the same way
+        // (fallback `resp_qoder` when none arrived).
+        let id = responseID ?? "resp_qoder"
+
+        var output: [[String: Any]] = []
+        if !content.isEmpty {
+            output.append([
+                "id": "msg_\(id)",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [QoderResponsesAdapter.outputTextPart(text: content)],
+            ])
+        }
+        if !toolCalls.isEmpty {
+            // The message item holds output position 0 when content streamed;
+            // function_call ids encode their array position, matching the
+            // streaming adapter's `fc_<outputIndex>` allocation (base 1 when
+            // the message item is present, 0 for an all-tools response).
+            let base = content.isEmpty ? 0 : 1
+            for (position, idx) in toolCalls.keys.sorted().enumerated() {
+                let acc = toolCalls[idx]!
+                var item: [String: Any] = [
+                    "id": "fc_\(base + position)",
+                    "type": "function_call",
+                    "status": "completed",
+                    "arguments": acc.arguments,
+                ]
+                if !acc.id.isEmpty { item["call_id"] = acc.id }
+                if !acc.name.isEmpty { item["name"] = acc.name }
+                output.append(item)
+            }
+        }
+
+        var response: [String: Any] = [
+            "id": id,
+            "object": "response",
+            "created_at": createdStamp ?? Int(Date().timeIntervalSince1970.rounded(.down)),
+            "status": "completed",
+            "model": requestModel,
+            "output": output,
+            "completed_at": Int(Date().timeIntervalSince1970.rounded(.down)),
+        ]
+        if let capturedUsage {
+            response["usage"] = QoderResponsesAdapter.mapUsage(capturedUsage)
+        } else {
+            response["usage"] = NSNull()
+        }
+        return response
+    }
+
     // MARK: - Tool-call accumulator
 
     /// One tool-call index's accumulated state. Mirrors `QoderToolCallState`

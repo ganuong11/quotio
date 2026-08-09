@@ -23,9 +23,10 @@
 //  `QoderCompletionAggregator`'s declaration style so the adapter opts out of
 //  the project's MainActor default and is callable from any isolation domain.
 //
-//  Streaming-only for now (issue #11 Task A). The non-streaming Responses
-//  shape is a separate follow-up; for `stream:false` the synthesized Chat body
-//  still flows through the Chat path and Task B decides how to fold it.
+//  Streaming events are this adapter's primary surface; the non-streaming
+//  Responses object (issue #26) is folded by `QoderCompletionAggregator
+//  .responsesObject`, which reuses this type's shared builders
+//  (`outputTextPart`, `mapUsage`) so both surfaces keep one schema.
 //
 
 import Foundation
@@ -364,7 +365,7 @@ nonisolated struct QoderResponsesAdapter {
             "item_id": messageItemID,
             "output_index": 0,
             "content_index": 0,
-            "part": outputTextPart(text: ""),
+            "part": Self.outputTextPart(text: ""),
             "sequence_number": nextSequence(),
         ]))
         return out
@@ -439,7 +440,7 @@ nonisolated struct QoderResponsesAdapter {
             "item_id": messageItemID,
             "output_index": 0,
             "content_index": 0,
-            "part": outputTextPart(text: content),
+            "part": Self.outputTextPart(text: content),
             "sequence_number": nextSequence(),
         ])
     }
@@ -450,7 +451,7 @@ nonisolated struct QoderResponsesAdapter {
         emitEvent("response.output_item.done", payload: [
             "type": "response.output_item.done",
             "output_index": 0,
-            "item": messageItemShell(status: "completed", content: [outputTextPart(text: content)]),
+            "item": messageItemShell(status: "completed", content: [Self.outputTextPart(text: content)]),
             "sequence_number": nextSequence(),
         ])
     }
@@ -498,7 +499,7 @@ nonisolated struct QoderResponsesAdapter {
         response["output"] = output
         response["completed_at"] = Int(Date().timeIntervalSince1970.rounded(.down))
         if let capturedUsage {
-            response["usage"] = mapUsage(capturedUsage)
+            response["usage"] = Self.mapUsage(capturedUsage)
         } else {
             response["usage"] = NSNull()
         }
@@ -540,11 +541,15 @@ nonisolated struct QoderResponsesAdapter {
 
     /// The completed assistant message item, with content array populated.
     private func messageItemCompleted() -> [String: Any] {
-        messageItemShell(status: "completed", content: [outputTextPart(text: content)])
+        messageItemShell(status: "completed", content: [Self.outputTextPart(text: content)])
     }
 
     /// The `output_text` part shape: `{type:"output_text", text, annotations:[]}`.
-    private func outputTextPart(text: String) -> [String: Any] {
+    /// Static so the non-streaming fold (`QoderCompletionAggregator
+    /// .responsesObject`, issue #26) reuses the exact same shape without
+    /// duplicating the literal — single source of truth for the output_text
+    /// part schema across the streaming and non-streaming Responses surfaces.
+    static func outputTextPart(text: String) -> [String: Any] {
         [
             "type": "output_text",
             "text": text,
@@ -577,7 +582,9 @@ nonisolated struct QoderResponsesAdapter {
     ///   - `completion_tokens` → `output_tokens`
     ///   - `total_tokens` preserved
     /// Other fields (e.g. `cached_tokens`) are passed through unchanged.
-    private func mapUsage(_ usage: [String: Any]) -> [String: Any] {
+    /// Static so the non-streaming fold (issue #26) shares the exact same
+    /// translation as the streaming `response.completed` event.
+    static func mapUsage(_ usage: [String: Any]) -> [String: Any] {
         var out = usage
         if let prompt = usage["prompt_tokens"] as? Int {
             out["input_tokens"] = prompt
