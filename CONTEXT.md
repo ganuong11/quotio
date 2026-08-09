@@ -38,7 +38,11 @@ An in-process `NWListener` in Quotio that sits between CLI agents and CPA. Today
 _Avoid_: bridge, proxy (ambiguous with CPA)
 
 **Routing discriminator**:
-The rule ProxyBridge uses to decide whether a request is Qoder-bound (and therefore takes the COSY path) or CPA-bound. Determined by parsing the request body's `model:` field against a Qoder-owned namespace.
+The rule ProxyBridge uses to decide whether a request is Qoder-bound (and therefore takes the COSY path) or CPA-bound. A conjunctive allowlist: body `model:` starts with `qoder/` **and** method is `POST` **and** path is an explicitly supported endpoint (today: `/v1/chat/completions`; extensible as #451/#452 land). A `qoder/` model on anything else is rejected with a Qoder-owned 404 — it does not fall through to CPA. ADR 0003 (prefix) refined by ADR 0009 (method+path).
+
+**QoderAccessValidator**:
+The in-process API-key gate that owns authentication on the Qoder path, since CPA's `AuthMiddleware` is bypassed for `qoder/*` traffic. Mirrors CPA's `config_access` provider exactly — same five candidate sources (`Authorization` Bearer-or-bare, `X-Api-Key`, `X-Goog-Api-Key`, `?key=`, `?auth_token=`), same `401` failure shapes, same key set (a CPA-sourced snapshot reloaded on the `fetchAPIKeys()` cadence). ADR 0008.
+_Avoid_: auth middleware (that's CPA's), API key check (vague)
 
 ### Qoder-specific
 
@@ -59,3 +63,7 @@ A per-install UUID embedded in COSY headers (`Cosy-Machineid`, `Cosy-Machinetoke
 
 **WAF body encoding (`Encode=1`)**:
 An obfuscation wrapper applied to chat/model-list request bodies before signing. Required for the full model catalog and for chat requests; without it the gateway returns a reduced response.
+
+**Non-streaming aggregation (`QoderCompletionAggregator`)**:
+The Qoder gateway speaks SSE only, so for a `stream != true` Chat Completions request (missing `stream` or `stream: false` — OpenAI's spec default is `false`), Quotio keeps consuming the SSE upstream and folds the streamed deltas into a single `chat.completion` JSON object returned with `Content-Type: application/json`. The streaming `QoderSSEReparser` remains the single parser of the Qoder envelope; the aggregator consumes its OpenAI-shape output. See ADR 0014.
+_Avoid_: "non-streaming mode" implying an upstream change — the upstream is always SSE.

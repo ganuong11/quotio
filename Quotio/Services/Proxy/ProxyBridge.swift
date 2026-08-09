@@ -954,129 +954,277 @@ final class ProxyBridge {
                 return
             }
 
-            // Confirmed 2xx: write the SSE response head, then pump.
-            let responseHead = "HTTP/1.1 200 OK\r\n" +
-                "Content-Type: text/event-stream\r\n" +
-                "Cache-Control: no-cache\r\n" +
-                "Connection: close\r\n" +
-                "\r\n"
-            guard let headData = responseHead.data(using: .utf8) else {
-                originalConnection.cancel()
-                return
-            }
+            // Confirmed 2xx. Branch on the client's streaming intent (issue #9,
+            // ADR 0014): `stream:true` → SSE head + live chunks (historic path);
+            // missing/false `stream` → aggregate the SSE upstream into one
+            // `chat.completion` JSON. The Qoder gateway stream is SSE either way;
+            // only the client-facing shape differs. Both paths converge on the
+            // shared metadata recording below via these locals:
+            var capturedUsageDict: [String: Any]?
+            var totalResponseBytes = 0
+            var pumpFailed = false
+            var httpStatus: Int? = 200
 
-            // Send head, then begin streaming. Use a continuation-style send.
-            originalConnection.send(content: headData, completion: .contentProcessed { headError in
-                if headError != nil {
+            if opened.streamRequested {
+                // --- Streaming: write the SSE response head, then pump. ---
+                let responseHead = "HTTP/1.1 200 OK\r\n" +
+                    "Content-Type: text/event-stream\r\n" +
+                    "Cache-Control: no-cache\r\n" +
+                    "Connection: close\r\n" +
+                    "\r\n"
+                guard let headData = responseHead.data(using: .utf8) else {
                     originalConnection.cancel()
                     return
                 }
-            })
 
-            // Pump upstream bytes → reparser → OpenAI chunks → agent socket.
-            // The gateway client owns the byte-stream plumbing and calls our
-            // `onChunk` per buffer; we feed each buffer through the reparser
-            // and forward the OpenAI-shape bytes to the agent socket.
-            // `QoderSSEReparser` is a per-request `var` (not Sendable by
-            // design — never shared). Owned inside this Task.
-            var reparser = QoderSSEReparser()
-            var totalResponseBytes = 0
-            var pumpFailed = false
-
-            // The onChunk closure captures mutable state via a final-class
-            // holder (closures can't capture `inout` reparser). The holder is
-            // local to this Task, never shared across isolation domains.
-            final class ReparserBox: @unchecked Sendable {
-                var reparser: QoderSSEReparser
-                var totalBytes: Int = 0
-                var failed: Bool = false
-                init(_ reparser: QoderSSEReparser) { self.reparser = reparser }
-            }
-            let box = ReparserBox(reparser)
-            // Track the agent connection so the closure can send to it.
-            let agentConn = originalConnection
-
-            // Feed the router's pre-handoff peek prefix through the reparser
-            // first. The router consumed the leading chunk to detect an
-            // in-envelope quota signal; those bytes must still reach the agent,
-            // so we replay them before driving the remainder pump.
-            if !opened.bufferedPrefix.isEmpty {
-                box.totalBytes += opened.bufferedPrefix.count
-                let prefixChunks: Data
-                do {
-                    prefixChunks = try box.reparser.feed(opened.bufferedPrefix)
-                } catch {
-                    // The router already probed the prefix for a non-200
-                    // envelope; a gate trip here would be a second-order
-                    // condition (e.g. malformed line the router's focused
-                    // probe didn't trip on). Terminate the same way as a
-                    // mid-stream gate.
-                    box.failed = true
-                    Log.proxy("Qoder prefix gate tripped: \(error.localizedDescription)")
-                    prefixChunks = Data()
-                }
-                if !prefixChunks.isEmpty {
-                    try? await Self.sendToAgent(prefixChunks, on: agentConn)
-                }
-            }
-
-            do {
-                try await opened.pump { rawChunk in
-                    box.totalBytes += rawChunk.count
-                    let openAIChunks: Data
-                    do {
-                        openAIChunks = try box.reparser.feed(rawChunk)
-                    } catch {
-                        // Reparser gate (reasoning_content / tool_calls /
-                        // upstreamStatus). A mid-stream gate can't become a
-                        // true HTTP 400 — the 200 SSE head already shipped.
-                        // Terminate the agent stream; chunks already sent
-                        // stand. ADR 0004 documents this wire behavior.
-                        box.failed = true
-                        Log.proxy("Qoder stream gate tripped: \(error.localizedDescription)")
-                        return false  // stop pumping
+                // Send head, then begin streaming. Use a continuation-style send.
+                originalConnection.send(content: headData, completion: .contentProcessed { headError in
+                    if headError != nil {
+                        originalConnection.cancel()
+                        return
                     }
-                    if !openAIChunks.isEmpty {
+                })
+
+                // Pump upstream bytes → reparser → OpenAI chunks → agent socket.
+                // The gateway client owns the byte-stream plumbing and calls our
+                // `onChunk` per buffer; we feed each buffer through the reparser
+                // and forward the OpenAI-shape bytes to the agent socket.
+                // `QoderSSEReparser` is a per-request `var` (not Sendable by
+                // design — never shared). Owned inside this Task.
+                var reparser = QoderSSEReparser()
+
+                // The onChunk closure captures mutable state via a final-class
+                // holder (closures can't capture `inout` reparser). The holder is
+                // local to this Task, never shared across isolation domains.
+                final class ReparserBox: @unchecked Sendable {
+                    var reparser: QoderSSEReparser
+                    var totalBytes: Int = 0
+                    var failed: Bool = false
+                    init(_ reparser: QoderSSEReparser) { self.reparser = reparser }
+                }
+                let box = ReparserBox(reparser)
+                // Track the agent connection so the closure can send to it.
+                let agentConn = originalConnection
+
+                // Feed the router's pre-handoff peek prefix through the reparser
+                // first. The router consumed the leading chunk to detect an
+                // in-envelope quota signal; those bytes must still reach the agent,
+                // so we replay them before driving the remainder pump.
+                if !opened.bufferedPrefix.isEmpty {
+                    box.totalBytes += opened.bufferedPrefix.count
+                    let prefixChunks: Data
+                    do {
+                        prefixChunks = try box.reparser.feed(opened.bufferedPrefix)
+                    } catch {
+                        // The router already probed the prefix for a non-200
+                        // envelope; a gate trip here would be a second-order
+                        // condition (e.g. malformed line the router's focused
+                        // probe didn't trip on). Terminate the same way as a
+                        // mid-stream gate.
+                        box.failed = true
+                        Log.proxy("Qoder prefix gate tripped: \(error.localizedDescription)")
+                        prefixChunks = Data()
+                    }
+                    if !prefixChunks.isEmpty {
+                        try? await Self.sendToAgent(prefixChunks, on: agentConn)
+                    }
+                }
+
+                do {
+                    try await opened.pump { rawChunk in
+                        box.totalBytes += rawChunk.count
+                        let openAIChunks: Data
                         do {
-                            try await Self.sendToAgent(openAIChunks, on: agentConn)
+                            openAIChunks = try box.reparser.feed(rawChunk)
                         } catch {
-                            // Agent socket went away — stop pumping cleanly.
+                            // Reparser gate (reasoning_content / tool_calls /
+                            // upstreamStatus). A mid-stream gate can't become a
+                            // true HTTP 400 — the 200 SSE head already shipped.
+                            // Terminate the agent stream; chunks already sent
+                            // stand. ADR 0004 documents this wire behavior.
+                            box.failed = true
+                            Log.proxy("Qoder stream gate tripped: \(error.localizedDescription)")
+                            return false  // stop pumping
+                        }
+                        if !openAIChunks.isEmpty {
+                            do {
+                                try await Self.sendToAgent(openAIChunks, on: agentConn)
+                            } catch {
+                                // Agent socket went away — stop pumping cleanly.
+                                return false
+                            }
+                        }
+                        return true
+                    }
+                } catch {
+                    if !Task.isCancelled {
+                        Log.proxy("Qoder upstream stream ended: \(error.localizedDescription)")
+                    }
+                }
+
+                totalResponseBytes = box.totalBytes
+                pumpFailed = box.failed
+                reparser = box.reparser  // read back final state for usage capture
+
+                // Flush the reparser's terminal chunk ([DONE] + trailing usage).
+                if !pumpFailed {
+                    let terminal: Data
+                    do {
+                        terminal = try reparser.finish()
+                    } catch {
+                        terminal = Data()
+                    }
+                    if !terminal.isEmpty {
+                        try? await Self.sendToAgent(terminal, on: originalConnection)
+                    }
+                }
+
+                // Close the agent socket (Connection: close).
+                originalConnection.send(content: nil, isComplete: true, completion: .contentProcessed { _ in
+                    originalConnection.cancel()
+                })
+
+                capturedUsageDict = reparser.capturedUsage
+            } else {
+                // --- Non-streaming: aggregate SSE → one chat.completion JSON. ---
+                // The head is written AFTER aggregation so Content-Length is
+                // exact (a non-streaming client expects a complete JSON body,
+                // not a chunked/trickled one). Pump the upstream through the
+                // same `QoderSSEReparser` (so Qoder envelope parsing, the
+                // upstream-status gate, and tool-call/usage capture stay
+                // identical), then feed the reparser's OpenAI-shape chunks into
+                // a `QoderCompletionAggregator`. Single parser of Qoder's
+                // envelope — no parallel state machine (issue #9 acceptance).
+                var reparser = QoderSSEReparser()
+                var aggregator = QoderCompletionAggregator()
+                var aggregateFailed = false
+
+                // Same final-class holder pattern as the streaming path: the
+                // pump closure can't capture `inout` reparser/aggregator.
+                final class AggregateBox: @unchecked Sendable {
+                    var reparser: QoderSSEReparser
+                    var aggregator: QoderCompletionAggregator
+                    var totalBytes: Int = 0
+                    var failed: Bool = false
+                    init(_ r: QoderSSEReparser, _ a: QoderCompletionAggregator) {
+                        self.reparser = r; self.aggregator = a
+                    }
+                }
+                let box = AggregateBox(reparser, aggregator)
+
+                // Feed the pre-handoff peek prefix: reparser first (unchanged),
+                // then its OpenAI-shape output into the aggregator.
+                if !opened.bufferedPrefix.isEmpty {
+                    box.totalBytes += opened.bufferedPrefix.count
+                    let prefixChunks: Data
+                    do {
+                        prefixChunks = try box.reparser.feed(opened.bufferedPrefix)
+                    } catch {
+                        box.failed = true
+                        Log.proxy("Qoder (non-stream) prefix gate tripped: \(error.localizedDescription)")
+                        prefixChunks = Data()
+                    }
+                    if !prefixChunks.isEmpty {
+                        try? box.aggregator.ingest(prefixChunks)
+                    }
+                }
+
+                do {
+                    try await opened.pump { rawChunk in
+                        box.totalBytes += rawChunk.count
+                        let openAIChunks: Data
+                        do {
+                            openAIChunks = try box.reparser.feed(rawChunk)
+                        } catch {
+                            // Reparser gate. Unlike the streaming path, the
+                            // 200 head has NOT been written yet — so a gate
+                            // here can still surface as a true HTTP error
+                            // (handled below after the pump). Record failure
+                            // and stop pumping.
+                            box.failed = true
+                            Log.proxy("Qoder (non-stream) gate tripped: \(error.localizedDescription)")
                             return false
                         }
+                        if !openAIChunks.isEmpty {
+                            try? box.aggregator.ingest(openAIChunks)
+                        }
+                        return true
                     }
-                    return true
-                }
-            } catch {
-                if !Task.isCancelled {
-                    Log.proxy("Qoder upstream stream ended: \(error.localizedDescription)")
-                }
-            }
-
-            totalResponseBytes = box.totalBytes
-            pumpFailed = box.failed
-            reparser = box.reparser  // read back final state for usage capture
-
-            // Flush the reparser's terminal chunk ([DONE] + trailing usage).
-            if !pumpFailed {
-                let terminal: Data
-                do {
-                    terminal = try reparser.finish()
                 } catch {
-                    terminal = Data()
+                    if !Task.isCancelled {
+                        Log.proxy("Qoder (non-stream) upstream stream ended: \(error.localizedDescription)")
+                    }
+                    // A transport drop before the head was written → true error.
+                    aggregateFailed = true
                 }
-                if !terminal.isEmpty {
-                    try? await Self.sendToAgent(terminal, on: originalConnection)
+
+                totalResponseBytes = box.totalBytes
+                pumpFailed = box.failed || aggregateFailed
+                reparser = box.reparser
+                aggregator = box.aggregator
+
+                // Flush the reparser so any trailing usage / stashed finish
+                // reason reaches the aggregator (the reparser's `finish()`
+                // emits the usage-only chunk + [DONE]; the aggregator ignores
+                // [DONE] and folds the usage chunk).
+                if !pumpFailed {
+                    let terminal: Data
+                    do {
+                        terminal = try reparser.finish()
+                    } catch {
+                        terminal = Data()
+                    }
+                    if !terminal.isEmpty {
+                        try? aggregator.ingest(terminal)
+                    }
+                }
+
+                if pumpFailed {
+                    // No head written yet → emit a true HTTP 500 instead of a
+                    // truncated JSON body. This is the advantage the
+                    // non-streaming path has over streaming (where a mid-stream
+                    // gate can only truncate). ADR 0010 will centralize the
+                    // error envelope; until then the existing text/plain error
+                    // path is used.
+                    httpStatus = nil
+                    self.sendError(to: originalConnection, statusCode: 502, message: "Qoder upstream stream ended before completion.")
+                    originalConnection.send(content: nil, isComplete: true, completion: .contentProcessed { _ in
+                        originalConnection.cancel()
+                    })
+                } else {
+                    let json = aggregator.completionJSON(requestModel: requestModel)
+                    capturedUsageDict = aggregator.capturedUsage ?? reparser.capturedUsage
+                    let bodyBytes: Data
+                    // Compact JSON — OpenAI returns non-streaming completions
+                    // compact, not pretty-printed.
+                    if let compact = try? JSONSerialization.data(withJSONObject: json) {
+                        bodyBytes = compact
+                    } else {
+                        bodyBytes = Data("{\"error\":\"failed to serialize completion\"}".utf8)
+                    }
+                    let head = "HTTP/1.1 200 OK\r\n" +
+                        "Content-Type: application/json\r\n" +
+                        "Content-Length: \(bodyBytes.count)\r\n" +
+                        "Cache-Control: no-cache\r\n" +
+                        "Connection: close\r\n" +
+                        "\r\n"
+                    let headBytes = Data(head.utf8)
+                    // Head then body, awaiting each send so order is preserved
+                    // (NWConnection does not guarantee ordering across
+                    // overlapping sends).
+                    try? await Self.sendToAgent(headBytes, on: originalConnection)
+                    try? await Self.sendToAgent(bodyBytes, on: originalConnection)
+                    originalConnection.send(content: nil, isComplete: true, completion: .contentProcessed { _ in
+                        originalConnection.cancel()
+                    })
+                    totalResponseBytes += bodyBytes.count
                 }
             }
-
-            // Close the agent socket (Connection: close).
-            originalConnection.send(content: nil, isComplete: true, completion: .contentProcessed { _ in
-                originalConnection.cancel()
-            })
 
             // Record completion metadata, including captured usage for the
-            // Quotio-side usage accumulator (ADR 0005 §2).
-            let usage = reparser.capturedUsage
+            // Quotio-side usage accumulator (ADR 0005 §2). Shared across the
+            // streaming and non-streaming branches.
+            let usage = capturedUsageDict
             let inputTokens = (usage?["prompt_tokens"] as? Int)
                 ?? (usage?["prompt_tokens"] as? NSNumber)?.intValue
             let outputTokens = (usage?["completion_tokens"] as? Int)
@@ -1099,7 +1247,7 @@ final class ProxyBridge {
                 model: requestModel,
                 resolvedModel: requestModel,
                 resolvedProvider: "qoder",
-                statusCode: pumpFailed ? nil : 200,
+                statusCode: pumpFailed ? nil : httpStatus,
                 durationMs: durationMs,
                 requestSize: requestSize,
                 responseSize: totalResponseBytes,

@@ -329,29 +329,53 @@ final class QoderFailoverRouterTests: XCTestCase {
         }
     }
 
-    func testRejectsStreamFalseBody() async throws {
+    // MARK: - Stream intent (issue #9, ADR 0014)
+
+    /// `QoderOpenedStream.streamRequested` must reflect the client's `stream`
+    /// field per the OpenAI spec default: missing or `false` → non-streaming,
+    /// only explicit `true` → streaming. None of these are rejected; the
+    /// gateway stream opens normally and ProxyBridge branches on the flag.
+    func testCarriesStreamIntent() async throws {
+        // Three cases in one test: each opens a fresh stream with a different
+        // `stream` field shape. Inlined (not a helper closure) so this test's
+        // `self` helper calls stay synchronous under Swift 6 sending checks.
         let vault = InMemoryCredentialStore()
         let account = makeAccount(key: "user@example.com")
         await vault.seed(account, makeCredential(accountID: account.id))
-        let router = makeRouter(
-            vault: vault,
-            pat: MockPATRefresher(),
-            gateway: MockGatewayClient(),
-            metadata: makeMetadataStore()
-        )
-        let json: [String: Any] = [
+
+        // Case 1: explicit `stream: true` → streaming.
+        let gwTrue = MockGatewayClient()
+        await gwTrue.seed(.init(status: 200, body: Data("data: [DONE]\n\n".utf8)))
+        let routerTrue = makeRouter(vault: vault, pat: MockPATRefresher(), gateway: gwTrue, metadata: makeMetadataStore())
+        let bodyTrue = try JSONSerialization.data(withJSONObject: [
+            "model": "qoder/auto", "stream": true,
+            "messages": [["role": "user", "content": "hi"]],
+        ])
+        let openedTrue = try await routerTrue.openStream(requestBody: bodyTrue, proxyAPIKey: "key")
+        XCTAssertTrue(openedTrue.streamRequested, "stream:true must be streaming")
+
+        // Case 2: explicit `stream: false` → non-streaming (previously rejected; issue #9).
+        let gwFalse = MockGatewayClient()
+        await gwFalse.seed(.init(status: 200, body: Data("data: [DONE]\n\n".utf8)))
+        let routerFalse = makeRouter(vault: vault, pat: MockPATRefresher(), gateway: gwFalse, metadata: makeMetadataStore())
+        let bodyFalse = try JSONSerialization.data(withJSONObject: [
             "model": "qoder/auto", "stream": false,
             "messages": [["role": "user", "content": "hi"]],
-        ]
-        let body = try JSONSerialization.data(withJSONObject: json)
-        do {
-            _ = try await router.openStream(requestBody: body, proxyAPIKey: "key")
-            XCTFail("expected requestRejected")
-        } catch let error as QoderFailoverError {
-            if case .requestRejected = error {} else {
-                XCTFail("expected requestRejected, got \(error)")
-            }
-        }
+        ])
+        let openedFalse = try await routerFalse.openStream(requestBody: bodyFalse, proxyAPIKey: "key")
+        XCTAssertFalse(openedFalse.streamRequested, "stream:false must be non-streaming")
+
+        // Case 3: missing `stream` → non-streaming (OpenAI spec default is
+        // `false`; previously mis-defaulted to streaming).
+        let gwMissing = MockGatewayClient()
+        await gwMissing.seed(.init(status: 200, body: Data("data: [DONE]\n\n".utf8)))
+        let routerMissing = makeRouter(vault: vault, pat: MockPATRefresher(), gateway: gwMissing, metadata: makeMetadataStore())
+        let bodyMissing = try JSONSerialization.data(withJSONObject: [
+            "model": "qoder/auto",
+            "messages": [["role": "user", "content": "hi"]],
+        ])
+        let openedMissing = try await routerMissing.openStream(requestBody: bodyMissing, proxyAPIKey: "key")
+        XCTAssertFalse(openedMissing.streamRequested, "missing stream must be non-streaming (OpenAI default)")
     }
 
     // MARK: - Happy path: first account, first attempt

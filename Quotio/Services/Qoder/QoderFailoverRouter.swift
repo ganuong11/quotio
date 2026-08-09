@@ -52,6 +52,18 @@ nonisolated struct QoderOpenedStream: Sendable {
     let pump: @Sendable (QoderChunkReceiver) async throws -> Void
     let accountID: String
     let translatorResult: QoderTranslationResult
+    /// Whether the client asked for a streaming response. True only when the
+    /// request body carried `"stream": true`; a missing `stream` field and an
+    /// explicit `false` both yield `false` (OpenAI's spec default is `false`,
+    /// https://github.com/openai/openai-openapi/blob/c309ca1/openapi.yaml#L32968-L32977).
+    /// ProxyBridge branches on this: streaming writes the SSE head + chunks
+    /// live; non-streaming aggregates the SSE upstream into one
+    /// `chat.completion` JSON via `QoderCompletionAggregator` (issue #9,
+    /// ADR 0014). The Qoder gateway stream is SSE either way — the upstream
+    /// request always carries `"stream": true` (translator, line ~688); this
+    /// flag controls only the *client-facing* shape. No default: every
+    /// construction site sets it explicitly from the parsed request body.
+    let streamRequested: Bool
 }
 
 /// Errors surfaced to ProxyBridge. ProxyBridge maps each to its wire
@@ -60,7 +72,9 @@ nonisolated struct QoderOpenedStream: Sendable {
 /// the router, not in error messages.
 nonisolated enum QoderFailoverError: Error, LocalizedError {
     /// The request body was rejected by the translator's fail-fast gate
-    /// (tools / images / malformed / `stream: false`). Maps to HTTP 400.
+    /// (tools / images / malformed body). Maps to HTTP 400. (`stream: false`
+    /// is no longer rejected — non-streaming is served by aggregation, issue
+    /// #9 / ADR 0014.)
     case requestRejected(String)
     /// No Qoder accounts are configured, or all are disabled / cooled down.
     /// Maps to HTTP 503 (no upstream available).
@@ -189,14 +203,13 @@ actor QoderFailoverRouter {
             modelID = rawModel
             bodyForTranslator = requestBody
         }
-        // Reject `stream: false` up front — the gateway stream is SSE-only in
-        // Phase 2a, and the SSEReparser assumes a stream. Phase 2b does not
-        // lift this.
-        if QoderFailoverRouter.isNonStreaming(body: requestBody) {
-            throw QoderFailoverError.requestRejected(
-                "Qoder: stream:false is not supported (Phase 2a is SSE-only)."
-            )
-        }
+        // Parse the client's streaming intent once. OpenAI's spec defaults
+        // `stream` to `false`; both missing and explicit `false` are
+        // non-streaming. The gateway stream is SSE either way (the translator
+        // hardcodes `"stream": true` upstream); this flag controls only the
+        // client-facing shape, branched on by ProxyBridge (issue #9, ADR 0014).
+        let clientWantsStream = QoderFailoverRouter.streamRequested(in: requestBody)
+
         let modelConfig = QoderModelRegistry.resolve(modelID)
 
         // Enumerate enabled, non-cooled-down Qoder accounts in priority order.
@@ -227,7 +240,8 @@ actor QoderFailoverRouter {
                     requestBody: bodyForTranslator,
                     proxyAPIKey: proxyAPIKey,
                     modelID: modelID,
-                    modelConfig: modelConfig
+                    modelConfig: modelConfig,
+                    streamRequested: clientWantsStream
                 )
                 return stream
             } catch let failure as QoderAccountFailure {
@@ -248,7 +262,8 @@ actor QoderFailoverRouter {
                                 requestBody: bodyForTranslator,
                                 proxyAPIKey: proxyAPIKey,
                                 modelID: modelID,
-                                modelConfig: modelConfig
+                                modelConfig: modelConfig,
+                                streamRequested: clientWantsStream
                             )
                             return stream
                         } catch let failure2 as QoderAccountFailure {
@@ -287,7 +302,8 @@ actor QoderFailoverRouter {
                             requestBody: bodyForTranslator,
                             proxyAPIKey: proxyAPIKey,
                             modelID: modelID,
-                            modelConfig: modelConfig
+                            modelConfig: modelConfig,
+                            streamRequested: clientWantsStream
                         )
                         return stream
                     } catch {
@@ -315,7 +331,8 @@ actor QoderFailoverRouter {
         requestBody: Data,
         proxyAPIKey: String,
         modelID: String,
-        modelConfig: QoderModelConfig
+        modelConfig: QoderModelConfig,
+        streamRequested: Bool
     ) async throws -> QoderOpenedStream {
         let userID = credential.accountID ?? ""
         guard !userID.isEmpty else {
@@ -375,7 +392,8 @@ actor QoderFailoverRouter {
             return try await confirmStreamAndHandOff(
                 stream: stream,
                 account: account,
-                translatorResult: translatorResult
+                translatorResult: translatorResult,
+                streamRequested: streamRequested
             )
         }
 
@@ -431,7 +449,8 @@ actor QoderFailoverRouter {
     private func confirmStreamAndHandOff(
         stream: QoderGatewayStream,
         account: MonitorAccount,
-        translatorResult: QoderTranslationResult
+        translatorResult: QoderTranslationResult,
+        streamRequested: Bool
     ) async throws -> QoderOpenedStream {
         let firstChunk: Data?
         do {
@@ -523,7 +542,8 @@ actor QoderFailoverRouter {
             bufferedPrefix: prefix,
             pump: { onChunk in try await streamRef.pump(onChunk) },
             accountID: account.id,
-            translatorResult: translatorResult
+            translatorResult: translatorResult,
+            streamRequested: streamRequested
         )
     }
 
@@ -713,15 +733,20 @@ actor QoderFailoverRouter {
         return rewritten
     }
 
-    /// Whether the request asked for a non-streaming response. Phase 2a is
-    /// SSE-only (the SSEReparser assumes a stream); reject `stream: false`
-    /// (or absent stream with explicit `false`) up front. A missing `stream`
-    /// field defaults to streaming (matches OpenAI's server default).
-    private nonisolated static func isNonStreaming(body: Data) -> Bool {
+    /// Whether the client asked for a streaming response. True only when the
+    /// request body carries `"stream": true`. A missing `stream` field and an
+    /// explicit `false` both yield `false` — OpenAI's Chat Completions schema
+    /// defaults `stream` to `false`
+    /// (https://github.com/openai/openai-openapi/blob/c309ca1/openapi.yaml#L32968-L32977).
+    /// This corrects the prior behavior, which treated a missing field as
+    /// streaming (the opposite of the spec default). Non-streaming requests
+    /// are now served by aggregating the SSE upstream into one
+    /// `chat.completion` JSON (issue #9, ADR 0014); they are NOT rejected.
+    private nonisolated static func streamRequested(in body: Data) -> Bool {
         guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
               let stream = json["stream"] as? Bool else {
             return false
         }
-        return stream == false
+        return stream
     }
 }
