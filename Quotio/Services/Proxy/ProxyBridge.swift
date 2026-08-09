@@ -126,6 +126,18 @@ final class ProxyBridge {
     
     /// Statistics: active connections count
     private(set) var activeConnections: Int = 0
+
+    /// ADR 0012: pump Task handles for in-flight Qoder streams, keyed by the
+    /// agent connection's `connectionId`. Stored on the MainActor so the agent
+    /// connection's `stateUpdateHandler` can cancel the pump promptly on
+    /// `.cancelled` / `.failed` (agent disconnect) without waiting for the next
+    /// `sendToAgent` to fail on a slow upstream. Insertion happens immediately
+    /// after `Task { ... }` creation in `forwardQoderRequest`, before its
+    /// `for await` begins; removal happens on every exit path (success, error,
+    /// cancellation) via the task body's MainActor-hopped cleanup. A missing
+    /// entry is a no-op for cancel (e.g. Qoder disabled, or the request was
+    /// pre-stream rejected before any pump Task was created).
+    private(set) var pumpTasks: [Int: Task<Void, Never>] = [:]
     
     /// Maximum concurrent connections to prevent resource exhaustion
     private let maxActiveConnections = 100
@@ -336,10 +348,18 @@ final class ProxyBridge {
             if case .cancelled = state {
                 Task { @MainActor in
                     weakSelf.activeConnections -= 1
+                    // ADR 0012: agent socket went away — cancel the in-flight
+                    // Qoder pump so the upstream URLSession tears down promptly
+                    // instead of draining until the next sendToAgent happens to
+                    // fail. NWConnection allows only one stateUpdateHandler, so
+                    // the disconnect-driven cancel is folded in here alongside
+                    // the active-connections accounting.
+                    weakSelf.cancelPumpTask(for: connectionId)
                 }
             } else if case .failed = state {
                 Task { @MainActor in
                     weakSelf.activeConnections -= 1
+                    weakSelf.cancelPumpTask(for: connectionId)
                 }
             }
         }
@@ -898,6 +918,20 @@ final class ProxyBridge {
 
     // MARK: - Qoder Branch (ADR 0001)
 
+    /// ADR 0012: cancel and remove the pump Task stored for `connectionId`.
+    /// Called from the agent connection's `stateUpdateHandler` on `.cancelled`
+    /// / `.failed` (agent disconnect). Remove-then-cancel: pop the handle first
+    /// so the body's own `defer { removeValue }` (which races this call on the
+    /// same MainActor) finds nothing to remove — both paths are idempotent and
+    /// a second cancel is a no-op on a completed Task. Missing entry is a
+    /// no-op (Qoder disabled, pre-stream rejection, or already cleaned up).
+    /// MainActor-isolated: matches `pumpTasks`'s isolation, and the handler
+    /// hops to MainActor before calling this.
+    private func cancelPumpTask(for connectionId: Int) {
+        guard let task = pumpTasks.removeValue(forKey: connectionId) else { return }
+        task.cancel()
+    }
+
     /// Forward a `qoder/<id>` request through the failover router, bypassing
     /// CPA. Mirrors the shape of `forwardRequest` (CPA path) but the upstream
     /// is the router's HTTPS stream to api3.qoder.sh, not an NWConnection to
@@ -916,9 +950,16 @@ final class ProxyBridge {
     ///   4. Mid-stream failure (transport drop, reparser gate): terminate —
     ///      never rotate (the 200 SSE response already began; ADR 0006 §2).
     ///
-    /// Cancellation: the pump Task is captured and cancelled from the agent
-    /// connection's stateUpdateHandler on disconnect, so a dropped agent
-    /// socket doesn't leak the URLSession byte stream.
+    /// Cancellation (ADR 0012): the pump runs in an unstructured `Task` whose
+    /// handle is stored in `pumpTasks[connectionId]` immediately after creation.
+    /// The agent connection's single `stateUpdateHandler` (set in
+    /// `handleNewConnection`) cancels that handle on `.cancelled` / `.failed`,
+    /// which cooperatively unblocks the pump's awaiting `source()` pull (via
+    /// `Task.checkCancellation()` inside `QoderGatewayStream.pump`) and the
+    /// stream's `cancel()` tears down the upstream URLSession task. So a dropped
+    /// agent socket no longer leaks the upstream byte stream until the next
+    /// `sendToAgent` happens to fail. The handle is removed from `pumpTasks` on
+    /// every exit path of the pump body (success, error, cancellation).
     private func forwardQoderRequest(
         router: QoderFailoverRouter,
         method: String,
@@ -950,17 +991,29 @@ final class ProxyBridge {
         // prefix *detection* (to decide routing), not stripping.
         let bodyData = body
 
-        // The pump runs in a detached-from-actor Task so the `for await` on
-        // the upstream byte stream doesn't block the MainActor. Cancellation:
-        // when the proxy stops or the agent socket is cancelled, the active-
-        // counter handler in `handleNewConnection` runs `connection.cancel()`;
-        // our pump's next `sendToAgent` then fails, the `try` propagates, and
-        // `Task.checkCancellation()` breaks the byte iterator (URLSession
-        // tears its stream down when the iterator is dropped). No explicit
-        // stateUpdateHandler wiring needed here — NWConnection allows only one
-        // handler, already set in `handleNewConnection`.
-        Task { [weak self] in
+        // ADR 0012: the pump runs in an unstructured Task so the `for await`
+        // on the upstream byte stream doesn't block the MainActor. The handle
+        // is stored in `pumpTasks[connectionId]` BEFORE the body's `for await`
+        // begins, so the agent connection's stateUpdateHandler can cancel it
+        // promptly on `.cancelled` / `.failed` (agent disconnect). Removal
+        // happens on every exit path via the cleanup hop at the end of the
+        // body (and via `cancelPumpTask`'s remove-then-cancel, which races the
+        // body safely — both paths idempotently remove the same key). The
+        // pump's cooperative-cancellation throw and the stream's `cancel()`
+        // (called from `QoderGatewayStream.pump`'s defer on every exit) tear
+        // down the upstream URLSession task together.
+        let pumpTask = Task { [weak self] in
             guard let self = self else { return }
+
+            // ADR 0012: remove the handle on EVERY exit path (success, error,
+            // early return, cancellation). The Task body is MainActor-isolated
+            // (unstructured `Task {}` inherits `forwardQoderRequest`'s
+            // `@MainActor` isolation), so this is a synchronous MainActor
+            // mutation — no hop needed. `cancelPumpTask(for:)` (called from the
+            // stateUpdateHandler on disconnect) removes-then-cancels; if it ran
+            // first this removeValue is a no-op, and vice-versa — both paths
+            // idempotently clear the same key.
+            defer { self.pumpTasks.removeValue(forKey: connectionId) }
 
             let opened: QoderOpenedStream
             do {
@@ -1439,6 +1492,14 @@ final class ProxyBridge {
             )
             self.onRequestCompleted?(finalMetadata)
         }
+
+        // ADR 0012: store the pump handle BEFORE its body's `for await` can
+        // begin. This synchronous MainActor assignment runs before
+        // `forwardQoderRequest` returns, so the agent connection's
+        // stateUpdateHandler (which may fire `.cancelled` / `.failed` on a
+        // fast disconnect) is guaranteed to find the handle in `pumpTasks`
+        // from this point onward. The body's `defer` removes it on every exit.
+        pumpTasks[connectionId] = pumpTask
     }
 
     /// Issue #19: parse `stream_options.include_usage` from a Chat Completions
