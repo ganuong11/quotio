@@ -237,10 +237,43 @@ final class QoderChatTranslatorTests: XCTestCase {
         XCTAssertEqual(out[0].role, "tool")
     }
 
-    /// Unknown roles are skipped (pi parity).
-    func testTransformSkipsUnknownRole() {
+    /// The OpenAI `developer` role folds into Qoder's `system` semantics —
+    /// it's the newer instruction role that replaces `system` for newer models.
+    /// Content is preserved; only the role is normalized.
+    func testTransformMapsDeveloperToSystem() {
         let msgs = [
             OpenAIChatMessage(role: "developer", content: .text("x"), toolCalls: nil, toolCallID: nil),
+        ]
+        let out = QoderChatTranslator.transformMessagesForQoder(msgs)
+        XCTAssertEqual(out.count, 1)
+        XCTAssertEqual(out[0].role, "system")
+        XCTAssertEqual(out[0].content, .text("x"))
+    }
+
+    /// Relative order among `system`/`developer`/`user` is preserved, with
+    /// `developer` normalized to `system`: the sequence system, developer, user
+    /// becomes system, system, user.
+    func testTransformPreservesInstructionOrder() {
+        let msgs = [
+            OpenAIChatMessage(role: "system", content: .text("s"), toolCalls: nil, toolCallID: nil),
+            OpenAIChatMessage(role: "developer", content: .text("d"), toolCalls: nil, toolCallID: nil),
+            OpenAIChatMessage(role: "user", content: .text("u"), toolCalls: nil, toolCallID: nil),
+        ]
+        let out = QoderChatTranslator.transformMessagesForQoder(msgs)
+        XCTAssertEqual(out.count, 3)
+        XCTAssertEqual(out[0].role, "system")
+        XCTAssertEqual(out[0].content, .text("s"))
+        XCTAssertEqual(out[1].role, "system")
+        XCTAssertEqual(out[1].content, .text("d"))
+        XCTAssertEqual(out[2].role, "user")
+        XCTAssertEqual(out[2].content, .text("u"))
+    }
+
+    /// Unknown roles are skipped (pi parity). `developer` is no longer unknown
+    /// — it folds into `system` — so a genuinely-unknown role exercises this path.
+    func testTransformSkipsUnknownRole() {
+        let msgs = [
+            OpenAIChatMessage(role: "moderator", content: .text("x"), toolCalls: nil, toolCallID: nil),
             OpenAIChatMessage(role: "user", content: .text("y"), toolCalls: nil, toolCallID: nil),
         ]
         let out = QoderChatTranslator.transformMessagesForQoder(msgs)

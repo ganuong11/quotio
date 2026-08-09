@@ -528,6 +528,9 @@ nonisolated enum QoderChatTranslator {
     ///     input carries system as a message, so we add a branch that passes it
     ///     through — Qoder honors role:system messages (the top-level `system:`
     ///     field is what the server ignores, confirmed in stream.ts).
+    ///   - The OpenAI `developer` role (the newer instruction role that replaces
+    ///     `system` for newer models) folds into the same branch and is emitted
+    ///     as role:system, preserving relative order among instruction messages.
     ///   - pi maps image content to `image_url` data-URL parts from an internal
     ///     base64 byte model; OpenAI input already carries a ready `image_url`
     ///     URL (often a `data:` URL), so Phase 2b passes the URL string through
@@ -537,9 +540,9 @@ nonisolated enum QoderChatTranslator {
         out.reserveCapacity(messages.count)
         for msg in messages {
             switch msg.role {
-            case "system":
+            case "system", "developer":
                 out.append(QoderMessage(
-                    role: msg.role,
+                    role: "system",
                     content: contentText(msg.content).map { .text($0) },
                     toolCalls: [],
                     toolCallID: nil
