@@ -155,9 +155,11 @@ final class QoderSSEReparserTests: XCTestCase {
 
     /// Usage from the final chunk is emitted as a trailing usage-only chunk
     /// (OpenAI's `stream_options.include_usage` convention), passed through
-    /// verbatim — no cached_tokens subtraction.
+    /// verbatim — no cached_tokens subtraction. Issue #19: the trailing
+    /// usage chunk is gated on `include_usage`; this test pins the opt-in
+    /// path by constructing the reparser with `includeUsage: true`.
     func testUsagePassedThroughVerbatim() throws {
-        var reparser = QoderSSEReparser()
+        var reparser = QoderSSEReparser(includeUsage: true)
         let usage: [String: Any] = [
             "prompt_tokens": 100,
             "completion_tokens": 50,
@@ -857,8 +859,10 @@ final class QoderSSEReparserTests: XCTestCase {
     /// ADR 0011 §3: the trailing usage chunk is built by a dedicated
     /// `buildUsageChunk` and carries `choices: []` (empty array), matching
     /// OpenAI's `stream_options.include_usage` spec. NOT `choices:[{index:0}]`.
+    /// Issue #19: opt into the trailing usage chunk via `includeUsage: true`
+    /// (the default is now false per the OpenAI streaming contract).
     func testUsageChunkHasEmptyChoices() throws {
-        var reparser = QoderSSEReparser()
+        var reparser = QoderSSEReparser(includeUsage: true)
         let line = qoderLine([
             "id": "x", "model": "m",
             "choices": [["delta": [:], "finish_reason": "stop"]],
@@ -955,5 +959,156 @@ final class QoderSSEReparserTests: XCTestCase {
             (($0["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["role"] as? String == "assistant"
         }
         XCTAssertEqual(openers.count, 0, "finish-only stream must not synthesize a role opener (ADR 0011 §4 edge case)")
+    }
+
+    // MARK: - Issue #19: stream_options.include_usage gating
+
+    /// Issue #19: when the reparser is constructed WITHOUT `includeUsage`
+    /// (the default — mirrors a client that did not send
+    /// `stream_options.include_usage: true`), the trailing usage chunk is
+    /// SUPPRESSED even though the upstream carried usage. The OpenAI
+    /// streaming contract emits the trailing usage-only chunk ONLY when the
+    /// client opted in; Quotio today emits it unconditionally (the bug).
+    func testUsageChunkSuppressedWhenIncludeUsageFalse() throws {
+        // Default init → includeUsage == false.
+        var reparser = QoderSSEReparser()
+        let line = qoderLine([
+            "id": "x", "model": "m",
+            "choices": [["delta": [:], "finish_reason": "stop"]],
+            "usage": ["prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15] as [String: Any],
+        ])
+        var out = try reparser.feed(Data(line.utf8))
+        out.append(try reparser.finish())
+        let chunks = openAIChunks(out)
+        // No chunk should carry a top-level `usage` field — the trailing
+        // usage-only chunk is gated off. The finish chunk (and any content)
+        // still emit; only the usage chunk is suppressed.
+        let usageChunks = chunks.filter { ($0["usage"] as? [String: Any]) != nil }
+        XCTAssertEqual(usageChunks.count, 0, "includeUsage=false must suppress the trailing usage chunk (issue #19)")
+    }
+
+    /// Issue #19: when the reparser is constructed WITH `includeUsage: true`
+    /// (mirrors a client that sent `stream_options.include_usage: true`), the
+    /// trailing usage chunk is emitted as before. Pin the opt-in path.
+    func testUsageChunkEmittedWhenIncludeUsageTrue() throws {
+        var reparser = QoderSSEReparser(includeUsage: true)
+        let line = qoderLine([
+            "id": "x", "model": "m",
+            "choices": [["delta": [:], "finish_reason": "stop"]],
+            "usage": ["prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15] as [String: Any],
+        ])
+        var out = try reparser.feed(Data(line.utf8))
+        out.append(try reparser.finish())
+        let chunks = openAIChunks(out)
+        let usageChunks = chunks.filter { ($0["usage"] as? [String: Any]) != nil }
+        XCTAssertEqual(usageChunks.count, 1, "includeUsage=true must emit exactly one trailing usage chunk")
+        // Built via buildUsageChunk → choices: [].
+        let choices = try XCTUnwrap(usageChunks[0]["choices"] as? [Any])
+        XCTAssertEqual(choices.count, 0, "usage chunk must carry choices: [] (ADR 0011 §3)")
+    }
+
+    /// Issue #19 acceptance: the internal `capturedUsage` MUST stay populated
+    /// when `includeUsage == false`. Quotio's own ADR 0005 §2 token accounting
+    /// reads `capturedUsage` independently of whether the client-facing chunk
+    /// was emitted — the whole point of the gate is to stop leaking token
+    /// counts to a client that opted out without breaking internal capture.
+    func testCapturedUsagePopulatedEvenWhenChunkSuppressed() throws {
+        var reparser = QoderSSEReparser()   // includeUsage == false
+        let line = qoderLine([
+            "id": "x", "model": "m",
+            "choices": [["delta": [:], "finish_reason": "stop"]],
+            "usage": ["prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150] as [String: Any],
+        ])
+        _ = try reparser.feed(Data(line.utf8))
+        _ = try reparser.finish()
+        // Internal capture UNCHANGED — the stash is read independently of the
+        // client-facing emission gate.
+        let captured = try XCTUnwrap(reparser.capturedUsage)
+        XCTAssertEqual(captured["prompt_tokens"] as? Int, 100)
+        XCTAssertEqual(captured["completion_tokens"] as? Int, 50)
+        XCTAssertEqual(captured["total_tokens"] as? Int, 150)
+    }
+
+    /// Issue #19: when `includeUsage == false`, the trailing usage chunk is
+    /// suppressed BUT the finish_reason chunk + `[DONE]` still emit. The gate
+    /// touches only the usage chunk; the rest of the terminal sequence is
+    /// unaffected. Regression-pin against an over-broad gate.
+    func testFinishReasonAndDoneStillEmitWhenUsageSuppressed() throws {
+        var reparser = QoderSSEReparser()   // includeUsage == false
+        let finishLine = qoderLine([
+            "id": "x", "model": "m",
+            "choices": [["delta": [:], "finish_reason": "stop"]],
+            "usage": ["prompt_tokens": 7] as [String: Any],
+        ])
+        var out = try reparser.feed(Data(finishLine.utf8))
+        out.append(try reparser.finish())
+        let text = String(data: out, encoding: .utf8) ?? ""
+        // [DONE] still terminates the stream.
+        XCTAssertTrue(text.hasSuffix("data: [DONE]\n\n"))
+        let chunks = openAIChunks(out)
+        // The finish chunk still carries the real finish_reason.
+        let finishChunk = try XCTUnwrap(chunks.first {
+            ($0["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String != nil
+        })
+        let choice = try XCTUnwrap((finishChunk["choices"] as? [[String: Any]])?[0])
+        XCTAssertEqual(choice["finish_reason"] as? String, "stop")
+    }
+
+    /// Issue #19 boundary: the default-constructed reparser (no params) and
+    /// the `includeUsage: false` reparser behave identically — pin that the
+    /// default argument matches the explicit false. Guards against a future
+    /// refactor accidentally flipping the default.
+    func testDefaultInitEqualsExplicitIncludeUsageFalse() throws {
+        let usage: [String: Any] = ["prompt_tokens": 1, "total_tokens": 1]
+        func emit(using make: () -> QoderSSEReparser) -> Int {
+            var r = make()
+            let line = qoderLine([
+                "id": "x", "model": "m",
+                "choices": [["delta": [:], "finish_reason": "stop"]],
+                "usage": usage,
+            ])
+            var out = try! r.feed(Data(line.utf8))
+            out.append(try! r.finish())
+            return openAIChunks(out).filter { ($0["usage"] as? [String: Any]) != nil }.count
+        }
+        XCTAssertEqual(emit { QoderSSEReparser() }, 0, "default init must suppress usage chunk")
+        XCTAssertEqual(emit { QoderSSEReparser(includeUsage: false) }, 0, "explicit false must suppress usage chunk")
+        XCTAssertEqual(emit { QoderSSEReparser(created: 1) }, 0, "created-pinned default must suppress usage chunk")
+        XCTAssertEqual(emit { QoderSSEReparser(created: 1, includeUsage: false) }, 0, "created-pinned explicit false must suppress usage chunk")
+    }
+
+    /// Issue #19 S3 regression pin: a full content + finish + usage stream with
+    /// `includeUsage == false` must still stream the content delta and emit the
+    /// finish chunk, while suppressing ONLY the trailing usage chunk. The most
+    /// direct pin against an over-broad gate — if the gate accidentally swallowed
+    /// the content delta, finish chunk, or [DONE], this test fails. Includes a
+    /// role opener (ADR 0011 §4) on the first content line, so the content
+    /// assertion uses a `contains` predicate rather than a positional index.
+    func testContentStillStreamsWhenUsageSuppressed() throws {
+        var reparser = QoderSSEReparser()   // includeUsage == false
+        var out = try reparser.feed(Data(qoderLine([
+            "id": "x", "model": "m",
+            "choices": [["delta": ["content": "Hi"]]],
+        ]).utf8))
+        out.append(try reparser.feed(Data(qoderLine([
+            "id": "x", "model": "m",
+            "choices": [["delta": [:], "finish_reason": "stop"]],
+            "usage": ["prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2] as [String: Any],
+        ]).utf8)))
+        out.append(try reparser.finish())
+        let chunks = openAIChunks(out)
+        // Content delta still reaches the client.
+        XCTAssertTrue(chunks.contains {
+            (($0["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["content"] as? String == "Hi"
+        }, "content delta must still stream when usage is suppressed")
+        // Finish chunk still reaches the client.
+        XCTAssertTrue(chunks.contains {
+            (($0["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String) == "stop"
+        }, "finish_reason chunk must still emit when usage is suppressed")
+        // [DONE] still terminates the stream.
+        XCTAssertTrue(String(data: out, encoding: .utf8)?.hasSuffix("data: [DONE]\n\n") == true)
+        // And the usage chunk is the ONLY thing suppressed.
+        XCTAssertEqual(chunks.filter { ($0["usage"] as? [String: Any]) != nil }.count, 0,
+                       "includeUsage=false must suppress the trailing usage chunk")
     }
 }

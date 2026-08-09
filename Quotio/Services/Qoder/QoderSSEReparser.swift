@@ -87,9 +87,12 @@ nonisolated struct QoderSSEReparser {
     /// share it (advisor watch-item). Matches OpenAI's `created` (unix seconds).
     private let created: Int
 
-    /// Stashed `usage` from the final chunk. Emitted in the last OpenAI chunk
-    /// (OpenAI puts usage on the final chunk, optionally behind a
-    /// `stream_options: {include_usage: true}` request — we always include it).
+    /// Stashed `usage` from the final chunk. Captured UNCONDITIONALLY from any
+    /// upstream chunk that carries it (issue #19: Quotio's internal accounting
+    /// always needs the token counts regardless of client intent). The
+    /// CLIENT-FACING trailing usage chunk is gated on `includeUsage` below;
+    /// `capturedUsage` exposes this stash to ProxyBridge independently of that
+    /// gate so ADR 0005 §2's accumulator keeps working when the client opted out.
     ///
     /// `internal` so ProxyBridge's Qoder pump (ticket #7) can read the final
     /// usage after `finish()` and populate `RequestMetadata`'s token fields for
@@ -133,15 +136,36 @@ nonisolated struct QoderSSEReparser {
     /// require this when tool_calls streamed, else the stream is malformed).
     private var toolCallsState: [Int: QoderToolCallState] = [:]
 
+    /// Issue #19: whether to emit the trailing client-facing usage chunk.
+    /// OpenAI's streaming contract emits the trailing usage-only chunk ONLY
+    /// when the request carried `stream_options.include_usage: true`. Defaults
+    /// to `false` (the spec default for a missing/false field). Internal
+    /// `capturedUsage` is populated UNCONDITIONALLY (see `stashedUsage` above)
+    /// — only the client-facing chunk emission is gated. Set `true` by
+    /// ProxyBridge when:
+    ///   - Chat streaming + the client sent `stream_options.include_usage: true`
+    ///   - Responses API streaming (the Responses contract's `response.completed`
+    ///     event always carries `usage` — issue #19 §4 preserve-behavior note)
+    ///   - Non-streaming aggregation (the reparser's usage chunk feeds the
+    ///     aggregator here; OpenAI includes usage unconditionally in non-
+    ///     streaming completions — `stream_options` applies to streaming only)
+    private let includeUsage: Bool
+
     /// New reparser. `created` defaults to now; tests can pin via the second
-    /// initializer to assert byte-exact OpenAI chunk output.
-    init() {
+    /// initializer to assert byte-exact OpenAI chunk output. `includeUsage`
+    /// defaults to false (issue #19: spec default — no trailing usage chunk
+    /// unless the client opted in via `stream_options.include_usage: true`).
+    init(includeUsage: Bool = false) {
         self.created = Int(Date().timeIntervalSince1970.rounded(.down))
+        self.includeUsage = includeUsage
     }
 
-    /// Test initializer pinning the `created` timestamp.
-    init(created: Int) {
+    /// Test initializer pinning the `created` timestamp. `includeUsage` defaults
+    /// to false to keep the existing test fixtures (which were written before
+    /// the gate) asserting the no-usage-chunk shape unless they opt in.
+    init(created: Int, includeUsage: Bool = false) {
         self.created = created
+        self.includeUsage = includeUsage
     }
 
     // MARK: - Feed
@@ -179,8 +203,10 @@ nonisolated struct QoderSSEReparser {
     /// If a usage block was stashed but no chunk yet carried it (e.g. the
     /// upstream ended on a chunk with usage AND finish_reason together, which
     /// the parse loop already emitted), `finish` still emits a final usage-only
-    /// chunk when usage is stashed, matching OpenAI's `stream_options.include_usage`
-    /// behavior of a trailing usage chunk.
+    /// chunk when usage is stashed AND `includeUsage` is true (issue #19: the
+    /// client-facing chunk follows OpenAI's `stream_options.include_usage`
+    /// contract). `capturedUsage` exposes the stashed usage regardless of the
+    /// gate for Quotio's internal accounting.
     mutating func finish() throws -> Data {
         guard !finished else { return Data() }
         finished = true
@@ -219,7 +245,14 @@ nonisolated struct QoderSSEReparser {
         // ADR 0011 §3: built by the dedicated `buildUsageChunk` so the
         // spec-mandated `choices: []` rule cannot be missed (a real choice
         // object here would be a schema violation).
-        if let usage = stashedUsage {
+        //
+        // Issue #19: gate the CLIENT-FACING emission on `includeUsage` so a
+        // client that did NOT send `stream_options.include_usage: true` gets
+        // no trailing usage chunk (the OpenAI contract). Internal capture
+        // (`capturedUsage`/`stashedUsage`) is UNCHANGED — it stays populated
+        // regardless of this flag so Quotio's ADR 0005 §2 accumulator reads
+        // the real token counts via `capturedUsage` after `finish()`.
+        if includeUsage, let usage = stashedUsage {
             out.append(buildUsageChunk(usage))
         }
         out.append(contentsOf: "data: [DONE]\n\n".utf8)

@@ -1024,7 +1024,18 @@ final class ProxyBridge {
                 // and forward the OpenAI-shape bytes to the agent socket.
                 // `QoderSSEReparser` is a per-request `var` (not Sendable by
                 // design — never shared). Owned inside this Task.
-                var reparser = QoderSSEReparser()
+                //
+                // Issue #19: thread `stream_options.include_usage` from the
+                // request body. For Chat streaming the client opts in via the
+                // field; default false (spec-compliant). For Responses API
+                // streaming the contract is different — `response.completed`
+                // always carries `usage` — so we force `includeUsage: true`
+                // there to preserve behavior (the reparser gate would otherwise
+                // suppress the upstream usage chunk the adapter folds into
+                // response.completed).
+                let includeUsage = responsesMode
+                    || Self.includeUsageFlag(in: bodyData)
+                var reparser = QoderSSEReparser(includeUsage: includeUsage)
 
                 // The onChunk closure captures mutable state via a final-class
                 // holder (closures can't capture `inout` reparser). The holder is
@@ -1254,7 +1265,13 @@ final class ProxyBridge {
                         originalConnection.cancel()
                     })
                 } else {
-                var reparser = QoderSSEReparser()
+                // Issue #19: non-streaming completions always carry `usage`
+                // (OpenAI includes it unconditionally in non-streaming
+                // responses — `stream_options` applies to streaming only).
+                // The reparser's trailing usage chunk feeds the aggregator's
+                // `completionJSON` usage field, so force `includeUsage: true`
+                // to preserve the existing behavior.
+                var reparser = QoderSSEReparser(includeUsage: true)
                 var aggregator = QoderCompletionAggregator()
                 var aggregateFailed = false
 
@@ -1422,6 +1439,34 @@ final class ProxyBridge {
             )
             self.onRequestCompleted?(finalMetadata)
         }
+    }
+
+    /// Issue #19: parse `stream_options.include_usage` from a Chat Completions
+    /// request body. OpenAI's streaming contract emits the trailing usage-only
+    /// chunk ONLY when this field is `true`; missing/malformed → `false` (the
+    /// spec default). Tolerates a non-object `stream_options` value (→ false).
+    /// Nonisolated + value-type JSON parse → callable from any isolation domain
+    /// (mirrors `QoderFailoverRouter.streamRequested(in:)`'s shape).
+    ///
+    /// Internal (not private) so `@testable` tests can pin the boundary
+    /// behavior directly (issue #19 acceptance: missing/malformed stream_options).
+    ///
+    /// Strictness note: `NSNumber as? Bool` succeeds for JSON `1`/`0`
+    /// (Foundation bridges them through NSNumber). To honor the OpenAI
+    /// contract's JSON-boolean requirement we discriminate via `objCType`:
+    /// JSONSerialization decodes true/false as `c` (char/BOOL), any other
+    /// numeric type → not a boolean opt-in.
+    nonisolated static func includeUsageFlag(in body: Data) -> Bool {
+        guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let streamOptions = json["stream_options"] as? [String: Any] else {
+            return false
+        }
+        guard let value = streamOptions["include_usage"] as? NSNumber else {
+            return false
+        }
+        // Only accept a genuine JSON boolean (objCType "c"). A numeric 1/0
+        // or a numeric-looking string is not an opt-in.
+        return strcmp(value.objCType, "c") == 0 && value.boolValue
     }
 
     /// Send one chunk to the agent NWConnection, awaiting the send completion
