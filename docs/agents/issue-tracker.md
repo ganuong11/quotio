@@ -11,7 +11,7 @@ Issues and PRDs for this repo live as GitHub issues. Use the `gh` CLI for all op
 - **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`
 - **Close**: `gh issue close <number> --comment "..."`
 
-Infer the repo from `git remote -v` — `gh` does this automatically when run inside a clone.
+**The canonical repo is `ganuong11/quotio` (the fork, remote `origin`).** Do not rely on `gh`'s heuristic — this clone also has an `upstream` remote (`nguyenphutrong/quotio`), which is read-only and not where issues live. Run `gh repo set-default ganuong11/quotio` once per fresh clone; afterwards `gh issue`/`gh pr` resolve correctly without `-R`. When in doubt, pass `-R ganuong11/quotio` explicitly.
 
 ## Pull requests as a triage surface
 
