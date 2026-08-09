@@ -283,14 +283,16 @@ final class QoderFailoverRouterTests: XCTestCase {
         pat: MockPATRefresher,
         gateway: MockGatewayClient,
         metadata: MonitorMetadataStore,
-        configuration: QoderFailoverRouterConfiguration = .default
+        configuration: QoderFailoverRouterConfiguration = .default,
+        translatorLimits: QoderTranslatorLimits = .default
     ) -> QoderFailoverRouter {
         QoderFailoverRouter(
             vault: vault,
             metadata: metadata,
             patService: pat,
             gateway: gateway,
-            configuration: configuration
+            configuration: configuration,
+            translatorLimits: translatorLimits
         )
     }
 
@@ -335,6 +337,136 @@ final class QoderFailoverRouterTests: XCTestCase {
             if case .noAccountsAvailable = error {} else {
                 XCTFail("expected noAccountsAvailable, got \(error)")
             }
+        }
+    }
+
+    // MARK: - Tier 2 translator caps surfacing (issue #14)
+
+    /// End-to-end: a translator Tier 2 cap rejection (byte-size → 413) flows
+    /// through the router's `attempt` catch as `QoderFailoverError.requestRejected`
+    /// carrying the translator's 413 status, which ProxyBridge forwards. Uses
+    /// tight injected limits so the test body is tiny. This is the contract
+    /// proof that the catch path (not just the translator in isolation)
+    /// surfaces the right status.
+    func testTranslatorImageSizeCapSurfacesAs413() async throws {
+        let vault = InMemoryCredentialStore()
+        let account = makeAccount(key: "primary@example.com")
+        await vault.seed(account, makeCredential(accountID: account.id))
+        let gateway = MockGatewayClient()  // never reached — translator rejects first
+        let router = makeRouter(
+            vault: vault, pat: MockPATRefresher(), gateway: gateway,
+            metadata: makeMetadataStore(),
+            translatorLimits: QoderTranslatorLimits(
+                maxMessages: 500, maxImageBytes: 100, maxTools: 128, maxToolSchemaBytes: 1024
+            )
+        )
+        // One over-cap image (101 decoded bytes > 100-byte cap).
+        let payload = Data(repeating: 0x41, count: 101).base64EncodedString()
+        let body: [String: Any] = [
+            "model": "qoder/auto",
+            "stream": true,
+            "messages": [[
+                "role": "user",
+                "content": [["type": "image_url", "image_url": ["url": "data:image/png;base64,\(payload)"]]],
+            ] as [String: Any]],
+        ]
+        let bodyData = try JSONSerialization.data(withJSONObject: body)
+        do {
+            _ = try await router.openStream(requestBody: bodyData, proxyAPIKey: "key")
+            XCTFail("expected requestRejected")
+        } catch let error as QoderFailoverError {
+            guard case .requestRejected(_, let status) = error else {
+                return XCTFail("expected requestRejected, got \(error)")
+            }
+            XCTAssertEqual(status, 413, "image-size cap must surface as 413, got \(status)")
+        }
+        // The gateway was never called — the translator rejected pre-stream.
+        let callCount = await gateway.callCount
+        XCTAssertEqual(callCount, 0, "translator cap must reject before any gateway call")
+    }
+
+    /// End-to-end: a translator count cap (messages → 400) surfaces as 400.
+    func testTranslatorMessageCountCapSurfacesAs400() async throws {
+        let vault = InMemoryCredentialStore()
+        let account = makeAccount(key: "primary@example.com")
+        await vault.seed(account, makeCredential(accountID: account.id))
+        let gateway = MockGatewayClient()
+        let router = makeRouter(
+            vault: vault, pat: MockPATRefresher(), gateway: gateway,
+            metadata: makeMetadataStore(),
+            translatorLimits: QoderTranslatorLimits(
+                maxMessages: 1, maxImageBytes: 1024, maxTools: 128, maxToolSchemaBytes: 1024
+            )
+        )
+        // Two user messages > 1-message cap.
+        let body: [String: Any] = [
+            "model": "qoder/auto",
+            "stream": true,
+            "messages": [
+                ["role": "user", "content": "a"],
+                ["role": "user", "content": "b"],
+            ],
+        ]
+        let bodyData = try JSONSerialization.data(withJSONObject: body)
+        do {
+            _ = try await router.openStream(requestBody: bodyData, proxyAPIKey: "key")
+            XCTFail("expected requestRejected")
+        } catch let error as QoderFailoverError {
+            guard case .requestRejected(_, let status) = error else {
+                return XCTFail("expected requestRejected, got \(error)")
+            }
+            XCTAssertEqual(status, 400, "message-count cap must surface as 400, got \(status)")
+        }
+        let callCount = await gateway.callCount
+        XCTAssertEqual(callCount, 0, "translator cap must reject before any gateway call")
+    }
+
+    // MARK: - Non-rotatable upstream status surfacing (issue #14 S2)
+
+    /// A non-rotatable 4xx from the gateway (e.g. 413) surfaces with the real
+    /// status, not the historical hard-coded 400. Guards the S2 fix: the
+    /// default-arm `requestRejected` must pass `status` through.
+    func testNonRotatable413FromGatewaySurfacesAs413() async throws {
+        let vault = InMemoryCredentialStore()
+        let account = makeAccount(key: "primary@example.com")
+        await vault.seed(account, makeCredential(accountID: account.id))
+        let gateway = MockGatewayClient()
+        await gateway.seed(.init(status: 413, body: Data()))
+        let router = makeRouter(
+            vault: vault, pat: MockPATRefresher(), gateway: gateway,
+            metadata: makeMetadataStore()
+        )
+        do {
+            _ = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
+            XCTFail("expected requestRejected")
+        } catch let error as QoderFailoverError {
+            guard case .requestRejected(_, let status) = error else {
+                return XCTFail("expected requestRejected, got \(error)")
+            }
+            XCTAssertEqual(status, 413, "gateway 413 must surface as 413, not collapsed to 400")
+        }
+    }
+
+    /// A non-rotatable 422 surfaces as 422 (spot-check a second non-429/401/403
+    /// status to confirm the pass-through is general, not 413-specific).
+    func testNonRotatable422FromGatewaySurfacesAs422() async throws {
+        let vault = InMemoryCredentialStore()
+        let account = makeAccount(key: "primary@example.com")
+        await vault.seed(account, makeCredential(accountID: account.id))
+        let gateway = MockGatewayClient()
+        await gateway.seed(.init(status: 422, body: Data()))
+        let router = makeRouter(
+            vault: vault, pat: MockPATRefresher(), gateway: gateway,
+            metadata: makeMetadataStore()
+        )
+        do {
+            _ = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
+            XCTFail("expected requestRejected")
+        } catch let error as QoderFailoverError {
+            guard case .requestRejected(_, let status) = error else {
+                return XCTFail("expected requestRejected, got \(error)")
+            }
+            XCTAssertEqual(status, 422)
         }
     }
 

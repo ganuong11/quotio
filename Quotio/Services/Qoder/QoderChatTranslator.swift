@@ -267,18 +267,118 @@ nonisolated struct QoderChatTranslatorOptions: Sendable {
     static let deferringToRandom = QoderChatTranslatorOptions()
 }
 
-/// Parse errors. ProxyBridge (#7) maps each to an HTTP 400 response body for
-/// the CLI agent. Tokens/secrets are never embedded. (Phase 2a's tools/image
-/// fail-fast gates were lifted in Phase 2b — tools and image content parts
-/// now translate into the Qoder envelope per ADR 0007 §3.)
+/// Tier 2 semantic caps for the Chat translator (issue #14, defense-in-depth
+/// on top of the upstream Qoder gateway's own limits). These run BEFORE the
+/// envelope is built, so an over-limit request never reaches the gateway or
+/// the COSY/WAF signing path — fail-fast at the cheapest point.
+///
+/// Pure value type, `Sendable`, no I/O. Defaults are sized to never reject a
+/// legitimate CLI-agent request while still bounding the translator's working
+/// set. They're `let`s on a struct (not a global) so tests can inject tighter
+/// values; the production call site uses `.default`.
+///
+/// The byte-size caps (image, tool schema) map to HTTP **413 Payload Too
+/// Large**; the count caps (messages, tools) map to HTTP **400
+/// invalid_request_error**. Rationale: a count overage is a structural misuse
+/// of the API (the request shape is fine, the agent just sent too many), while
+/// a byte overage is a payload that's literally too large to forward — the
+/// same semantics Tier 1's body cap (ADR 0013) uses for 413. The status-code
+/// split is realized via `QoderTranslatorError.httpStatus` and surfaced through
+/// `QoderFailoverError.requestRejected` → `ProxyBridge.sendError`, which wraps
+/// the message in the ADR 0010 OpenAI error envelope.
+nonisolated struct QoderTranslatorLimits: Sendable, Equatable {
+    /// Maximum number of messages accepted in one request. 500 comfortably
+    /// covers long CLI-agent conversations while bounding the O(n) message
+    /// transform and the recordID hash. Above this, reject as 400.
+    let maxMessages: Int
+    /// Maximum decoded byte length of a single `image_url` data-URL payload
+    /// (base64 portion decoded). 10 MB matches the headroom the upstream
+    /// Qoder gateway advertises for inline images. For plain http(s) URLs the
+    /// URL string length is capped at this same value (a sane upper bound — a
+    /// real URL is a few hundred chars; only an adversarial value runs long).
+    /// Above this, reject as 413.
+    let maxImageBytes: Int
+    /// Maximum number of tools accepted in one request. 128 covers the largest
+    /// MCP-derived tool sets observed in practice. Above this, reject as 400.
+    let maxTools: Int
+    /// Maximum serialized byte length of a single tool's `parameters` JSON
+    /// Schema subtree. 1 MB is generous for a hand-authored or generated
+    /// schema and bounds the per-tool memory cost. Above this, reject as 413.
+    let maxToolSchemaBytes: Int
+
+    /// Production defaults (see per-field docs for sizing rationale).
+    static let `default` = QoderTranslatorLimits(
+        maxMessages: 500,
+        maxImageBytes: 10 * 1024 * 1024,
+        maxTools: 128,
+        maxToolSchemaBytes: 1024 * 1024
+    )
+}
+
+/// Parse + limit errors. ProxyBridge (#7) maps each to an HTTP error response
+/// body for the CLI agent via the ADR 0010 OpenAI envelope. Tokens/secrets are
+/// never embedded; limit messages state the limit value and which limit was
+/// hit but never echo request content (e.g. the offending image bytes).
 nonisolated enum QoderTranslatorError: Error, LocalizedError {
     /// Request body was not valid OpenAI-shape JSON. Detail is structural only.
     case malformedRequest(String)
+
+    /// Tier 2 count overages (message count, tool count). 400 — the request
+    /// shape is fine, the agent just sent too many. `limit` is the configured
+    /// cap; `actual` is the offending count. The message names the limit but
+    /// never echoes request content.
+    case limitCountExceeded(kind: CountLimitKind, limit: Int, actual: Int)
+
+    /// Tier 2 byte overages (image size, tool schema size). 413 — the payload
+    /// is literally too large to forward, matching Tier 1's body-cap semantics
+    /// (ADR 0013). `limit` is the configured byte cap; `actual` is the
+    /// measured size. The message names the limit but never echoes content.
+    case limitSizeExceeded(kind: SizeLimitKind, limit: Int, actual: Int)
+
+    /// Which count-based limit was exceeded. Drives the error message; the
+    /// associated HTTP status is always 400.
+    enum CountLimitKind: Sendable, Equatable {
+        case messages
+        case tools
+        var displayName: String {
+            switch self {
+            case .messages: return "messages"
+            case .tools: return "tools"
+            }
+        }
+    }
+
+    /// Which byte-size limit was exceeded. Drives the error message; the
+    /// associated HTTP status is always 413.
+    enum SizeLimitKind: Sendable, Equatable {
+        case image
+        case toolSchema
+        var displayName: String {
+            switch self {
+            case .image: return "image_url"
+            case .toolSchema: return "tool schema"
+            }
+        }
+    }
+
+    /// HTTP status for this error. Count caps → 400; size caps → 413;
+    /// malformed → 400 (matches the historical Phase 2a behavior).
+    var httpStatus: Int {
+        switch self {
+        case .malformedRequest: return 400
+        case .limitCountExceeded: return 400
+        case .limitSizeExceeded: return 413
+        }
+    }
 
     var errorDescription: String? {
         switch self {
         case .malformedRequest(let detail):
             return "Qoder translator: malformed request (\(detail))."
+        case .limitCountExceeded(let kind, let limit, let actual):
+            return "Qoder translator: \(kind.displayName) count \(actual) exceeds limit of \(limit)."
+        case .limitSizeExceeded(let kind, let limit, let actual):
+            return "Qoder translator: \(kind.displayName) size \(actual) bytes exceeds limit of \(limit) bytes."
         }
     }
 }
@@ -304,12 +404,19 @@ nonisolated enum QoderChatTranslator {
     /// Parse an OpenAI-shape request body, apply fail-fast gates, build the
     /// Qoder envelope. Combines parsing + gate-checking + translation — the
     /// single call ProxyBridge (ticket #7) makes per Qoder-bound request.
+    ///
+    /// `limits` runs Tier 2 semantic caps (issue #14): message count, image
+    /// size, tool count, per-tool schema size. Defaults (`.default`) are sized
+    /// to never reject a legitimate CLI-agent request; tests inject tighter
+    /// values. Over-limit throws `QoderTranslatorError.limitCountExceeded`
+    /// (HTTP 400) or `.limitSizeExceeded` (HTTP 413).
     static func translate(
         body: Data,
         userID: String,
         proxyAPIKey: String,
         modelConfig: QoderModelConfig,
-        options: QoderChatTranslatorOptions = .deferringToRandom
+        options: QoderChatTranslatorOptions = .deferringToRandom,
+        limits: QoderTranslatorLimits = .default
     ) throws -> QoderTranslationResult {
         let request = try parse(body: body)
         return try translate(
@@ -317,22 +424,29 @@ nonisolated enum QoderChatTranslator {
             userID: userID,
             proxyAPIKey: proxyAPIKey,
             modelConfig: modelConfig,
-            options: options
+            options: options,
+            limits: limits
         )
     }
 
-    /// Build the Qoder envelope from a parsed OpenAI request. The tools/image
-    /// fail-fast gates run here regardless of entry path — a typed caller
-    /// passing tools still fails fast.
+    /// Build the Qoder envelope from a parsed OpenAI request. The Tier 2
+    /// semantic caps (issue #14) run here regardless of entry path — a typed
+    /// caller passing too many messages / oversized images still fails fast.
     static func translate(
         request: OpenAIChatRequest,
         userID: String,
         proxyAPIKey: String,
         modelConfig: QoderModelConfig,
-        options: QoderChatTranslatorOptions = .deferringToRandom
+        options: QoderChatTranslatorOptions = .deferringToRandom,
+        limits: QoderTranslatorLimits = .default
     ) throws -> QoderTranslationResult {
-        // Phase 2b lifted the tools and image fail-fast gates (ADR 0007 §3).
-        // Tools and image parts now translate into the Qoder envelope.
+        // Tier 2 semantic caps (issue #14, defense-in-depth). The upstream
+        // Qoder gateway enforces its own limits; these bound the translator's
+        // working set and fail-fast at the cheapest point. O(n) over the
+        // parsed request — no extra re-parses (tool schema size reuses the
+        // already-stored `parameters: Data` bytes; image size decodes the
+        // base64 slice of the data-URL string only when present).
+        try enforceLimits(request: request, limits: limits)
 
         // Model key: prefer the resolved config; fall back to the request model
         // when the catalog had no entry (defaultUnknown carries an empty key).
@@ -405,6 +519,126 @@ nonisolated enum QoderChatTranslator {
             chatRecordID: recordID,
             sessionID: sessionID
         )
+    }
+
+    // MARK: - Tier 2 semantic caps (issue #14)
+
+    /// Enforce the four Tier 2 caps (issue #14). O(n) over the parsed request:
+    /// one pass for messages + image parts, one pass for tool schema sizes.
+    /// Throws the first overage encountered. Order is intentional: message
+    /// count → image size → tool count → tool schema size. Message count runs
+    /// first because it bounds every later pass (and is the cheapest check);
+    /// tool count before per-tool schema size so a structurally-misused request
+    /// reports its kind, not an incidental size overage on one tool. The
+    /// message names the limit + actual but never echoes request content.
+    private static func enforceLimits(
+        request: OpenAIChatRequest,
+        limits: QoderTranslatorLimits
+    ) throws {
+        // 1. Message count (HTTP 400 on overage).
+        if request.messages.count > limits.maxMessages {
+            throw QoderTranslatorError.limitCountExceeded(
+                kind: .messages, limit: limits.maxMessages, actual: request.messages.count
+            )
+        }
+
+        // 2. Per-image size (HTTP 413 on overage). Walk every message's content
+        //    parts; for image_url parts measure the payload:
+        //      - base64 data URLs (`data:<mime>;base64,<...>`) → decoded byte
+        //        length (the real memory cost when the gateway materializes it).
+        //      - plain http(s) URLs → the URL string length, capped against the
+        //        same `maxImageBytes` threshold (a sane upper bound — real URLs
+        //        are a few hundred chars; only an adversarial value runs long).
+        //    Both user messages and tool-result messages carry images (a tool
+        //    result from an image-returning tool can include image_url parts),
+        //    so we walk all messages rather than just user ones.
+        for msg in request.messages {
+            guard case .parts(let parts)? = msg.content else { continue }
+            for part in parts {
+                guard case .imageURL(let url) = part else { continue }
+                let size = imageSizeBytes(url: url, cap: limits.maxImageBytes)
+                if size > limits.maxImageBytes {
+                    throw QoderTranslatorError.limitSizeExceeded(
+                        kind: .image, limit: limits.maxImageBytes, actual: size
+                    )
+                }
+            }
+        }
+
+        // 3. Tool count (HTTP 400 on overage). `nil` tools (request carried no
+        //    `tools:` field) is allowed — equivalent to an empty array.
+        if let tools = request.tools, tools.count > limits.maxTools {
+            throw QoderTranslatorError.limitCountExceeded(
+                kind: .tools, limit: limits.maxTools, actual: tools.count
+            )
+        }
+
+        // 4. Per-tool schema size (HTTP 413 on overage). The parser already
+        //    re-serializes each tool's `parameters` subtree to canonical bytes
+        //    (stored on `OpenAIToolDefinition.parameters: Data`), so the size
+        //    check is a byte-count — no extra serialization here. Default `{}` is
+        //    ~2 bytes; a real schema is a few KB; 1 MB is generous.
+        if let tools = request.tools {
+            for tool in tools {
+                let size = tool.function.parameters.count
+                if size > limits.maxToolSchemaBytes {
+                    throw QoderTranslatorError.limitSizeExceeded(
+                        kind: .toolSchema, limit: limits.maxToolSchemaBytes, actual: size
+                    )
+                }
+            }
+        }
+    }
+
+    /// Measure an image_url's payload size for the cap. For a base64 data URL,
+    /// returns the decoded byte length (the real memory cost). For any other
+    /// URL (http/https, or a malformed data URL), returns the URL string's
+    /// UTF-8 byte length — a conservative proxy.
+    ///
+    /// `cap` is an early-out to avoid decoding up to ~10 MB of base64 for an
+    /// under-cap image: a base64 payload is always at least as long as the
+    /// decoded bytes (base64 inflates ~4/3× on the wire), so if the URL string
+    /// (including the `data:...;base64,` prefix) is ≤ cap, the decoded size is
+    /// guaranteed ≤ cap too — return the string length without decoding. Only
+    /// when the string length alone exceeds the cap do we decode, to report the
+    /// real decoded byte count in the error message.
+    ///
+    /// Decoding uses Foundation's `base64EncodedData`: a malformed base64 tail
+    /// returns nil and we fall back to the string length. This deliberately
+    /// over-counts a malformed tail rather than under-counting it, so an
+    /// adversarial payload can't slip past the cap by ending in junk.
+    private static func imageSizeBytes(url: URL, cap: Int) -> Int {
+        let urlString = url.absoluteString
+        let stringBytes = urlString.utf8.count
+        // Fast path: under the cap by string length → safe regardless of
+        // encoding (decoded ≤ string ≤ cap). Skips the base64 decode for the
+        // common under-cap inline-image case.
+        if stringBytes <= cap {
+            return stringBytes
+        }
+        // Non-data URLs: the string length (already > cap) is the answer.
+        guard urlString.hasPrefix("data:") else {
+            return stringBytes
+        }
+        // data URL shape: `data:<mime>[;base64],<payload>`. Find the comma
+        // separating the metadata prefix from the payload.
+        guard let comma = urlString.firstIndex(of: ",") else {
+            return stringBytes
+        }
+        let prefix = urlString[urlString.startIndex..<comma]
+        let payload = urlString[urlString.index(after: comma)..<urlString.endIndex]
+        // Only base64 data URLs need decoding; plain (URL-encoded) data URLs
+        // are rare for images and small — use the string length.
+        guard prefix.lowercased().hasSuffix("base64") else {
+            return stringBytes
+        }
+        let payloadString = String(payload)
+        guard let decoded = Data(base64Encoded: payloadString) else {
+            // Malformed base64 — return the string length (conservative
+            // over-count; never let junk sneak under the cap).
+            return stringBytes
+        }
+        return decoded.count
     }
 
     // MARK: - Stable hashing (ported verbatim from stream.ts ~30-75)

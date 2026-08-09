@@ -71,6 +71,25 @@ final class QoderOpenAIErrorTests: XCTestCase {
         XCTAssertEqual(err["code"] as? String, "rate_limit_exceeded")
     }
 
+    /// 413 → `invalid_request_error` with no `code` (the default 4xx arm).
+    /// Pins both the status→type/code map for 413 (issue #14's byte-size caps
+    /// surface as 413) and the reason phrase used when the message is empty.
+    func test413MapsToInvalidRequestNoCode() throws {
+        let err = errorDict(QoderOpenAIError.body(statusCode: 413, message: "too big"))
+        XCTAssertEqual(err["type"] as? String, "invalid_request_error")
+        XCTAssertEqual(err["message"] as? String, "too big")
+        XCTAssertNil(err["code"], "413 must omit code (default 4xx arm, omitempty)")
+    }
+
+    /// 413 with an empty message falls back to "Payload Too Large" (issue #14
+    /// acceptance: the reason phrase table must carry 413, otherwise an empty-
+    /// message 413 response would ship with "Internal Server Error").
+    func test413ReasonPhraseIsPayloadTooLarge() {
+        XCTAssertEqual(QoderOpenAIError.reasonPhrase(for: 413), "Payload Too Large")
+        let err = errorDict(QoderOpenAIError.body(statusCode: 413, message: ""))
+        XCTAssertEqual(err["message"] as? String, "Payload Too Large")
+    }
+
     /// 500 → `server_error` / `internal_server_error`. The whole 5xx arm maps
     /// the same way; parameterize across 500/502/503 to prove it.
     func test500MapsToServerErrorInternalServerError() throws {

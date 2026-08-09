@@ -970,16 +970,17 @@ final class ProxyBridge {
                     proxyAPIKey: proxyAPIKey
                 )
             } catch let error as QoderFailoverError {
-                // Pre-stream failure → true HTTP error. Map by kind:
-                //  - requestRejected / missingProxyAPIKey → 400
-                //  - noAccountsAvailable → 503
-                let status: Int
-                if case .noAccountsAvailable = error {
-                    status = 503
-                } else {
-                    status = 400
-                }
-                self.sendError(to: originalConnection, statusCode: status, message: error.localizedDescription)
+                // Pre-stream failure → true HTTP error. The status lives on the
+                // error itself (issue #14): requestRejected carries the
+                // translator's chosen 400/413, missingProxyAPIKey → 401,
+                // noAccountsAvailable → 503. ProxyBridge.sendError wraps the
+                // message in the ADR 0010 OpenAI error envelope, so the agent
+                // sees a structured `{"error":{...}}` body matching the status.
+                self.sendError(
+                    to: originalConnection,
+                    statusCode: error.httpStatus,
+                    message: error.localizedDescription
+                )
                 return
             } catch {
                 // Any other unexpected error → 502 (we couldn't reach upstream).

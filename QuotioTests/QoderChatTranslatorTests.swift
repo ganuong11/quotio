@@ -988,4 +988,368 @@ final class QoderChatTranslatorTests: XCTestCase {
         )
         XCTAssertNotEqual(enabled, disabled)
     }
+
+    // MARK: - Tier 2 semantic caps (issue #14)
+
+    /// Tight limits used by the cap tests so each boundary is exact and the
+    /// tests don't depend on the (much larger) production defaults.
+    private static let tightLimits = QoderTranslatorLimits(
+        maxMessages: 3,
+        maxImageBytes: 100,
+        maxTools: 2,
+        maxToolSchemaBytes: 50
+    )
+
+    /// Convenience: translate with the tight test limits + throwaway defaults.
+    private func translateWithTightLimits(_ request: OpenAIChatRequest) throws -> QoderTranslationResult {
+        try QoderChatTranslator.translate(
+            request: request,
+            userID: "u",
+            proxyAPIKey: "k",
+            modelConfig: QoderModelConfig(key: "m", isReasoning: false, maxOutputTokens: 32768, source: "system"),
+            options: .deferringToRandom,
+            limits: Self.tightLimits
+        )
+    }
+
+    /// Asserts the thrown error is the expected limit kind + maps to the
+    /// expected HTTP status. Centralizes the throw-shape assertion so each cap
+    /// test reads as one line.
+    private func assertLimitError(
+        _ block: () throws -> QoderTranslationResult,
+        expectedStatus: Int,
+        kindDescriptionContains needle: String,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        do {
+            _ = try block()
+            XCTFail("expected limit error, request was accepted", file: file, line: line)
+        } catch let error as QoderTranslatorError {
+            XCTAssertEqual(error.httpStatus, expectedStatus, "status mismatch: \(error)", file: file, line: line)
+            XCTAssertTrue(
+                error.localizedDescription.contains(needle),
+                "error message should name '\(needle)': got \(error.localizedDescription)",
+                file: file, line: line
+            )
+        } catch {
+            XCTFail("expected QoderTranslatorError, got \(error)", file: file, line: line)
+        }
+    }
+
+    // -- Message count cap ---------------------------------------------------
+
+    /// At-limit message count is accepted (tight limit = 3, send exactly 3).
+    func testMessageCountAtLimitAccepted() throws {
+        let msgs = (0..<3).map {
+            OpenAIChatMessage(role: "user", content: .text("m\($0)"), toolCalls: nil, toolCallID: nil)
+        }
+        let request = OpenAIChatRequest(model: "m", messages: msgs, tools: nil, maxTokens: nil)
+        _ = try translateWithTightLimits(request)  // does not throw
+    }
+
+    /// Over-limit message count is rejected with 400 + the message-count error.
+    func testMessageCountOverLimitRejected() {
+        let msgs = (0..<4).map {
+            OpenAIChatMessage(role: "user", content: .text("m\($0)"), toolCalls: nil, toolCallID: nil)
+        }
+        let request = OpenAIChatRequest(model: "m", messages: msgs, tools: nil, maxTokens: nil)
+        assertLimitError(
+            { try translateWithTightLimits(request) },
+            expectedStatus: 400,
+            kindDescriptionContains: "messages"
+        )
+    }
+
+    /// The error reports the actual count and the limit, but not message content.
+    func testMessageCountErrorNamesLimitAndActualNotContent() {
+        let msgs = (0..<5).map { _ in
+            OpenAIChatMessage(role: "user", content: .text("SECRET"), toolCalls: nil, toolCallID: nil)
+        }
+        let request = OpenAIChatRequest(model: "m", messages: msgs, tools: nil, maxTokens: nil)
+        do {
+            _ = try translateWithTightLimits(request)
+            XCTFail("expected throw")
+        } catch let error as QoderTranslatorError {
+            let msg = error.localizedDescription
+            XCTAssertTrue(msg.contains("5"), "should report actual count 5: \(msg)")
+            XCTAssertTrue(msg.contains("3"), "should report limit 3: \(msg)")
+            XCTAssertFalse(msg.contains("SECRET"), "error must not echo request content: \(msg)")
+        } catch {
+            XCTFail("expected QoderTranslatorError, got \(error)")
+        }
+    }
+
+    // -- Image size cap ------------------------------------------------------
+
+    /// Helper: an OpenAIChatRequest with a single user message carrying one
+    /// image_url part with the given URL string.
+    private func requestWithImageURL(_ urlString: String) -> OpenAIChatRequest {
+        OpenAIChatRequest(
+            model: "m",
+            messages: [OpenAIChatMessage(
+                role: "user",
+                content: .parts([.imageURL(URL(string: urlString)!)]),
+                toolCalls: nil,
+                toolCallID: nil
+            )],
+            tools: nil,
+            maxTokens: nil
+        )
+    }
+
+    /// At-limit image size (base64 decoded) is accepted. Tight cap = 100 bytes;
+    /// 100 bytes of base64-decoded payload = ~134 base64 chars.
+    func testImageSizeAtLimitAccepted() throws {
+        // 100 zero bytes → base64 "AAAA..." (134 chars including padding).
+        let payload = Data(repeating: 0x41, count: 100).base64EncodedString()
+        let url = "data:image/png;base64,\(payload)"
+        // Sanity: the decoded size really is 100.
+        XCTAssertEqual(Data(base64Encoded: payload)?.count, 100)
+        _ = try translateWithTightLimits(requestWithImageURL(url))
+    }
+
+    /// Over-limit image size (base64 decoded) is rejected with 413.
+    func testImageSizeOverLimitRejected() {
+        // 101 bytes → just over the 100-byte cap.
+        let payload = Data(repeating: 0x41, count: 101).base64EncodedString()
+        let url = "data:image/png;base64,\(payload)"
+        assertLimitError(
+            { try translateWithTightLimits(requestWithImageURL(url)) },
+            expectedStatus: 413,
+            kindDescriptionContains: "image_url"
+        )
+    }
+
+    /// The image cap measures the DECODED byte length, not the on-wire base64
+    /// length — a 4/3 inflation must not sneak a too-large image past the cap.
+    /// Tight cap = 100 bytes; 80 raw bytes encode to ~108 base64 chars (under
+    /// 100 if measured as chars, over 100 only when decoded). This guards that
+    /// we decode rather than string-counting the data URL.
+    func testImageSizeMeasuresDecodedBase64NotWireLength() {
+        // 200 raw bytes → 268 base64 chars. Decoded = 200 > 100 cap. If we were
+        // measuring wire length we'd still reject (268 > 100), so to truly test
+        // the decode path use a size that's over-cap when decoded but whose
+        // base64 substring is longer than the cap either way. The point of this
+        // test is that the decoded count appears in the error message.
+        let raw = Data(repeating: 0x42, count: 150)
+        let payload = raw.base64EncodedString()
+        let url = "data:image/png;base64,\(payload)"
+        do {
+            _ = try translateWithTightLimits(requestWithImageURL(url))
+            XCTFail("expected throw")
+        } catch let error as QoderTranslatorError {
+            XCTAssertEqual(error.httpStatus, 413)
+            // The actual decoded size (150) must be reported, proving we decoded.
+            XCTAssertTrue(error.localizedDescription.contains("150"), "got \(error.localizedDescription)")
+        } catch {
+            XCTFail("expected QoderTranslatorError, got \(error)")
+        }
+    }
+
+    /// A plain http(s) URL image is capped by URL string length (proxy for
+    /// payload size — real URLs are tiny). Tight cap = 100 bytes; a 101-char
+    /// URL is over.
+    func testImageSizeHTTPSURLCappedByStringLength() {
+        let longURL = "https://example.com/" + String(repeating: "x", count: 90)  // > 100 chars total
+        XCTAssertTrue(longURL.utf8.count > 100)
+        assertLimitError(
+            { try translateWithTightLimits(requestWithImageURL(longURL)) },
+            expectedStatus: 413,
+            kindDescriptionContains: "image_url"
+        )
+    }
+
+    /// A small plain https URL image is accepted.
+    func testImageSizeSmallHTTPSURLAccepted() throws {
+        _ = try translateWithTightLimits(requestWithImageURL("https://e.co/x.png"))
+    }
+
+    /// A small data URL image is accepted (the common case — inline screenshots).
+    func testImageSizeSmallDataURLAccepted() throws {
+        let payload = Data(repeating: 0x41, count: 10).base64EncodedString()
+        _ = try translateWithTightLimits(requestWithImageURL("data:image/png;base64,\(payload)"))
+    }
+
+    /// Image cap applies to tool-result messages too (a screenshot-returning
+    /// tool includes image_url parts in a role:tool message). Over-limit there
+    /// is also rejected.
+    func testImageSizeCapAppliesToToolResultMessages() {
+        let payload = Data(repeating: 0x41, count: 101).base64EncodedString()
+        let url = "data:image/png;base64,\(payload)"
+        let request = OpenAIChatRequest(
+            model: "m",
+            messages: [OpenAIChatMessage(
+                role: "tool",
+                content: .parts([.text("note"), .imageURL(URL(string: url)!)]),
+                toolCalls: nil,
+                toolCallID: "tc1"
+            )],
+            tools: nil,
+            maxTokens: nil
+        )
+        assertLimitError(
+            { try translateWithTightLimits(request) },
+            expectedStatus: 413,
+            kindDescriptionContains: "image_url"
+        )
+    }
+
+    // -- Tools count cap -----------------------------------------------------
+
+    private func requestWithTools(_ count: Int) -> OpenAIChatRequest {
+        let tools = (0..<count).map { i in
+            OpenAITool(function: OpenAIToolDefinition(
+                name: "t\(i)", description: nil, parameters: Data("{}".utf8)
+            ))
+        }
+        return OpenAIChatRequest(
+            model: "m",
+            messages: [OpenAIChatMessage(role: "user", content: .text("hi"), toolCalls: nil, toolCallID: nil)],
+            tools: tools,
+            maxTokens: nil
+        )
+    }
+
+    /// At-limit tool count is accepted (tight cap = 2).
+    func testToolCountAtLimitAccepted() throws {
+        _ = try translateWithTightLimits(requestWithTools(2))
+    }
+
+    /// Over-limit tool count is rejected with 400.
+    func testToolCountOverLimitRejected() {
+        assertLimitError(
+            { try translateWithTightLimits(requestWithTools(3)) },
+            expectedStatus: 400,
+            kindDescriptionContains: "tools"
+        )
+    }
+
+    // -- Per-tool schema size cap -------------------------------------------
+
+    /// Helper: a request with one tool whose `parameters` JSON Schema serializes
+    /// to *exactly* `targetBytes` (within JSON's determinism for this shape).
+    /// Builds `{"description":"<pad>"}` and grows the pad until the serialized
+    /// form hits the target. The parser round-trips the schema through
+    /// JSONSerialization, so the byte length is stable for this key/value shape.
+    /// `targetBytes` must be ≥ the skeleton `{"description":""}` length (19).
+    private func requestWithToolSchemaSize(_ targetBytes: Int) -> OpenAIChatRequest {
+        // Grow the pad until the serialized form equals the target. Tolerates
+        // JSON escape differences by measuring the real output each iteration.
+        var padLen = 0
+        var schemaData: Data
+        repeat {
+            let pad = String(repeating: "x", count: padLen)
+            schemaData = (try! JSONSerialization.data(withJSONObject: ["description": pad]))
+            if schemaData.count == targetBytes { break }
+            padLen += 1
+        } while schemaData.count < targetBytes
+        // The at-limit test relies on exactness; assert it here so a future
+        // Foundation change that shifts serialization surfaces loudly.
+        XCTAssertEqual(schemaData.count, targetBytes, "schema must serialize to exactly \(targetBytes) bytes")
+        let tool = OpenAITool(function: OpenAIToolDefinition(
+            name: "big", description: nil, parameters: schemaData
+        ))
+        return OpenAIChatRequest(
+            model: "m",
+            messages: [OpenAIChatMessage(role: "user", content: .text("hi"), toolCalls: nil, toolCallID: nil)],
+            tools: [tool],
+            maxTokens: nil
+        )
+    }
+
+    /// At-limit tool schema size is accepted. Tight cap = 50 bytes; build a
+    /// schema that serializes to *exactly* 50 bytes so the `>` boundary is
+    /// genuinely pinned (cap+1 would reject; cap must not).
+    func testToolSchemaSizeAtLimitAccepted() throws {
+        let request = requestWithToolSchemaSize(50)  // exactly the cap
+        _ = try translateWithTightLimits(request)
+    }
+
+    /// Over-limit tool schema size is rejected with 413. Cap+1 byte.
+    func testToolSchemaSizeOverLimitRejected() {
+        let request = requestWithToolSchemaSize(51)  // 51 = cap + 1
+        assertLimitError(
+            { try translateWithTightLimits(request) },
+            expectedStatus: 413,
+            kindDescriptionContains: "tool schema"
+        )
+    }
+
+    /// The schema-size error names the byte count + limit, not the schema.
+    func testToolSchemaSizeErrorNamesBytesNotContent() {
+        let request = requestWithToolSchemaSize(51)
+        do {
+            _ = try translateWithTightLimits(request)
+            XCTFail("expected throw")
+        } catch let error as QoderTranslatorError {
+            let msg = error.localizedDescription
+            XCTAssertTrue(msg.contains("50"), "should report limit 50: \(msg)")
+            XCTAssertFalse(msg.contains("xxx"), "error must not echo schema content: \(msg)")
+        } catch {
+            XCTFail("expected QoderTranslatorError, got \(error)")
+        }
+    }
+
+    // -- Production defaults sanity -----------------------------------------
+
+    /// Production defaults are the values documented in the issue and ADR 0013.
+    /// Pins them so a future edit can't silently shrink them.
+    func testProductionDefaultsMatchIssue14() {
+        let d = QoderTranslatorLimits.default
+        XCTAssertEqual(d.maxMessages, 500)
+        XCTAssertEqual(d.maxImageBytes, 10 * 1024 * 1024)
+        XCTAssertEqual(d.maxTools, 128)
+        XCTAssertEqual(d.maxToolSchemaBytes, 1024 * 1024)
+    }
+
+    /// Defaults are injectable and a request that's over the tight limit but
+    /// under the production limit is accepted under `.default` — proving the
+    /// tight-limit rejections above are about the injected limits, not a hard
+    /// structural cap.
+    func testDefaultsAreInjectableAndMorePermissive() throws {
+        // 4 messages: rejected by tightLimits (cap 3), accepted by .default.
+        let msgs = (0..<4).map {
+            OpenAIChatMessage(role: "user", content: .text("m\($0)"), toolCalls: nil, toolCallID: nil)
+        }
+        let request = OpenAIChatRequest(model: "m", messages: msgs, tools: nil, maxTokens: nil)
+        XCTAssertThrowsError(try translateWithTightLimits(request))
+        _ = try QoderChatTranslator.translate(
+            request: request,
+            userID: "u", proxyAPIKey: "k",
+            modelConfig: QoderModelConfig(key: "m", isReasoning: false, maxOutputTokens: 32768, source: "system"),
+            options: .deferringToRandom,
+            limits: .default
+        )
+    }
+
+    // -- Status code propagation through QoderFailoverError -----------------
+
+    /// The translator error's httpStatus flows through QoderFailoverError so
+    /// that a size overage surfaces as 413 (not the historical hard-coded 400).
+    /// This is the contract ProxyBridge relies on to send the right status.
+    func testFailoverErrorSurfacesTranslatorStatusForSizeCap() {
+        // 413 path: image size overage.
+        let payload = Data(repeating: 0x41, count: 101).base64EncodedString()
+        let url = "data:image/png;base64,\(payload)"
+        let request = requestWithImageURL(url)
+        do {
+            _ = try translateWithTightLimits(request)
+            XCTFail("expected throw")
+        } catch let error as QoderTranslatorError {
+            let failover = QoderFailoverError.requestRejected(
+                error.localizedDescription, status: error.httpStatus
+            )
+            XCTAssertEqual(failover.httpStatus, 413)
+        } catch {
+            XCTFail("expected QoderTranslatorError, got \(error)")
+        }
+    }
+
+    func testFailoverErrorDefaultsTo400ForMalformed() {
+        // The default status (used by missing-model, gateway HTTP errors, etc.)
+        // is 400 — guards the backward-compatible shape for non-translator
+        // rejections.
+        let e = QoderFailoverError.requestRejected("missing model")
+        XCTAssertEqual(e.httpStatus, 400)
+    }
 }

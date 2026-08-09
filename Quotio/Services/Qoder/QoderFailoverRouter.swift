@@ -88,10 +88,13 @@ nonisolated struct QoderOpenedStream: Sendable {
 /// the router, not in error messages.
 nonisolated enum QoderFailoverError: Error, LocalizedError {
     /// The request body was rejected by the translator's fail-fast gate
-    /// (tools / images / malformed body). Maps to HTTP 400. (`stream: false`
-    /// is no longer rejected — non-streaming is served by aggregation, issue
-    /// #9 / ADR 0014.)
-    case requestRejected(String)
+    /// (Tier 2 semantic caps from issue #14, or a malformed body). `status`
+    /// is the HTTP code to surface: 400 for malformed/count caps,
+    /// 413 for byte-size caps (image, tool schema). Defaults to 400 for
+    /// callers that don't carry a translator error (e.g. missing model field).
+    /// (`stream: false` is no longer rejected — non-streaming is served by
+    /// aggregation, issue #9 / ADR 0014.)
+    case requestRejected(_ detail: String, status: Int = 400)
     /// No Qoder accounts are configured, or all are disabled / cooled down.
     /// Maps to HTTP 503 (no upstream available).
     case noAccountsAvailable
@@ -100,9 +103,18 @@ nonisolated enum QoderFailoverError: Error, LocalizedError {
     /// router owns it. Maps to HTTP 401.
     case missingProxyAPIKey
 
+    /// The HTTP status ProxyBridge should send for this error.
+    var httpStatus: Int {
+        switch self {
+        case .requestRejected(_, let status): return status
+        case .noAccountsAvailable: return 503
+        case .missingProxyAPIKey: return 401
+        }
+    }
+
     var errorDescription: String? {
         switch self {
-        case .requestRejected(let detail):
+        case .requestRejected(let detail, _):
             return detail
         case .noAccountsAvailable:
             return "No Qoder accounts available: add a PAT or wait for cooldown to clear."
@@ -204,19 +216,25 @@ actor QoderFailoverRouter {
     private let patService: any QoderPATRefreshing
     private let gateway: any QoderGatewayClientProtocol
     private let configuration: QoderFailoverRouterConfiguration
+    /// Tier 2 translator caps (issue #14). Default `.default`; tests inject
+    /// tighter values to exercise the rejection paths without crafting huge
+    /// request bodies.
+    private let translatorLimits: QoderTranslatorLimits
 
     init(
         vault: any MonitorCredentialStore,
         metadata: MonitorMetadataStore = .shared,
         patService: any QoderPATRefreshing,
         gateway: any QoderGatewayClientProtocol,
-        configuration: QoderFailoverRouterConfiguration = .default
+        configuration: QoderFailoverRouterConfiguration = .default,
+        translatorLimits: QoderTranslatorLimits = .default
     ) {
         self.vault = vault
         self.metadata = metadata
         self.patService = patService
         self.gateway = gateway
         self.configuration = configuration
+        self.translatorLimits = translatorLimits
     }
 
     // MARK: - Public entry point
@@ -440,13 +458,19 @@ actor QoderFailoverRouter {
                 body: requestBody,
                 userID: userID,
                 proxyAPIKey: proxyAPIKey,
-                modelConfig: modelConfig
+                modelConfig: modelConfig,
+                limits: translatorLimits
             )
         } catch let error as QoderTranslatorError {
-            // Fail-fast gates (tools / images / malformed). Map to a rejected
-            // request — ProxyBridge returns HTTP 400. Not account-specific, so
-            // throw the terminal error, not a rotation-eligible one.
-            throw QoderFailoverError.requestRejected(error.localizedDescription)
+            // Fail-fast gates (Tier 2 semantic caps from issue #14, or a
+            // malformed body). Map to a rejected request, surfacing the
+            // translator's chosen HTTP status (400 for malformed/count caps,
+            // 413 for byte-size caps) so the agent sees the precise OpenAI
+            // error. Not account-specific, so throw the terminal error, not a
+            // rotation-eligible one.
+            throw QoderFailoverError.requestRejected(
+                error.localizedDescription, status: error.httpStatus
+            )
         }
 
         let cosyCredentials = QoderCOSYCredentials(
@@ -507,13 +531,14 @@ actor QoderFailoverRouter {
         case 500...599:
             throw QoderAccountFailure(kind: .transient, status: status)
         default:
-            // 4xx other than 429/401/403 (e.g. 400 bad request, 404, 422) is
-            // a request-level rejection, not an account-level one — rotating
-            // accounts won't fix a malformed envelope. Surface it as a
-            // terminal request rejection so ProxyBridge returns the real
-            // status to the agent.
+            // 4xx other than 429/401/403 (e.g. 400 bad request, 404, 413, 422)
+            // is a request-level rejection, not an account-level one — rotating
+            // accounts won't fix a malformed envelope. Surface it as a terminal
+            // request rejection, passing the gateway's status through so
+            // ProxyBridge returns the real status (400/404/413/422/...) to the
+            // agent rather than collapsing them all to 400.
             throw QoderFailoverError.requestRejected(
-                "Qoder gateway returned HTTP \(status) (non-rotatable)."
+                "Qoder gateway returned HTTP \(status) (non-rotatable).", status: status
             )
         }
     }
@@ -632,9 +657,10 @@ actor QoderFailoverRouter {
             default:
                 // Other non-200 codes inside the envelope are request-level
                 // rejections, same as the HTTP-status path — rotating accounts
-                // won't fix a malformed envelope.
+                // won't fix a malformed envelope. Pass the in-envelope status
+                // through so ProxyBridge returns it verbatim to the agent.
                 throw QoderFailoverError.requestRejected(
-                    "Qoder upstream returned status \(signal) (non-rotatable)."
+                    "Qoder upstream returned status \(signal) (non-rotatable).", status: signal
                 )
             }
         }
