@@ -26,8 +26,9 @@
 //  ADR 0009 §Consequences anticipates the allowlist growing: issue #10
 //  (`/v1/models` merge) and issue #11 (`/v1/responses` adapter) add entries.
 //  #11 has landed — `/v1/responses` is already an allowed route here; excluding
-//  it would regress #11. #10 is path-level (`GET /v1/models` carries no body
-//  model and never matched the prefix test) and remains unaffected.
+//  it would regress #11. #10 has landed too — `GET /v1/models` is intercepted
+//  separately in `ProxyBridge.processRequest` (ADR 0016), independent of this
+//  gate, which still never matches it (no body model on a GET).
 //
 //  Pure value type — no I/O, no actor state. `nonisolated enum` with a single
 //  static method so it opts out of the project's MainActor default and is

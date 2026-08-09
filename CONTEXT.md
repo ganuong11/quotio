@@ -38,7 +38,10 @@ An in-process `NWListener` in Quotio that sits between CLI agents and CPA. Today
 _Avoid_: bridge, proxy (ambiguous with CPA)
 
 **Routing discriminator**:
-The rule ProxyBridge uses to decide whether a request is Qoder-bound (and therefore takes the COSY path) or CPA-bound. A conjunctive allowlist: body `model:` starts with `qoder/` **and** method is `POST` **and** path is an explicitly supported endpoint (today: `/v1/chat/completions`; extensible as #451/#452 land). A `qoder/` model on anything else is rejected with a Qoder-owned 404 — it does not fall through to CPA. ADR 0003 (prefix) refined by ADR 0009 (method+path).
+The rule ProxyBridge uses to decide whether a request is Qoder-bound (and therefore takes the COSY path) or CPA-bound. A conjunctive allowlist: body `model:` starts with `qoder/` **and** method is `POST` **and** path is an explicitly supported endpoint (today: `/v1/chat/completions` and `/v1/responses`; extensible as #451/#452 land). A `qoder/` model on anything else is rejected with a Qoder-owned 404 — it does not fall through to CPA. ADR 0003 (prefix) refined by ADR 0009 (method+path).
+
+**/v1/models merge**:
+`GET /v1/models` is intercepted by ProxyBridge and answered with CPA's list plus the Qoder catalog under `qoder/<id>` (one entry per `QoderModelRegistry` seed key, `created` pinned to the 2026-08-03 catalog-refresh epoch). Any failure — non-2xx from CPA, unparseable body, merge error — degrades to raw CPA passthrough (the agent sees exactly what CPA sent), so model discovery never breaks. The merge only runs when `qoderRouter` is wired; otherwise the endpoint stays a pure passthrough. The endpoint stays on CPA's auth surface (client `Authorization` flows through; `QoderAccessValidator` is not involved). ADR 0016 reverses ADR 0003 §3.
 
 **QoderAccessValidator**:
 The in-process API-key gate that owns authentication on the Qoder path, since CPA's `AuthMiddleware` is bypassed for `qoder/*` traffic. Mirrors CPA's `config_access` provider exactly — same five candidate sources (`Authorization` Bearer-or-bare, `X-Api-Key`, `X-Goog-Api-Key`, `?key=`, `?auth_token=`), same `401` failure shapes, same key set (a CPA-sourced snapshot reloaded on the `fetchAPIKeys()` cadence). ADR 0008.

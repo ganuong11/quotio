@@ -30,6 +30,10 @@ Three facets, all chosen for minimum surface in Phase 2:
    `qoder/auto` etc. in their agent config; Quotio may surface the model list
    in-app as documentation.
 
+   > **Superseded by ADR 0016 for the `/v1/models` facet** — `GET /v1/models`
+   > is now intercepted by ProxyBridge and answered with CPA's list merged with
+   > the Qoder catalog under `qoder/<id>`. §1 and §2 stand.
+
 The registry sits behind an actor so a future dynamic fetch (COSY-signed
 `/model/list?Encode=1`) can slot in without touching the routing path. When
 enabled, the cache lives at `~/Library/Application Support/Quotio/qoder-models.json`

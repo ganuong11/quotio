@@ -85,7 +85,17 @@ nonisolated enum QoderModelRegistry {
     ]
 
     /// Convenience: just the keys, for membership tests and UI listings.
+    /// Unordered (`Set`) — use this for `contains` checks and dedupe, never for
+    /// ordered enumeration.
     static let knownIDs: Set<String> = Set(entries.map { $0.key })
+
+    /// The catalog keys in SEED (declaration) order. Issue #10 / ADR 0016: the
+    /// `/v1/models` merger enumerates the catalog in this order so the merged
+    /// list is deterministic across calls and across process restarts (iterating
+    /// `knownIDs` would give an arbitrary order — Set iteration is unstable).
+    /// The seed order IS the stable display order; the dynamic-fetch follow-up
+    /// (#446) will need to define its own ordering when it replaces the seed.
+    static let catalogKeys: [String] = entries.map { $0.key }
 
     /// Whether an ID (already prefix-stripped) is in the known catalog. Used by
     /// ProxyBridge to short-circuit obviously-wrong IDs in error messages; NOT

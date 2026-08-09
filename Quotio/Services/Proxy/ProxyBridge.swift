@@ -534,6 +534,44 @@ final class ProxyBridge {
         Task { @MainActor [weak self] in
             guard let self = self else { return }
 
+            // Issue #10 / ADR 0016: GET /v1/models is intercepted at the path
+            // level and answered with CPA's list merged with the Qoder catalog
+            // under `qoder/<id>`. This intercept runs INDEPENDENTLY of the
+            // Qoder route gate (ADR 0009) — `GET /v1/models` carries no body
+            // model and never matched the prefix test, so without this branch
+            // it would fall through to CPA and `qoder/<id>` models would stay
+            // invisible to model-discovery clients (the trade ADR 0003 §3
+            // deferred). Reversing that trade (ADR 0016) means ProxyBridge now
+            // owns response-shaping for exactly this one endpoint. The gate
+            // below is untouched; the Qoder branch is also untouched.
+            //
+            // The intercept reads `qoderRouter` to decide whether to merge: if
+            // the Qoder branch is disabled (router nil), advertising Qoder
+            // models would be a lie (they couldn't be served), so we forward
+            // raw to CPA and let `serveModelsList` degrade to passthrough. That
+            // read is MainActor-safe — this block already runs on MainActor.
+            if method == "GET", QoderRouteGate.pathWithoutQuery(path) == "/v1/models" {
+                // Compute `shouldMerge` and capture MainActor-isolated state
+                // (`targetPort`, `targetHost`, `qoderRouter`) here so
+                // `serveModelsList` can be `nonisolated` like `forwardRequest`
+                // — it never touches MainActor-isolated state itself, and all
+                // its callbacks (NWConnection state/receive) are nonisolated.
+                let shouldMerge = (self.qoderRouter != nil)
+                self.serveModelsList(
+                    path: path,
+                    headers: headers,
+                    originalConnection: connection,
+                    connectionId: connectionId,
+                    startTime: startTime,
+                    requestSize: requestSize,
+                    metadata: metadata,
+                    targetPort: self.targetPort,
+                    targetHost: self.targetHost,
+                    shouldMerge: shouldMerge
+                )
+                return
+            }
+
             // Qoder branch: route to the failover router and return — the CPA
             // path (fallback + forwardRequest) does not run for qoder/ models.
             // `.notQoder` (no qoder/ prefix) skips this branch entirely; the
@@ -825,6 +863,371 @@ final class ProxyBridge {
         return (provider, model, method, path)
     }
     
+    // MARK: - Models List Merge (Issue #10 / ADR 0016)
+
+    /// Intercept `GET /v1/models` and answer with CPA's list merged with the
+    /// Qoder catalog (issue #10, ADR 0016 — reverses ADR 0003 §3).
+    ///
+    /// This owns response-shaping for exactly one endpoint. The flow:
+    ///   1. Open an `NWConnection` to `targetHost:targetPort` mirroring
+    ///      `forwardRequest`'s setup (10s timeout, `.failed` → 502).
+    ///   2. Send `GET <original path incl. query> HTTP/1.1` with the client's
+    ///      headers (Authorization etc. flow through verbatim — CPA's
+    ///      AuthMiddleware applies to /v1/models and the client's credentials
+    ///      must reach it; the QoderAccessValidator does NOT apply here, this
+    ///      endpoint stays on CPA's auth surface) + forced `Connection: close`.
+    ///   3. Accumulate ALL response bytes until the target connection completes
+    ///      (single `Data` buffer; cap at 16 MiB — a models list is KB; on
+    ///      overflow give up with a 502 rather than risk an unbounded buffer).
+    ///   4. On the full response: try `QoderModelsMerger.extractHTTPBody` +
+    ///      `mergeQoderModels`. On success, emit `HTTP/1.1 200 OK` with the
+    ///      merged JSON body. On ANY failure (non-2xx upstream, body parse
+    ///      failure, merge failure), forward CPA's RAW response bytes verbatim
+    ///      (status line included) — model discovery must never break.
+    ///   5. Record the request via `onRequestCompleted` so RequestTracker sees
+    ///      it.
+    ///
+    /// The merge is only attempted when `qoderRouter` is non-nil: advertising
+    /// Qoder models while the Qoder branch is disabled would be a lie (the
+    /// merged `qoder/<id>` ids couldn't be served). With a nil router we still
+    /// proxy to CPA and forward its raw response — `/v1/models` keeps working
+    /// as a passthrough, just without the merge. This read is MainActor-safe
+    /// (this method is MainActor-isolated like its enclosing class).
+    ///
+    /// The accumulation design (one buffer, drain-until-close) is deliberate:
+    /// `forwardRequest` forces `Connection: close` upstream for unrelated
+    /// reasons (stale-connection bugs), so the full response is guaranteed to
+    /// land before `isComplete` fires. That lets the network code stay dumb
+    /// while the framing/merge logic lives in the pure `QoderModelsMerger`
+    /// (unit-tested without NWConnection). A streaming-merge was considered
+    /// and rejected — see ADR 0016 §Considered Options.
+    private nonisolated func serveModelsList(
+        path: String,
+        headers: [(String, String)],
+        originalConnection: NWConnection,
+        connectionId: Int,
+        startTime: Date,
+        requestSize: Int,
+        metadata: (provider: String?, model: String?, method: String, path: String),
+        targetPort: UInt16,
+        targetHost: String,
+        shouldMerge: Bool
+    ) {
+        // Only merge when the Qoder branch is servable. Advertising qoder/<id>
+        // while the router is nil would mislead discovery clients. With a nil
+        // router we still proxy to CPA and forward raw (the merge attempt in
+        // step 4 below just no-ops when `shouldMerge` is false). `shouldMerge`
+        // is computed by the caller on MainActor (where `qoderRouter` lives)
+        // and passed in, so this method itself needs no MainActor hop to read
+        // router state — matching `forwardRequest`'s `nonisolated` shape.
+        guard let port = NWEndpoint.Port(rawValue: targetPort) else {
+            sendError(to: originalConnection, statusCode: 500, message: "Invalid target port")
+            return
+        }
+
+        let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(targetHost), port: port)
+
+        let tcpOptions = NWProtocolTCP.Options()
+        tcpOptions.enableKeepalive = true
+        tcpOptions.keepaliveIdle = 30
+        tcpOptions.keepaliveInterval = 5
+        tcpOptions.keepaliveCount = 3
+        let parameters = NWParameters(tls: nil, tcp: tcpOptions)
+
+        let targetConnection = NWConnection(to: endpoint, using: parameters)
+
+        // `connectionTimeoutSeconds` is a `let` (immutable), so reading it from
+        // a nonisolated context is fine — no MainActor hop needed. Matches the
+        // existing `forwardRequest` pattern.
+        let timeoutSeconds = self.connectionTimeoutSeconds
+
+        // Class-based wrapper for a thread-safe cancellation flag, matching
+        // `forwardRequest`'s pattern.
+        final class TimeoutState: @unchecked Sendable {
+            var cancelled = false
+        }
+        let timeoutState = TimeoutState()
+
+        DispatchQueue.global().asyncAfter(deadline: .now() + .seconds(Int(timeoutSeconds))) { [weak targetConnection] in
+            guard !timeoutState.cancelled else { return }
+            guard let conn = targetConnection, conn.state != .ready else { return }
+            conn.cancel()
+        }
+
+        let capturedHeaders = headers
+        let capturedPath = path
+        let capturedTargetHost = targetHost
+        let capturedTargetPort = targetPort
+        // Cap the accumulated response at 16 MiB. A models list is KB; exceeding
+        // the cap signals a misbehaving upstream (or a non-models response), so
+        // we abort with a 502 rather than risk an unbounded buffer. Rationale in
+        // ADR 0016 (Bounded accumulation).
+        let maxAccumBytes = 16 * 1024 * 1024
+
+        targetConnection.stateUpdateHandler = { [weak self] state in
+            guard let self = self else { return }
+
+            switch state {
+            case .ready:
+                timeoutState.cancelled = true
+                // Reconstruct the request line + header section. The path is
+                // forwarded verbatim (query string preserved) so a client
+                // request like `GET /v1/models?limit=10` reaches CPA intact.
+                var forwardedHeader = "GET \(capturedPath) HTTP/1.1\r\n"
+
+                // Forward the client's headers, excluding the ones
+                // `forwardRequest` also overrides (and `accept-encoding` so CPA
+                // doesn't ship a gzip body that would defeat the merge). Auth
+                // headers MUST flow through — CPA's AuthMiddleware gates
+                // /v1/models, and the QoderAccessValidator does NOT apply
+                // here (this endpoint stays on CPA's auth surface, ADR 0016).
+                let excludedHeaders: Set<String> = ["connection", "content-length", "host", "transfer-encoding", "accept-encoding"]
+                for (name, value) in capturedHeaders {
+                    if !excludedHeaders.contains(name.lowercased()) {
+                        forwardedHeader += "\(name): \(value)\r\n"
+                    }
+                }
+
+                forwardedHeader += "Host: \(capturedTargetHost):\(capturedTargetPort)\r\n"
+                forwardedHeader += "Connection: close\r\n"
+                forwardedHeader += "\r\n"
+
+                guard let requestData = forwardedHeader.data(using: .utf8) else {
+                    self.sendError(to: originalConnection, statusCode: 500, message: "Failed to encode request")
+                    targetConnection.cancel()
+                    return
+                }
+
+                targetConnection.send(content: requestData, completion: .contentProcessed { error in
+                    if error != nil {
+                        targetConnection.cancel()
+                        originalConnection.cancel()
+                    } else {
+                        // Begin accumulating the response. `receiveModelsList`
+                        // drains until `isComplete` (Connection: close), then
+                        // hands the whole buffer to the merge decision.
+                        self.receiveModelsList(
+                            from: targetConnection,
+                            to: originalConnection,
+                            connectionId: connectionId,
+                            startTime: startTime,
+                            requestSize: requestSize,
+                            metadata: metadata,
+                            responseData: Data(),
+                            shouldMerge: shouldMerge,
+                            maxAccumBytes: maxAccumBytes
+                        )
+                    }
+                })
+
+            case .failed:
+                timeoutState.cancelled = true
+                self.sendError(to: originalConnection, statusCode: 502, message: "Bad Gateway - Cannot connect to proxy")
+                targetConnection.cancel()
+
+            default:
+                break
+            }
+        }
+
+        targetConnection.start(queue: .global(qos: .userInitiated))
+    }
+
+    /// Accumulate an upstream `GET /v1/models` response until the target
+    /// connection completes (Connection: close guarantees the full response
+    /// lands), then either merge + emit, or forward CPA's raw bytes verbatim.
+    /// See `serveModelsList` for the decision tree.
+    private nonisolated func receiveModelsList(
+        from targetConnection: NWConnection,
+        to originalConnection: NWConnection,
+        connectionId: Int,
+        startTime: Date,
+        requestSize: Int,
+        metadata: (provider: String?, model: String?, method: String, path: String),
+        responseData: Data,
+        shouldMerge: Bool,
+        maxAccumBytes: Int
+    ) {
+        targetConnection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
+            guard let self = self else { return }
+
+            if error != nil {
+                // Transport error mid-response. We have no full response to
+                // merge or forward — emit a 502 (same degradation as
+                // `forwardRequest` on transport failure).
+                targetConnection.cancel()
+                self.sendError(to: originalConnection, statusCode: 502, message: "Bad Gateway - Upstream error")
+                return
+            }
+
+            var accumulated = responseData
+            if let data = data, !data.isEmpty {
+                accumulated.append(data)
+            }
+
+            // Bounded buffer: a models list is KB. If CPA shipped more than the
+            // cap, something is wrong (wrong endpoint, non-models response) —
+            // abort with a 502 rather than risk OOM. The merge never sees this
+            // path; the raw-passthrough fallback also never runs.
+            if accumulated.count > maxAccumBytes {
+                targetConnection.cancel()
+                self.sendError(to: originalConnection, statusCode: 502, message: "Bad Gateway - Response too large")
+                return
+            }
+
+            if isComplete {
+                // Full response in hand — Connection: close means the upstream
+                // is now EOF'd. Decide merge vs. raw passthrough.
+                targetConnection.cancel()
+                self.finishModelsList(
+                    accumulatedResponse: accumulated,
+                    originalConnection: originalConnection,
+                    connectionId: connectionId,
+                    startTime: startTime,
+                    requestSize: requestSize,
+                    metadata: metadata,
+                    shouldMerge: shouldMerge
+                )
+            } else {
+                // More bytes may arrive — keep draining into the same buffer.
+                DispatchQueue.global(qos: .userInitiated).async {
+                    self.receiveModelsList(
+                        from: targetConnection,
+                        to: originalConnection,
+                        connectionId: connectionId,
+                        startTime: startTime,
+                        requestSize: requestSize,
+                        metadata: metadata,
+                        responseData: accumulated,
+                        shouldMerge: shouldMerge,
+                        maxAccumBytes: maxAccumBytes
+                    )
+                }
+            }
+        }
+    }
+
+    /// Decide merge vs. raw-passthrough for an accumulated `GET /v1/models`
+    /// response, emit the agent-facing response, and record the request.
+    ///
+    /// Merge path (only when `shouldMerge` AND CPA returned 2xx AND
+    /// `extractHTTPBody` + `mergeQoderModels` both succeed): emit
+    /// `HTTP/1.1 200 OK` + `Content-Type: application/json` + the merged body.
+    /// Any failure → forward CPA's RAW response bytes verbatim (status line
+    /// included) so the agent sees exactly what CPA sent. Rationale
+    /// (ADR 0016 §Decision): any merge failure must not break model discovery,
+    /// and forwarding raw keeps CPA's own error envelopes visible to the agent.
+    private nonisolated func finishModelsList(
+        accumulatedResponse: Data,
+        originalConnection: NWConnection,
+        connectionId: Int,
+        startTime: Date,
+        requestSize: Int,
+        metadata: (provider: String?, model: String?, method: String, path: String),
+        shouldMerge: Bool
+    ) {
+        // Try the merge. Every guard in this block falls through to raw
+        // passthrough — the only way to get the merged body is to pass ALL of:
+        // (a) `shouldMerge` (qoderRouter wired), (b) CPA returned 2xx, (c) body
+        // extraction succeeds, (d) merge succeeds.
+        var mergedBody: Data? = nil
+        var sentStatusCode: Int?
+        if shouldMerge,
+           let status = Self.statusCode(from: accumulatedResponse),
+           (200..<300).contains(status),
+           let body = QoderModelsMerger.extractHTTPBody(from: accumulatedResponse),
+           let merged = QoderModelsMerger.mergeQoderModels(into: body) {
+            mergedBody = merged
+            sentStatusCode = 200  // CPA returns 200 for models; emit 200 on success.
+        } else {
+            // Record the status CPA actually returned (for the no-merge /
+            // passthrough path) so RequestTracker sees the real outcome. nil
+            // when the status line is unparseable (e.g. CPA closed with zero
+            // bytes) — matches `recordCompletion`'s behavior of recording nil
+            // rather than fabricating a 200.
+            sentStatusCode = Self.statusCode(from: accumulatedResponse)
+        }
+
+        if let mergedBody = mergedBody {
+            // Merge succeeded — emit a fresh response with our merged body.
+            let header = "HTTP/1.1 200 OK\r\n" +
+                "Content-Type: application/json\r\n" +
+                "Content-Length: \(mergedBody.count)\r\n" +
+                "Connection: close\r\n" +
+                "\r\n"
+            var responseData = Data()
+            if let headerData = header.data(using: .utf8) {
+                responseData.append(headerData)
+            }
+            responseData.append(mergedBody)
+
+            originalConnection.send(content: responseData, completion: .contentProcessed { _ in
+                originalConnection.send(content: nil, isComplete: true, completion: .contentProcessed { _ in
+                    originalConnection.cancel()
+                })
+            })
+        } else {
+            // Degrade to raw passthrough — forward CPA's exact bytes (status
+            // line + headers + body) so the agent sees what CPA sent. This is
+            // the ADR 0016 §Decision safety net: any merge failure must not
+            // break model discovery, and forwarding raw keeps CPA's own errors
+            // (e.g. 401 Unauthorized) visible to the agent verbatim.
+            originalConnection.send(content: accumulatedResponse, completion: .contentProcessed { _ in
+                originalConnection.send(content: nil, isComplete: true, completion: .contentProcessed { _ in
+                    originalConnection.cancel()
+                })
+            })
+        }
+
+        // Record the request so RequestTracker sees it (same pattern as
+        // `recordCompletion`, minus the fallback bookkeeping — this endpoint
+        // doesn't participate in fallback). Provider is nil: `/v1/models` isn't
+        // a provider-specific call, and the metadata's provider field is
+        // derived from path/model heuristics that don't apply here.
+        let durationMs = Int(Date().timeIntervalSince(startTime) * 1000)
+        let responseSize = accumulatedResponse.count
+        let capturedStatusCode = sentStatusCode
+        let capturedMetadata = metadata
+        let capturedStartTime = startTime
+        let capturedRequestSize = requestSize
+        Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            let requestMetadata = RequestMetadata(
+                timestamp: capturedStartTime,
+                method: capturedMetadata.method,
+                path: capturedMetadata.path,
+                provider: capturedMetadata.provider,
+                model: capturedMetadata.model,
+                resolvedModel: nil,
+                resolvedProvider: nil,
+                statusCode: capturedStatusCode,
+                durationMs: durationMs,
+                requestSize: capturedRequestSize,
+                responseSize: responseSize,
+                fallbackAttempts: [],
+                fallbackStartedFromCache: false,
+                responseSnippet: nil
+            )
+            self.onRequestCompleted?(requestMetadata)
+        }
+    }
+
+    /// Parse the HTTP status code from the first line of a whole HTTP response
+    /// (`HTTP/1.1 200 OK`). Returns nil if the line is missing or malformed.
+    /// Used by `finishModelsList` to decide merge-vs-passthrough and to report
+    /// the upstream status to RequestTracker. `nonisolated` so the models-merge
+    /// path (which is `nonisolated`, like `forwardRequest`) can call it without
+    /// a MainActor hop.
+    private nonisolated static func statusCode(from response: Data) -> Int? {
+        guard let prefix = String(data: response.prefix(64), encoding: .utf8),
+              let statusLine = prefix.components(separatedBy: "\r\n").first else {
+            return nil
+        }
+        let parts = statusLine.components(separatedBy: " ")
+        guard parts.count >= 2, let code = Int(parts[1]) else { return nil }
+        return code
+    }
+
     // MARK: - Request Forwarding
 
     private nonisolated func forwardRequest(
