@@ -164,6 +164,45 @@ final class QoderResponsesTranslatorTests: XCTestCase {
         XCTAssertEqual(parsed.messages[1].content, .text("hi"))
     }
 
+    // MARK: - Reasoning intent vocabulary (issue #27)
+
+    /// A Responses body with `reasoning_effort` parses through the shared
+    /// `QoderReasoningVocabulary` into the request's `reasoningIntent`. Pins
+    /// the Responses path on the shared vocabulary so a future revert to a
+    /// local helper here would be caught.
+    func testReasoningEffortParsesToIntent() throws {
+        let req = try QoderResponsesTranslator.parseResponses(body: body([
+            "model": "qoder/x",
+            "input": "hi",
+            "reasoning_effort": "high",
+        ]))
+        XCTAssertEqual(req.reasoningIntent, .enabled(effort: "high"))
+    }
+
+    /// Unknown effort strings (not a tier, not an alias) clamp to "medium",
+    /// the same rule the Chat path applies.
+    func testReasoningEffortClampsUnknown() throws {
+        let req = try QoderResponsesTranslator.parseResponses(body: body([
+            "model": "qoder/x",
+            "input": "hi",
+            "reasoning_effort": "superduper",
+        ]))
+        XCTAssertEqual(req.reasoningIntent, .enabled(effort: "medium"))
+    }
+
+    /// The synthesized Chat body carries the intent as `reasoning_effort`, so
+    /// `synthesizeChatBody` round-trips through the Chat translator with the
+    /// intent preserved end-to-end on the Responses path.
+    func testSynthesizeChatBodyCarriesReasoningEffort() throws {
+        let synthesized = try QoderResponsesTranslator.synthesizeChatBody(from: body([
+            "model": "qoder/x",
+            "input": "hi",
+            "reasoning_effort": "low",
+        ]))
+        let parsed = try QoderChatTranslator.parse(body: synthesized)
+        XCTAssertEqual(parsed.reasoningIntent, .enabled(effort: "low"))
+    }
+
     // MARK: - Errors
 
     /// Missing/empty `model` → malformedRequest.
