@@ -244,8 +244,17 @@ actor QoderFailoverRouter {
     /// `QoderFailoverError` if no account can serve the request.
     ///
     /// `proxyAPIKey` is the `Bearer` key from the agent's request — used in
-    /// the session-ID derivation (ADR 0005 §1) and validated non-empty here
-    /// (CPA is bypassed for Qoder, so we own key validation).
+    /// the session-ID derivation (ADR 0005 §1) and validated non-empty here.
+    /// As of issue #21 / ADR 0008, API-key authentication against CPA's
+    /// `config_access` provider is owned by `QoderAccessValidator` in
+    /// `ProxyBridge.forwardQoderRequest` BEFORE this method is reached, so by
+    /// the time we get here `proxyAPIKey` is either the CPA-authenticated
+    /// principal or a legacy fallback value. The `guard !proxyAPIKey.isEmpty`
+    /// below stays as a safety net: it fires for a credential-less request on
+    /// the open-access legacy paths (`.notConfigured` / validator-nil fallback
+    /// with an empty Bearer suffix), which keeps the pre-issue-#21 behavior of
+    /// rejecting credential-less Qoder requests (session-ID material is
+    /// required); this method's logic is otherwise unchanged.
     ///
     /// `userID` (resolved from the chosen credential) feeds the session-ID
     /// derivation; the translator hashes `(userID, model, proxyAPIKey)` into

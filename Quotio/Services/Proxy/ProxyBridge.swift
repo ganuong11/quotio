@@ -155,6 +155,16 @@ final class ProxyBridge {
     /// path (`forwardRequest`) is untouched regardless of this property.
     var qoderRouter: QoderFailoverRouter?
 
+    /// Qoder-path API-key validator (ADR 0008, issue #21). When non-nil,
+    /// `forwardQoderRequest` authenticates every Qoder request against this
+    /// validator's snapshot before forwarding — mirroring CPA's `config_access`
+    /// provider so Qoder and non-Qoder traffic authenticate identically. Wired
+    /// by `QuotaViewModel` at proxy start alongside `qoderRouter`; nil in tests
+    /// (where case the bridge falls back to legacy Bearer-suffix extraction,
+    /// preserving the pre-issue-#21 behaviour). Reloaded on the existing
+    /// `fetchAPIKeys()` cadence — no per-request I/O.
+    var accessValidator: QoderAccessValidator?
+
     // MARK: - Request Metadata
 
     /// Metadata extracted from proxied requests
@@ -568,7 +578,14 @@ final class ProxyBridge {
                     effectiveBody = body
                     responsesMode = false
                 }
-                self.forwardQoderRequest(
+                // `forwardQoderRequest` is `async` (issue #21: it awaits
+                // `QoderAccessValidator.authenticate`). This block runs inside
+                // a `Task { @MainActor }` (see `processRequest`); the await is
+                // a single hop into the validator actor, suspending the
+                // MainActor meanwhile. `router` and the request inputs are all
+                // captured before the await and never re-read afterwards, so
+                // the suspension cannot observe changed bridge state.
+                await self.forwardQoderRequest(
                     router: router,
                     method: method,
                     path: path,
@@ -997,17 +1014,85 @@ final class ProxyBridge {
         requestSize: Int,
         requestModel: String,
         responsesMode: Bool = false   // Issue #11
-    ) {
-        // Extract the proxy API key from `Authorization: Bearer <key>`. The
-        // router uses it for session-ID derivation (ADR 0005 §1) and validates
-        // it non-empty (CPA is bypassed for Qoder, so we own key validation).
-        let proxyAPIKey = headers.first(where: { $0.0.lowercased() == "authorization" })?
-            .1
-            .components(separatedBy: " ")
-            .dropFirst()
-            .joined(separator: " ")
-            .trimmingCharacters(in: .whitespaces)
-        ?? ""
+    ) async {
+        // ADR 0008 / issue #21: authenticate the Qoder request against a
+        // CPA-mirrored validator before forwarding. The Qoder branch bypasses
+        // CPA's `AuthMiddleware`, so ProxyBridge owns API-key validation for
+        // `qoder/*` traffic. The validator mirrors CPA's `config_access`
+        // provider (five candidate sources, presence-based missing check,
+        // primed-empty-set pass-through, constant-time compare). On
+        // `.allowed(principal:)` the matched candidate value becomes the proxy
+        // API key used downstream (CPA parity: `userApiKey = result.Principal`).
+        // On `.notConfigured` (primed, empty key set) we fall back to legacy
+        // Bearer-suffix extraction — CPA's "no providers → allow all" legacy
+        // behaviour. On `.notPrimed` / `.missing` / `.invalid` we short-circuit
+        // (503 / 401 / 401). When the validator is nil (tests, or Qoder not
+        // wired) we fall back to legacy extraction too, preserving
+        // pre-issue-#21 behaviour.
+        //
+        // The legacy Bearer-suffix extraction is retained as a small local
+        // helper for the two fallback cases (`.notConfigured` and validator
+        // nil). It is intentionally not CPA-faithful — it is the pre-issue-#21
+        // behaviour, kept only for the open-access fallback so an unconfigured
+        // validator behaves exactly as before.
+        func legacyBearerExtraction() -> String {
+            headers.first(where: { $0.0.lowercased() == "authorization" })?
+                .1
+                .components(separatedBy: " ")
+                .dropFirst()
+                .joined(separator: " ")
+                .trimmingCharacters(in: .whitespaces)
+            ?? ""
+        }
+
+        let proxyAPIKey: String
+        if let validator = self.accessValidator {
+            switch await validator.authenticate(path: path, headers: headers) {
+            case .allowed(let principal):
+                // CPA parity: userApiKey = result.Principal. The matched
+                // candidate value flows downstream for session-ID derivation
+                // and as the user-attribution key.
+                proxyAPIKey = principal
+            case .notConfigured:
+                // Primed but no api-keys configured → open-access legacy
+                // behaviour for requests carrying some Bearer value (CPA:
+                // provider unregistered → AuthMiddleware allows all requests).
+                proxyAPIKey = legacyBearerExtraction()
+            case .notPrimed:
+                // The validator has not yet received its first key snapshot
+                // (startProxy primes it with a dedicated fetch before serving
+                // begins — see QuotaViewModel). Fail CLOSED: the key set is
+                // unknown, not known-empty, so this must not degrade to open
+                // access. There is no CPA analogue (CPA loads its config keys
+                // before accepting requests); 503 signals "try again shortly".
+                self.sendError(
+                    to: originalConnection,
+                    statusCode: 503,
+                    message: "Qoder API-key validation is not ready yet — the proxy key snapshot has not loaded. Retry in a moment."
+                )
+                return
+            case .missing:
+                // No candidate source present → CPA's
+                // `NewNoCredentialsError` ("Missing API key"). NOTE: CPA
+                // itself sends `{"error":"Missing API key"}` (plain string);
+                // issue #21 prescribes the ADR 0010 OpenAI envelope instead,
+                // which `sendError` applies here — deliberate divergence from
+                // the literal CPA body shape, recorded for future auditors.
+                self.sendError(to: originalConnection, statusCode: 401, message: "Missing API key")
+                return
+            case .invalid:
+                // Candidate(s) present, none matched → CPA's
+                // `NewInvalidCredentialError` ("Invalid API key"). Same
+                // envelope-vs-plain-string divergence as `.missing` above
+                // (issue #21 / ADR 0010).
+                self.sendError(to: originalConnection, statusCode: 401, message: "Invalid API key")
+                return
+            }
+        } else {
+            // Validator not wired (tests, or Qoder branch disabled) → unchanged
+            // pre-issue-#21 behaviour.
+            proxyAPIKey = legacyBearerExtraction()
+        }
 
         // Issue #15: the body reaches here as `Data` straight from the parser
         // (no String round-trip on the hot path). The `qoder/` routing prefix

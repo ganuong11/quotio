@@ -1572,10 +1572,31 @@ final class QuotaViewModel {
                 gateway: QoderGatewayClient()
             )
 
+            // Wire up the Qoder API-key validator (ADR 0008, issue #21). The
+            // Qoder branch bypasses CPA's `AuthMiddleware`, so ProxyBridge owns
+            // API-key validation for `qoder/*` traffic. The validator holds a
+            // CPA-sourced key snapshot reloaded on the existing `fetchAPIKeys()`
+            // cadence (see `refreshData` / `fetchAPIKeys` below) — no per-request
+            // I/O. Until the first successful reload it is UNPRIMED and
+            // `authenticate` fails CLOSED with `.notPrimed` (503), never open
+            // access — see the dedicated priming fetch below. An empty-but-
+            // primed snapshot means "no api-keys configured" → `.notConfigured`
+            // (CPA legacy open access).
+            proxyManager.proxyBridge.accessValidator = QoderAccessValidator()
+
             try await proxyManager.start()
             setupAPIClient()
             startAutoRefresh()
             restartWarmupScheduler()
+
+            // Prime the Qoder API-key validator snapshot BEFORE the first
+            // request can be served (ADR 0008 / issue #21). CPA loads its
+            // config keys before accepting traffic; the dedicated fetch here
+            // closes the fail-open window between proxy start and the first
+            // heavyweight `refreshData()`. A fetch failure leaves the validator
+            // UNPRIMED — Qoder requests fail closed with 503 rather than
+            // silently opening access — and the periodic refresh below retries.
+            await primeQoderAccessValidator()
 
             // Start RequestTracker
             requestTracker.start()
@@ -1620,6 +1641,12 @@ final class QuotaViewModel {
         // ProxyBridge falls back to CPA for any in-flight qoder/ requests (the
         // CPA path is the unchanged default).
         proxyManager.proxyBridge.qoderRouter = nil
+
+        // Tear down the Qoder API-key validator alongside the router (ADR 0008,
+        // issue #21). A nil validator makes `forwardQoderRequest` fall back to
+        // legacy Bearer-suffix extraction, matching pre-issue-#21 behaviour for
+        // any straggler request during shutdown.
+        proxyManager.proxyBridge.accessValidator = nil
 
         proxyManager.stop()
         restartWarmupScheduler()
@@ -1747,7 +1774,18 @@ final class QuotaViewModel {
             }
 
             self.apiKeys = try await client.fetchAPIKeys()
-            
+
+            // ADR 0008 / issue #21: reload the Qoder API-key validator snapshot
+            // on the existing fetchAPIKeys cadence. The snapshot lives in the
+            // validator actor; `authenticate(...)` reads it off the request
+            // path with no per-request file I/O or network. A failed fetch
+            // skips this reload, leaving the previous snapshot in place (stale,
+            // never clobbered to empty). If this is the first successful fetch
+            // it also PRIMES the validator, flipping it out of the fail-closed
+            // `.notPrimed` state that `primeQoderAccessValidator()` may have
+            // left it in.
+            await proxyManager.proxyBridge.accessValidator?.reload(keys: self.apiKeys)
+
             // Clear any previous error on success
             errorMessage = nil
             
@@ -2778,11 +2816,35 @@ final class QuotaViewModel {
     
     func fetchAPIKeys() async {
         guard let client = apiClient else { return }
-        
+
         do {
             apiKeys = try await client.fetchAPIKeys()
+
+            // ADR 0008 / issue #21: reload the Qoder API-key validator snapshot
+            // after every add/update/delete on the API Keys screen (this wrapper
+            // is the single funnel for those mutations). Same no-per-request-I/O
+            // contract as the periodic refresh in `refreshData()`.
+            await proxyManager.proxyBridge.accessValidator?.reload(keys: apiKeys)
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Prime the Qoder access-validator key snapshot at proxy start (ADR 0008,
+    /// issue #21). Fetches the configured API keys from CPA's management API
+    /// and reloads the validator with them, so Qoder requests can authenticate
+    /// immediately instead of failing closed with `.notPrimed` until the first
+    /// periodic `refreshData()` succeeds. A fetch failure leaves the validator
+    /// unprimed (Qoder requests get a 503 "not ready" — fail closed, never
+    /// fail open) and the periodic refresh keeps retrying.
+    private func primeQoderAccessValidator() async {
+        guard let client = apiClient else { return }
+        do {
+            let keys = try await client.fetchAPIKeys()
+            apiKeys = keys
+            await proxyManager.proxyBridge.accessValidator?.reload(keys: keys)
+        } catch {
+            Log.quota("Qoder access validator priming failed (will retry on refresh): \(error.localizedDescription)")
         }
     }
     
