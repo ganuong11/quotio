@@ -23,7 +23,11 @@ struct FallbackContext: Sendable {
     let virtualModelName: String?
     let fallbackEntries: [FallbackEntry]
     let currentIndex: Int
-    let originalBody: String
+    /// Original request body, as parsed bytes (issue #15: no String
+    /// round-trip on the receive hot path; the body reaches us as `Data`
+    /// from `HTTP1RequestParser` and stays `Data` through the fallback
+    /// retry path).
+    let originalBody: Data
     let wasLoadedFromCache: Bool
     let attempts: [FallbackAttempt]
     let triedSanitization: Bool
@@ -84,7 +88,7 @@ struct FallbackContext: Sendable {
         virtualModelName: nil,
         fallbackEntries: [],
         currentIndex: 0,
-        originalBody: "",
+        originalBody: Data(),
         wasLoadedFromCache: false,
         attempts: [],
         triedSanitization: false
@@ -342,23 +346,39 @@ final class ProxyBridge {
         
         connection.start(queue: .global(qos: .userInitiated))
         
-        // Start receiving request
+        // Start receiving request. The parser is owned per-connection (a fresh
+        // value type per request — ProxyBridge forces Connection: close on the
+        // upstream so it processes exactly one request per agent connection).
         receiveRequest(
             from: connection,
             connectionId: connectionId,
             startTime: startTime,
-            accumulatedData: Data()
+            parser: HTTP1RequestParser()
         )
     }
     
     // MARK: - Request Receiving (Iterative)
-    
-    /// Receives HTTP request data iteratively to avoid stack overflow
+
+    /// Receives HTTP request data iteratively to avoid stack overflow.
+    ///
+    /// Drives `HTTP1RequestParser` (issue #15, ADR 0015) — bytes are fed to
+    /// the byte-wise parser on every NWConnection receive callback. The
+    /// parser returns one of:
+    ///   - `.needsMoreData` → keep reading (recurse via async dispatch to
+    ///     avoid stack growth).
+    ///   - `.complete(HTTP1Request)` → call `processRequest` with the parsed
+    ///     request. The body arrives as `Data` — no whole-request String
+    ///     conversion on this hot path. A small String decode of just the
+    ///     header section happens inside the parser, bounded by
+    ///     `maxHeaderBytes` (ADR 0013 Tier 1 cap).
+    ///   - `.error(...)` → surface as the corresponding HTTP error via
+    ///     `sendError`. Header/body cap violations → 413 (ADR 0013); other
+    ///     parse errors → 400. Routed through the ADR 0010 envelope.
     private nonisolated func receiveRequest(
         from connection: NWConnection,
         connectionId: Int,
         startTime: Date,
-        accumulatedData: Data
+        parser: HTTP1RequestParser
     ) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 1048576) { [weak self] data, _, isComplete, error in
             guard let self = self else { return }
@@ -367,130 +387,95 @@ final class ProxyBridge {
                 connection.cancel()
                 return
             }
-            
+
             guard let data = data, !data.isEmpty else {
                 if isComplete {
                     connection.cancel()
                 }
                 return
             }
-            
-            var newData = accumulatedData
-            newData.append(data)
-            
-            // Check if we have a complete HTTP request
-            if let requestString = String(data: newData, encoding: .utf8),
-               let headerEndRange = requestString.range(of: "\r\n\r\n") {
-                
-                let headerEndIndex = requestString.distance(from: requestString.startIndex, to: headerEndRange.upperBound)
-                let headerPart = String(requestString.prefix(headerEndIndex))
-                
-                // Check Content-Length to determine if we have full body
-                if let contentLengthLine = headerPart
-                    .components(separatedBy: "\r\n")
-                    .first(where: { $0.lowercased().hasPrefix("content-length:") }) {
-                    
-                    let headerParts = contentLengthLine.components(separatedBy: ":")
-                    guard headerParts.count > 1 else { return }
-                    
-                    let lengthStr = headerParts[1].trimmingCharacters(in: .whitespaces)
-                    if let contentLength = Int(lengthStr) {
-                        let currentBodyLength = newData.count - headerEndIndex
-                        
-                        // Need more data
-                        if currentBodyLength < contentLength {
-                            let nextData = newData
-                            // Use async dispatch to break recursion stack
-                            DispatchQueue.global(qos: .userInitiated).async {
-                                self.receiveRequest(
-                                    from: connection,
-                                    connectionId: connectionId,
-                                    startTime: startTime,
-                                    accumulatedData: nextData
-                                )
-                            }
-                            return
-                        }
-                    }
+
+            // Feed the byte-wise parser. `parser` is a value type — copy it
+            // locally, mutate, then pass the updated copy into the next
+            // receive iteration (or use it to drive processRequest).
+            var localParser = parser
+            let progress = localParser.feed(data)
+
+            switch progress {
+            case .needsMoreData:
+                if isComplete {
+                    // Socket closed mid-request: terminate rather than wait.
+                    connection.cancel()
+                    return
                 }
-                
-                // Complete request - process it
-                self.processRequest(
-                    data: newData,
-                    connection: connection,
-                    connectionId: connectionId,
-                    startTime: startTime
-                )
-                
-            } else if !isComplete {
-                // Haven't found header end yet, continue receiving
-                // Use async dispatch to break recursion stack
-                let nextData = newData
+                // Async dispatch to break recursion stack (preserved from the
+                // prior implementation). Bind the parser value to a `let`
+                // before capture — it's a value type, so each iteration owns
+                // its own copy (no shared mutable state across the dispatch).
+                let nextParser = localParser
                 DispatchQueue.global(qos: .userInitiated).async {
                     self.receiveRequest(
                         from: connection,
                         connectionId: connectionId,
                         startTime: startTime,
-                        accumulatedData: nextData
+                        parser: nextParser
                     )
                 }
-            } else {
-                // Complete but malformed
+
+            case .complete(let request):
                 self.processRequest(
-                    data: newData,
+                    request: request,
                     connection: connection,
                     connectionId: connectionId,
                     startTime: startTime
                 )
+
+            case .error(let parseError):
+                // ADR 0013 Tier 1 cap violations → 413; everything else → 400.
+                // Both routed through the ADR 0010 JSON envelope by sendError.
+                let statusCode: Int
+                switch parseError {
+                case .headerTooLarge, .bodyTooLarge:
+                    statusCode = 413
+                default:
+                    statusCode = 400
+                }
+                self.sendError(to: connection, statusCode: statusCode, message: parseError.localizedDescription)
             }
         }
     }
-    
+
     // MARK: - Request Processing
 
+    /// Process a parsed HTTP/1.1 request (issue #15, ADR 0015). The body
+    /// arrives here as `Data` from `HTTP1RequestParser` — no whole-request
+    /// String conversion on the receive hot path. The Qoder branch consumes
+    /// the body bytes directly; the CPA branch decodes the body to String
+    /// once at forwarding time (single decode, cold path — not on every
+    /// receive callback as the prior parser did).
     private nonisolated func processRequest(
-        data: Data,
+        request: HTTP1Request,
         connection: NWConnection,
         connectionId: Int,
         startTime: Date
     ) {
-        guard let requestString = String(data: data, encoding: .utf8) else {
-            sendError(to: connection, statusCode: 400, message: "Invalid request encoding")
-            return
-        }
+        let method = request.method
+        let path = request.path
+        let httpVersion = request.version
+        // Map the parser's `[(name: String, value: String)]` onto the tuple
+        // shape downstream code already uses. Preserve original casing and
+        // arrival order (the parser does both).
+        let headers: [(String, String)] = request.headers.map { ($0.name, $0.value) }
+        let body = request.body
 
-        // Parse HTTP request line
-        let lines = requestString.components(separatedBy: "\r\n")
-        guard let requestLine = lines.first else {
-            sendError(to: connection, statusCode: 400, message: "Missing request line")
-            return
-        }
-
-        let parts = requestLine.components(separatedBy: " ")
-        guard parts.count >= 3 else {
-            sendError(to: connection, statusCode: 400, message: "Invalid request format")
-            return
-        }
-
-        let method = parts[0]
-        let path = parts[1]
-        let httpVersion = parts[2]
-
-        // Collect headers
-        var headers: [(String, String)] = []
-        for line in lines.dropFirst() {
-            if line.isEmpty { break }
-            guard let colonIndex = line.firstIndex(of: ":") else { continue }
-            let name = String(line[..<colonIndex]).trimmingCharacters(in: .whitespaces)
-            let value = String(line[line.index(after: colonIndex)...]).trimmingCharacters(in: .whitespaces)
-            headers.append((name, value))
-        }
-
-        // Extract body
-        var body = ""
-        if let bodyRange = requestString.range(of: "\r\n\r\n") {
-            body = String(requestString[bodyRange.upperBound...])
-        }
+        // Request size for `RequestMetadata` accounting: wire-accurate count
+        // of the consumed request bytes = header section (request line +
+        // headers + `\r\n\r\n`) + body bytes. The parser surfaces the header
+        // byte count directly (issue #15 W4) so we don't lose this metric vs.
+        // the prior `data.count` (whole-request) implementation. For chunked
+        // input, `body.count` is the *decoded* body size — the chunk framing
+        // is not counted, matching the framing semantics a client sees.
+        let requestSize = request.headerBytes + body.count
 
         let metadata = extractMetadata(method: method, path: path, body: body)
 
@@ -530,12 +515,16 @@ final class ProxyBridge {
                 // body didn't carry model/input/etc. Non-responses qoder
                 // requests keep their body byte-identical (only the new flag +
                 // the synthesized body differ).
-                let effectiveBody: String
+                //
+                // Issue #15: the body reaches this branch as `Data` straight
+                // from the parser — no `Data(body.utf8)` round-trip here, no
+                // whole-request String conversion upstream. The synthesized
+                // Chat body is also `Data`.
+                let effectiveBody: Data
                 let responsesMode: Bool
                 if isResponsesEndpoint {
                     do {
-                        let chatBody = try QoderResponsesTranslator.synthesizeChatBody(from: Data(body.utf8))
-                        effectiveBody = String(data: chatBody, encoding: .utf8) ?? body
+                        effectiveBody = try QoderResponsesTranslator.synthesizeChatBody(from: body)
                         responsesMode = true
                     } catch {
                         self.sendError(to: connection, statusCode: 400, message: error.localizedDescription)
@@ -554,7 +543,7 @@ final class ProxyBridge {
                     originalConnection: connection,
                     connectionId: connectionId,
                     startTime: startTime,
-                    requestSize: data.count,
+                    requestSize: requestSize,
                     requestModel: metadata.model ?? "",
                     responsesMode: responsesMode
                 )
@@ -562,7 +551,7 @@ final class ProxyBridge {
             }
 
             let fallbackContext = self.createFallbackContext(body: body)
-            let resolvedBody: String
+            let resolvedBody: Data
 
             if fallbackContext.hasFallback, let entry = fallbackContext.currentEntry {
                 // Replace model in body with resolved model
@@ -583,7 +572,7 @@ final class ProxyBridge {
                 originalConnection: connection,
                 connectionId: connectionId,
                 startTime: startTime,
-                requestSize: data.count,
+                requestSize: requestSize,
                 metadata: metadata,
                 targetPort: targetPortValue,
                 targetHost: targetHostValue,
@@ -592,10 +581,11 @@ final class ProxyBridge {
         }
     }
 
+
     // MARK: - Fallback Support
 
     /// Create fallback context if the request uses a virtual model
-    private func createFallbackContext(body: String) -> FallbackContext {
+    private func createFallbackContext(body: Data) -> FallbackContext {
         let settings = FallbackSettingsManager.shared
 
         // Check if fallback is enabled
@@ -603,9 +593,9 @@ final class ProxyBridge {
             return .empty
         }
 
-        // Extract model from body
-        guard let bodyData = body.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any],
+        // Extract model from body (JSON). Issue #15: body arrives as `Data`
+        // from the parser; no `.data(using: .utf8)` round-trip.
+        guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
               let model = json["model"] as? String else {
             return .empty
         }
@@ -655,28 +645,27 @@ final class ProxyBridge {
     // MARK: - Request Body Transformation
 
     private nonisolated func replaceModelInBody(
-        _ body: String,
+        _ body: Data,
         with newModel: String
-    ) -> String {
-        guard let bodyData = body.data(using: .utf8),
-              var json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any],
+    ) -> Data {
+        // Issue #15: body is `Data` (from the parser). The JSON rewrite path
+        // stays byte-oriented end to end; no String round-trip.
+        guard var json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
               json["model"] != nil else {
             return body
         }
 
         json["model"] = newModel
 
-        guard let newData = try? JSONSerialization.data(withJSONObject: json, options: [.sortedKeys]),
-              let newBody = String(data: newData, encoding: .utf8) else {
+        guard let newData = try? JSONSerialization.data(withJSONObject: json, options: [.sortedKeys]) else {
             return body
         }
 
-        return newBody
+        return newData
     }
 
-    private nonisolated func sanitizeThinkingBlocks(_ body: String, targetModelId: String) -> String {
-        guard let bodyData = body.data(using: .utf8),
-              var json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any],
+    private nonisolated func sanitizeThinkingBlocks(_ body: Data, targetModelId: String) -> Data {
+        guard var json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
               var messages = json["messages"] as? [[String: Any]] else {
             return body
         }
@@ -709,12 +698,11 @@ final class ProxyBridge {
         json["messages"] = messages
         json["model"] = targetModelId
 
-        guard let newData = try? JSONSerialization.data(withJSONObject: json, options: [.sortedKeys]),
-              let newBody = String(data: newData, encoding: .utf8) else {
+        guard let newData = try? JSONSerialization.data(withJSONObject: json, options: [.sortedKeys]) else {
             return body
         }
 
-        return newBody
+        return newData
     }
 
     /// Check why a response should trigger fallback (if any)
@@ -736,7 +724,7 @@ final class ProxyBridge {
     
     // MARK: - Metadata Extraction
     
-    private nonisolated func extractMetadata(method: String, path: String, body: String) -> (provider: String?, model: String?, method: String, path: String) {
+    private nonisolated func extractMetadata(method: String, path: String, body: Data) -> (provider: String?, model: String?, method: String, path: String) {
         // Detect provider from path
         var provider: String?
         if path.contains("/anthropic/") || path.contains("/claude") {
@@ -750,14 +738,14 @@ final class ProxyBridge {
         } else if path.contains("codewhisperer") || path.contains("kiro") {
             provider = "kiro"
         }
-        
-        // Extract model from JSON body
+
+        // Extract model from JSON body. Issue #15: body is `Data` (from the
+        // parser); no `.data(using: .utf8)` round-trip.
         var model: String?
-        if let bodyData = body.data(using: .utf8),
-           let json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any],
+        if let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
            let modelValue = json["model"] as? String {
             model = modelValue
-            
+
             // Infer provider from model name if not already detected
             if provider == nil {
                 if FallbackFormatConverter.isClaudeModel(modelValue) {
@@ -771,7 +759,7 @@ final class ProxyBridge {
                 }
             }
         }
-        
+
         return (provider, model, method, path)
     }
     
@@ -782,7 +770,7 @@ final class ProxyBridge {
         path: String,
         version: String,
         headers: [(String, String)],
-        body: String,
+        body: Data,
         originalConnection: NWConnection,
         connectionId: Int,
         startTime: Date,
@@ -836,29 +824,39 @@ final class ProxyBridge {
             switch state {
             case .ready:
                 timeoutState.cancelled = true
-                // Build forwarded request with Connection: close
-                var forwardedRequest = "\(capturedMethod) \(capturedPath) \(capturedVersion)\r\n"
+                // Build the forwarded request. Issue #15: the request line and
+                // header section are built as a String (small, ASCII-only,
+                // bounded by the header cap) and converted to Data ONCE; the
+                // body is appended as raw bytes — no body String round-trip,
+                // no `Data(body.utf8)`. The body can carry non-UTF8 bytes
+                // (binary payloads) without corruption.
+                var forwardedHeader = "\(capturedMethod) \(capturedPath) \(capturedVersion)\r\n"
 
                 // Forward headers, excluding ones we'll override or that break error detection
                 let excludedHeaders: Set<String> = ["connection", "content-length", "host", "transfer-encoding", "accept-encoding"]
                 for (name, value) in capturedHeaders {
                     if !excludedHeaders.contains(name.lowercased()) {
-                        forwardedRequest += "\(name): \(value)\r\n"
+                        forwardedHeader += "\(name): \(value)\r\n"
                     }
                 }
 
                 // Add our headers
-                forwardedRequest += "Host: \(targetHost):\(targetPort)\r\n"
-                forwardedRequest += "Connection: close\r\n"  // KEY: Force fresh connections
-                forwardedRequest += "Content-Length: \(body.utf8.count)\r\n"
-                forwardedRequest += "\r\n"
-                forwardedRequest += body
+                forwardedHeader += "Host: \(targetHost):\(targetPort)\r\n"
+                forwardedHeader += "Connection: close\r\n"  // KEY: Force fresh connections
+                forwardedHeader += "Content-Length: \(body.count)\r\n"
+                forwardedHeader += "\r\n"
 
-                guard let requestData = forwardedRequest.data(using: .utf8) else {
+                guard let headerData = forwardedHeader.data(using: .utf8) else {
                     self.sendError(to: originalConnection, statusCode: 500, message: "Failed to encode request")
                     targetConnection.cancel()
                     return
                 }
+
+                // Concatenate header bytes + raw body bytes. The body is
+                // forwarded byte-exact (Content-Length was set to body.count).
+                var requestData = Data()
+                requestData.append(headerData)
+                requestData.append(body)
 
                 targetConnection.send(content: requestData, completion: .contentProcessed { error in
                     if error != nil {
@@ -926,7 +924,7 @@ final class ProxyBridge {
         method: String,
         path: String,
         headers: [(String, String)],
-        body: String,
+        body: Data,
         originalConnection: NWConnection,
         connectionId: Int,
         startTime: Date,
@@ -945,11 +943,12 @@ final class ProxyBridge {
             .trimmingCharacters(in: .whitespaces)
         ?? ""
 
-        // Pass the raw body to the router. The `qoder/` routing prefix is
-        // stripped inside the router (ADR 0003 §1) before the body reaches the
-        // translator and the upstream gateway — ProxyBridge only does prefix
-        // *detection* (to decide routing), not stripping.
-        let bodyData = Data(body.utf8)
+        // Issue #15: the body reaches here as `Data` straight from the parser
+        // (no String round-trip on the hot path). The `qoder/` routing prefix
+        // is stripped inside the router (ADR 0003 §1) before the body reaches
+        // the translator and the upstream gateway — ProxyBridge only does
+        // prefix *detection* (to decide routing), not stripping.
+        let bodyData = body
 
         // The pump runs in a detached-from-actor Task so the `for await` on
         // the upstream byte stream doesn't block the MainActor. Cancellation:
