@@ -46,7 +46,9 @@ final class QoderSSEReparserTests: XCTestCase {
     // MARK: - Content extraction
 
     /// A content delta in the inner OpenAI-shape chunk is re-emitted as an
-    /// OpenAI-shape chunk with the same text.
+    /// OpenAI-shape chunk with the same text. ADR 0011 §4: a synthesized
+    /// `delta.role:"assistant"` opener fires first, so a one-line content feed
+    /// produces two chunks (opener + content).
     func testEmitsContentDelta() throws {
         var reparser = QoderSSEReparser(created: 1)
         let line = qoderLine([
@@ -56,19 +58,22 @@ final class QoderSSEReparserTests: XCTestCase {
         ])
         let out = try reparser.feed(Data(line.utf8))
         let chunks = openAIChunks(out)
-        XCTAssertEqual(chunks.count, 1)
+        // ADR 0011: opener + content = 2 chunks.
+        XCTAssertEqual(chunks.count, 2)
         XCTAssertEqual(chunks[0]["id"] as? String, "chatcmpl-abc")
         XCTAssertEqual(chunks[0]["model"] as? String, "qoder-model-x")
         XCTAssertEqual(chunks[0]["object"] as? String, "chat.completion.chunk")
         XCTAssertEqual(chunks[0]["created"] as? Int, 1)
-        let choices = try XCTUnwrap(chunks[0]["choices"] as? [[String: Any]])
+        // chunks[0] is the role opener; chunks[1] carries the content.
+        let choices = try XCTUnwrap(chunks[1]["choices"] as? [[String: Any]])
         XCTAssertEqual(choices[0]["index"] as? Int, 0)
         let delta = try XCTUnwrap(choices[0]["delta"] as? [String: Any])
         XCTAssertEqual(delta["content"] as? String, "Hello")
     }
 
     /// Multiple content deltas across multiple frames each produce their own
-    /// OpenAI chunk. Response ID + model are stamped once and reused.
+    /// OpenAI chunk. Response ID + model are stamped once and reused. ADR 0011
+    /// §4: the synthesized role opener fires once on the first content line.
     func testEmitsMultipleContentDeltas() throws {
         var reparser = QoderSSEReparser()
         let line1 = qoderLine([
@@ -81,17 +86,26 @@ final class QoderSSEReparserTests: XCTestCase {
         var out = try reparser.feed(Data((line1 + line2).utf8))
         out.append(try reparser.finish())
         let chunks = openAIChunks(out)
-        XCTAssertEqual(chunks.count, 2)
+        // ADR 0011: opener + "Hel" + "lo" = 3 chunks.
+        XCTAssertEqual(chunks.count, 3)
         XCTAssertEqual(chunks[0]["id"] as? String, "chatcmpl-x")
         XCTAssertEqual(chunks[1]["id"] as? String, "chatcmpl-x")  // stable ID
-        let c0 = (chunks[0]["choices"] as? [[String: Any]])?[0]
+        // chunks[0] = role opener; chunks[1] = "Hel"; chunks[2] = "lo".
         let c1 = (chunks[1]["choices"] as? [[String: Any]])?[0]
-        XCTAssertEqual((c0?["delta"] as? [String: Any])?["content"] as? String, "Hel")
-        XCTAssertEqual((c1?["delta"] as? [String: Any])?["content"] as? String, "lo")
+        let c2 = (chunks[2]["choices"] as? [[String: Any]])?[0]
+        XCTAssertEqual((c1?["delta"] as? [String: Any])?["content"] as? String, "Hel")
+        XCTAssertEqual((c2?["delta"] as? [String: Any])?["content"] as? String, "lo")
     }
 
     /// An empty content delta (role-only opener or usage-only chunk) emits
     /// nothing — no spurious empty chunks.
+    ///
+    /// ADR 0011 §4: this test still passes unchanged after the role-opener
+    /// synthesis. The opener is gated on a content/reasoning/tool payload
+    /// (`producedAssistantPayloadThisLine`), and an upstream role-only delta
+    /// carries none of those — so `out` stays empty and the opener does NOT
+    /// fire. The reparser synthesizes its OWN opener lazily on the first real
+    /// payload; it does not echo an upstream role-only delta.
     func testEmptyContentDeltaEmitsNothing() throws {
         var reparser = QoderSSEReparser()
         let line = qoderLine([
@@ -106,7 +120,7 @@ final class QoderSSEReparserTests: XCTestCase {
 
     /// A frame split across two `feed` calls (TCP segment boundary) is
     /// reassembled before parsing — the advisor's "retain partial trailing
-    /// lines across feed calls" watch-item.
+    /// lines across feed calls" watch-item. ADR 0011 §4: opener + content = 2.
     func testHandlesFrameSplitAcrossFeeds() throws {
         var reparser = QoderSSEReparser()
         let line = qoderLine([
@@ -119,11 +133,14 @@ final class QoderSSEReparserTests: XCTestCase {
         let out2 = try reparser.feed(Data(bytes[split..<bytes.count]))
         XCTAssertTrue(out1.isEmpty, "first half should buffer, not emit")
         let chunks = openAIChunks(out2)
-        XCTAssertEqual(chunks.count, 1)
-        XCTAssertEqual(((chunks[0]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["content"] as? String, "Hello")
+        // ADR 0011: opener + content = 2 chunks.
+        XCTAssertEqual(chunks.count, 2)
+        // chunks[0] is the role opener; chunks[1] carries the content.
+        XCTAssertEqual(((chunks[1]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["content"] as? String, "Hello")
     }
 
-    /// `\r\n` line endings are tolerated (SSE spec allows them).
+    /// `\r\n` line endings are tolerated (SSE spec allows them). ADR 0011 §4:
+    /// opener + content = 2 chunks.
     func testHandlesCRLFLineEndings() throws {
         var reparser = QoderSSEReparser()
         let line = qoderLine([
@@ -131,7 +148,7 @@ final class QoderSSEReparserTests: XCTestCase {
             "choices": [["delta": ["content": "hi"]]],
         ]).replacingOccurrences(of: "\n", with: "\r\n")
         let out = try reparser.feed(Data(line.utf8))
-        XCTAssertEqual(openAIChunks(out).count, 1)
+        XCTAssertEqual(openAIChunks(out).count, 2)
     }
 
     // MARK: - Usage pass-through (ADR 0005 §2)
@@ -197,7 +214,8 @@ final class QoderSSEReparserTests: XCTestCase {
     // MARK: - Reasoning content (Phase 2b)
 
     /// `delta.reasoning_content` is stripped of thinking-tag artifacts then
-    /// re-emitted as OpenAI `delta.reasoning_content`.
+    /// re-emitted as OpenAI `delta.reasoning_content`. ADR 0011 §4: opener +
+    /// reasoning = 2 chunks.
     func testReasoningContentEmitted() throws {
         var reparser = QoderSSEReparser(created: 1)
         let line = qoderLine([
@@ -206,8 +224,10 @@ final class QoderSSEReparserTests: XCTestCase {
         ])
         let out = try reparser.feed(Data(line.utf8))
         let chunks = openAIChunks(out)
-        XCTAssertEqual(chunks.count, 1)
-        let delta = chunks[0]["choices"] as? [[String: Any]]
+        // ADR 0011: opener + reasoning = 2 chunks.
+        XCTAssertEqual(chunks.count, 2)
+        // chunks[0] is the role opener; chunks[1] carries reasoning.
+        let delta = chunks[1]["choices"] as? [[String: Any]]
         let deltaDict = (delta?[0]["delta"] as? [String: Any])
         XCTAssertEqual(deltaDict?["reasoning_content"] as? String, "thinking...")
         XCTAssertNil(deltaDict?["content"], "reasoning chunk must not carry content")
@@ -215,7 +235,8 @@ final class QoderSSEReparserTests: XCTestCase {
 
     /// A literal `<thinking>` opener routed into reasoning_content is stripped
     /// (Qoder's backend sometimes splits a tag pair across reasoning + content
-    /// channels — pi strips the artifacts in stream.ts ~354-355).
+    /// channels — pi strips the artifacts in stream.ts ~354-355). ADR 0011 §4:
+    /// opener + reasoning = 2 chunks.
     func testReasoningContentStripsThinkingTags() throws {
         var reparser = QoderSSEReparser(created: 1)
         let line = qoderLine([
@@ -224,8 +245,9 @@ final class QoderSSEReparserTests: XCTestCase {
         ])
         let out = try reparser.feed(Data(line.utf8))
         let chunks = openAIChunks(out)
-        XCTAssertEqual(chunks.count, 1)
-        let delta = (chunks[0]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any]
+        // ADR 0011: opener + reasoning = 2 chunks.
+        XCTAssertEqual(chunks.count, 2)
+        let delta = (chunks[1]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any]
         XCTAssertEqual(delta?["reasoning_content"] as? String, "real reasoning")
     }
 
@@ -246,6 +268,7 @@ final class QoderSSEReparserTests: XCTestCase {
     /// A `<thinking>...</thinking>` pair embedded in `delta.content` splits
     /// into a reasoning delta (the thinking text) and text deltas (the parts
     /// before and after the pair). Cross-checks the thinking parser wiring.
+    /// ADR 0011 §4: opener + text + reasoning + text = 4 chunks.
     func testContentWithThinkingTagSplits() throws {
         var reparser = QoderSSEReparser(created: 1)
         let line = qoderLine([
@@ -254,14 +277,15 @@ final class QoderSSEReparserTests: XCTestCase {
         ])
         let out = try reparser.feed(Data(line.utf8))
         let chunks = openAIChunks(out)
-        // Order: text "before ", reasoning "mid", text " after".
-        XCTAssertEqual(chunks.count, 3)
-        let d0 = (chunks[0]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any]
+        // ADR 0011: opener + text "before " + reasoning "mid" + text " after" = 4.
+        XCTAssertEqual(chunks.count, 4)
+        // chunks[0] = role opener. Then: text, reasoning, text.
         let d1 = (chunks[1]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any]
         let d2 = (chunks[2]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any]
-        XCTAssertEqual(d0?["content"] as? String, "before ")
-        XCTAssertEqual(d1?["reasoning_content"] as? String, "mid")
-        XCTAssertEqual(d2?["content"] as? String, " after")
+        let d3 = (chunks[3]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any]
+        XCTAssertEqual(d1?["content"] as? String, "before ")
+        XCTAssertEqual(d2?["reasoning_content"] as? String, "mid")
+        XCTAssertEqual(d3?["content"] as? String, " after")
     }
 
     /// A thinking tag split across content deltas (cross-delta buffering)
@@ -298,7 +322,7 @@ final class QoderSSEReparserTests: XCTestCase {
     }
 
     /// A tool_calls delta is re-emitted as OpenAI `delta.tool_calls`, preserving
-    /// the index, id, type, and function name.
+    /// the index, id, type, and function name. ADR 0011 §4: opener + tool = 2.
     func testToolCallFirstDeltaEmitted() throws {
         var reparser = QoderSSEReparser(created: 1)
         let line = qoderLine(innerWithToolCalls([[
@@ -309,8 +333,10 @@ final class QoderSSEReparserTests: XCTestCase {
         ]]))
         let out = try reparser.feed(Data(line.utf8))
         let chunks = openAIChunks(out)
-        XCTAssertEqual(chunks.count, 1)
-        let tcArray = ((chunks[0]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["tool_calls"] as? [[String: Any]]
+        // ADR 0011: opener + tool = 2 chunks.
+        XCTAssertEqual(chunks.count, 2)
+        // chunks[0] = role opener; chunks[1] = tool_calls.
+        let tcArray = ((chunks[1]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["tool_calls"] as? [[String: Any]]
         XCTAssertEqual(tcArray?.count, 1)
         XCTAssertEqual(tcArray?[0]["index"] as? Int, 0)
         XCTAssertEqual(tcArray?[0]["id"] as? String, "call_1")
@@ -321,7 +347,8 @@ final class QoderSSEReparserTests: XCTestCase {
 
     /// Argument fragments stream across deltas (true OpenAI streaming). Two
     /// deltas with the SAME index but fragmented `function.arguments` produce
-    /// two chunks; the agent concatenates them.
+    /// two chunks; the agent concatenates them. ADR 0011 §4: opener + tool +
+    /// fragment = 3 chunks.
     func testToolCallArgumentsStreamFragmented() throws {
         var reparser = QoderSSEReparser(created: 1)
         let first = qoderLine(innerWithToolCalls([[
@@ -335,21 +362,23 @@ final class QoderSSEReparserTests: XCTestCase {
         var out = try reparser.feed(Data(first.utf8))
         out.append(try reparser.feed(Data(frag.utf8)))
         let chunks = openAIChunks(out)
-        XCTAssertEqual(chunks.count, 2)
-        // First chunk carries id/type/name + first argument fragment.
-        let fn0 = (((chunks[0]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["tool_calls"] as? [[String: Any]])?[0]["function"] as? [String: Any]
-        XCTAssertEqual(fn0?["arguments"] as? String, "{\"city\":")
-        // Second chunk carries only the argument fragment (sparse delta).
-        let tc1 = ((chunks[1]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["tool_calls"] as? [[String: Any]]
-        XCTAssertEqual(tc1?[0]["index"] as? Int, 0)
-        let fn1 = tc1?[0]["function"] as? [String: Any]
-        XCTAssertEqual(fn1?["arguments"] as? String, " \"Paris\"}")
-        XCTAssertNil(tc1?[0]["id"], "second fragment must not repeat id")
+        // ADR 0011: opener + first tool + fragment = 3 chunks.
+        XCTAssertEqual(chunks.count, 3)
+        // chunks[0] = opener; chunks[1] = id/type/name + first arg; chunks[2] = sparse fragment.
+        let fn1 = (((chunks[1]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["tool_calls"] as? [[String: Any]])?[0]["function"] as? [String: Any]
+        XCTAssertEqual(fn1?["arguments"] as? String, "{\"city\":")
+        // Second tool chunk (chunks[2]) carries only the argument fragment (sparse delta).
+        let tc2 = ((chunks[2]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["tool_calls"] as? [[String: Any]]
+        XCTAssertEqual(tc2?[0]["index"] as? Int, 0)
+        let fn2 = tc2?[0]["function"] as? [String: Any]
+        XCTAssertEqual(fn2?["arguments"] as? String, " \"Paris\"}")
+        XCTAssertNil(tc2?[0]["id"], "second fragment must not repeat id")
     }
 
     /// Multiple tool-call indices interleave correctly — each index gets its
     /// own id on first sighting. Each entry in the upstream `tool_calls` array
-    /// is re-emitted as its own OpenAI chunk (one tool_call per delta).
+    /// is re-emitted as its own OpenAI chunk (one tool_call per delta). ADR
+    /// 0011 §4: opener + tool_a + tool_b = 3 chunks.
     func testMultipleToolCallIndices() throws {
         var reparser = QoderSSEReparser(created: 1)
         let line = qoderLine(innerWithToolCalls([
@@ -358,17 +387,19 @@ final class QoderSSEReparserTests: XCTestCase {
         ]))
         let out = try reparser.feed(Data(line.utf8))
         let chunks = openAIChunks(out)
-        // One chunk per tool_call entry (streaming shape).
-        XCTAssertEqual(chunks.count, 2)
-        let tc0 = ((chunks[0]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["tool_calls"] as? [[String: Any]]
+        // ADR 0011: opener + tool_a + tool_b = 3 chunks.
+        XCTAssertEqual(chunks.count, 3)
+        // chunks[0] = opener; chunks[1] = tool_a; chunks[2] = tool_b.
         let tc1 = ((chunks[1]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["tool_calls"] as? [[String: Any]]
-        XCTAssertEqual(tc0?[0]["id"] as? String, "call_a")
-        XCTAssertEqual(tc0?[0]["index"] as? Int, 0)
-        XCTAssertEqual(tc1?[0]["id"] as? String, "call_b")
-        XCTAssertEqual(tc1?[0]["index"] as? Int, 1)
+        let tc2 = ((chunks[2]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["tool_calls"] as? [[String: Any]]
+        XCTAssertEqual(tc1?[0]["id"] as? String, "call_a")
+        XCTAssertEqual(tc1?[0]["index"] as? Int, 0)
+        XCTAssertEqual(tc2?[0]["id"] as? String, "call_b")
+        XCTAssertEqual(tc2?[0]["index"] as? Int, 1)
     }
 
-    /// `index` defaults to 0 when absent (pi: `tc.index ?? 0`).
+    /// `index` defaults to 0 when absent (pi: `tc.index ?? 0`). ADR 0011 §4:
+    /// opener + tool = 2 chunks; the tool is chunks[1].
     func testToolCallIndexDefaultsToZero() throws {
         var reparser = QoderSSEReparser(created: 1)
         let line = qoderLine(innerWithToolCalls([[
@@ -376,7 +407,8 @@ final class QoderSSEReparserTests: XCTestCase {
             "function": ["name": "f", "arguments": ""],
         ]]))
         let out = try reparser.feed(Data(line.utf8))
-        let tcArray = ((openAIChunks(out)[0]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["tool_calls"] as? [[String: Any]]
+        // chunks[0] is the role opener; the tool is chunks[1].
+        let tcArray = ((openAIChunks(out)[1]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["tool_calls"] as? [[String: Any]]
         XCTAssertEqual(tcArray?[0]["index"] as? Int, 0)
     }
 
@@ -384,7 +416,9 @@ final class QoderSSEReparserTests: XCTestCase {
     /// `finish_reason: "stop"`, the reparser overrides it to OpenAI's
     /// `"tool_calls"` so the agent knows to execute the calls (pi forces
     /// "toolUse" in stream.ts ~496-498). A meaningful upstream finish_reason
-    /// ("length", "content_filter") is preserved.
+    /// ("length", "content_filter") is preserved. ADR 0011: every choice now
+    /// carries a `finish_reason` key (null on non-terminal chunks), so the
+    /// find filter must distinguish a real string reason from null.
     func testToolCallsOverrideFinishReasonToToolCalls() throws {
         var reparser = QoderSSEReparser(created: 1)
         let toolLine = qoderLine(innerWithToolCalls([[
@@ -398,8 +432,11 @@ final class QoderSSEReparserTests: XCTestCase {
         var out = try reparser.feed(Data(toolLine.utf8))
         out.append(try reparser.feed(Data(stopLine.utf8)))
         let chunks = openAIChunks(out)
-        // The finish chunk carries "tool_calls", not "stop".
-        let finishChunk = chunks.first { ($0["choices"] as? [[String: Any]])?[0]["finish_reason"] != nil }
+        // The finish chunk carries "tool_calls", not "stop". Filter on a real
+        // string finish_reason (ADR 0011: other chunks carry NSNull now).
+        let finishChunk = chunks.first {
+            ($0["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String != nil
+        }
         XCTAssertEqual(
             (finishChunk?["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String,
             "tool_calls"
@@ -472,7 +509,7 @@ final class QoderSSEReparserTests: XCTestCase {
         out.append(try reparser.feed(Data(args.utf8)))
         out.append(try reparser.feed(Data(stop.utf8)))
         let chunks = openAIChunks(out)
-        let finishChunk = chunks.first { ($0["choices"] as? [[String: Any]])?[0]["finish_reason"] != nil }
+        let finishChunk = chunks.first { ($0["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String != nil }
         XCTAssertEqual(
             (finishChunk?["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String,
             "tool_calls"
@@ -528,7 +565,7 @@ final class QoderSSEReparserTests: XCTestCase {
         let secondFunction = second?[0]["function"] as? [String: Any]
         XCTAssertEqual(secondFunction?["arguments"] as? String, "{\"city\":\"Paris\"}")
 
-        let finishChunk = chunks.first { ($0["choices"] as? [[String: Any]])?[0]["finish_reason"] != nil }
+        let finishChunk = chunks.first { ($0["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String != nil }
         XCTAssertEqual(
             (finishChunk?["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String,
             "tool_calls"
@@ -550,7 +587,7 @@ final class QoderSSEReparserTests: XCTestCase {
         var out = try reparser.feed(Data(toolLine.utf8))
         out.append(try reparser.feed(Data(lengthLine.utf8)))
         let chunks = openAIChunks(out)
-        let finishChunk = chunks.first { ($0["choices"] as? [[String: Any]])?[0]["finish_reason"] != nil }
+        let finishChunk = chunks.first { ($0["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String != nil }
         XCTAssertEqual(
             (finishChunk?["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String,
             "length"
@@ -581,7 +618,7 @@ final class QoderSSEReparserTests: XCTestCase {
         }
         XCTAssertTrue(toolChunks.isEmpty, "a function-less delta must emit no tool_calls chunk")
         // finish_reason stays "stop" — not overridden to "tool_calls".
-        let finishChunk = chunks.first { ($0["choices"] as? [[String: Any]])?[0]["finish_reason"] != nil }
+        let finishChunk = chunks.first { ($0["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String != nil }
         XCTAssertEqual(
             (finishChunk?["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String,
             "stop",
@@ -592,7 +629,8 @@ final class QoderSSEReparserTests: XCTestCase {
     // MARK: - finish_reason + [DONE]
 
     /// finish_reason on its own chunk emits a chunk carrying finish_reason,
-    /// then finish() emits the usage chunk (if any) + [DONE].
+    /// then finish() emits the usage chunk (if any) + [DONE]. ADR 0011 §4:
+    /// opener + content + finish = 3 chunks (was 2).
     func testFinishReasonEmittedAndDone() throws {
         var reparser = QoderSSEReparser()
         let contentLine = qoderLine([
@@ -607,9 +645,10 @@ final class QoderSSEReparserTests: XCTestCase {
         let text = String(data: out, encoding: .utf8) ?? ""
         XCTAssertTrue(text.hasSuffix("data: [DONE]\n\n"))
         let chunks = openAIChunks(out)
-        // content + finish_reason.
-        XCTAssertEqual(chunks.count, 2)
-        let finishChunk = chunks[1]
+        // ADR 0011: opener + content + finish = 3 chunks (was 2).
+        XCTAssertEqual(chunks.count, 3)
+        // chunks[2] is the finish chunk (chunks[0] = opener, chunks[1] = content).
+        let finishChunk = chunks[2]
         let choices = (finishChunk["choices"] as? [[String: Any]])?[0]
         XCTAssertEqual(choices?["finish_reason"] as? String, "stop")
     }
@@ -621,6 +660,13 @@ final class QoderSSEReparserTests: XCTestCase {
     /// `[DONE]` — else strict OpenAI clients see an unterminated response.
     /// Contract: a content chunk followed by a finish chunk (real reason),
     /// then `[DONE]`.
+    ///
+    /// ADR 0011 §4: the count grew from 2 → 3 because the role opener now
+    /// synthesizes on the first content emission. This is a sanctioned
+    /// ADR-0011 update, NOT a #18 regression — the finish chunk still carries
+    /// the real `finish_reason` (pinned by `testFinishChunkCarriesDeltaAndFinishReason`).
+    /// Chunk layout: chunks[0] = role opener, chunks[1] = content,
+    /// chunks[2] = finish.
     func testCombinedContentAndFinishReasonEmittedInFinish() throws {
         var reparser = QoderSSEReparser()
         let line = qoderLine([
@@ -632,14 +678,19 @@ final class QoderSSEReparserTests: XCTestCase {
         let text = String(data: out, encoding: .utf8) ?? ""
         XCTAssertTrue(text.hasSuffix("data: [DONE]\n\n"))
         let chunks = openAIChunks(out)
-        XCTAssertEqual(chunks.count, 2)
-        // Chunk 0: the content delta.
+        // ADR 0011: opener (§4) + content + finish = 3 chunks (was 2 pre-0011).
+        XCTAssertEqual(chunks.count, 3)
+        // Chunk 0: the synthesized role opener.
         let c0 = (chunks[0]["choices"] as? [[String: Any]])?[0]
         let d0 = c0?["delta"] as? [String: Any]
-        XCTAssertEqual(d0?["content"] as? String, "done")
-        // Chunk 1: the finish chunk carrying the real finish_reason.
+        XCTAssertEqual(d0?["role"] as? String, "assistant", "ADR 0011 §4: opener fires first")
+        // Chunk 1: the content delta.
         let c1 = (chunks[1]["choices"] as? [[String: Any]])?[0]
-        XCTAssertEqual(c1?["finish_reason"] as? String, "stop")
+        let d1 = c1?["delta"] as? [String: Any]
+        XCTAssertEqual(d1?["content"] as? String, "done")
+        // Chunk 2: the finish chunk carrying the real finish_reason.
+        let c2 = (chunks[2]["choices"] as? [[String: Any]])?[0]
+        XCTAssertEqual(c2?["finish_reason"] as? String, "stop")
     }
 
     /// Issue #18 contract lock: a frame with `delta.reasoning_content` AND
@@ -657,7 +708,7 @@ final class QoderSSEReparserTests: XCTestCase {
         var out = try reparser.feed(Data(line.utf8))
         out.append(try reparser.finish())
         let chunks = openAIChunks(out)
-        let finishChunk = chunks.first { ($0["choices"] as? [[String: Any]])?[0]["finish_reason"] != nil }
+        let finishChunk = chunks.first { ($0["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String != nil }
         XCTAssertEqual(
             (finishChunk?["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String,
             "stop"
@@ -686,7 +737,7 @@ final class QoderSSEReparserTests: XCTestCase {
         var out = try reparser.feed(Data(line.utf8))
         out.append(try reparser.finish())
         let chunks = openAIChunks(out)
-        let finishChunk = chunks.first { ($0["choices"] as? [[String: Any]])?[0]["finish_reason"] != nil }
+        let finishChunk = chunks.first { ($0["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String != nil }
         XCTAssertEqual(
             (finishChunk?["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String,
             "tool_calls"
@@ -709,6 +760,7 @@ final class QoderSSEReparserTests: XCTestCase {
     // MARK: - Robustness
 
     /// A non-`data:` line (SSE comment, event line) is ignored, not fatal.
+    /// ADR 0011 §4: opener + content = 2 chunks.
     func testIgnoresNonDataLines() throws {
         var reparser = QoderSSEReparser()
         let cleanLine = qoderLine([
@@ -718,10 +770,12 @@ final class QoderSSEReparserTests: XCTestCase {
         let raw = ": comment\n\nevent: ping\n\n" + cleanLine
         let out = try reparser.feed(Data(raw.utf8))
         let chunks = openAIChunks(out)
-        XCTAssertEqual(chunks.count, 1)
+        // ADR 0011: opener + content = 2.
+        XCTAssertEqual(chunks.count, 2)
     }
 
-    /// A malformed `data:` line is skipped (pi parity), not fatal.
+    /// A malformed `data:` line is skipped (pi parity), not fatal. ADR 0011 §4:
+    /// opener + content = 2 chunks.
     func testSkipsMalformedDataLine() throws {
         var reparser = QoderSSEReparser()
         let bad = "data: {not json}\n\n"
@@ -731,7 +785,8 @@ final class QoderSSEReparserTests: XCTestCase {
         ])
         let out = try reparser.feed(Data((bad + good).utf8))
         let chunks = openAIChunks(out)
-        XCTAssertEqual(chunks.count, 1, "malformed line should be skipped, not fatal")
+        // ADR 0011: opener + content = 2.
+        XCTAssertEqual(chunks.count, 2, "malformed line should be skipped, not fatal")
     }
 
     /// Upstream `[DONE]` in an inner body is ignored; finish() owns the
@@ -746,5 +801,159 @@ final class QoderSSEReparserTests: XCTestCase {
         let out2 = try reparser.finish()
         let text = String(data: out2, encoding: .utf8) ?? ""
         XCTAssertEqual(text, "data: [DONE]\n\n", "exactly one terminal [DONE]")
+    }
+
+    // MARK: - ADR 0011 streaming chunk template
+
+    /// ADR 0011: every choice on every chunk carries BOTH `delta` (default `{}`)
+    /// and `finish_reason` (default null — present, null on non-terminal chunks).
+    /// Strict SDK schemas (zod, pydantic with `required`) reject the key being
+    /// absent. The content chunk is the populated case for `delta` and the
+    /// null case for `finish_reason`.
+    func testEveryChoiceCarriesDeltaAndFinishReason() throws {
+        var reparser = QoderSSEReparser()
+        // Content chunk: delta populated, finish_reason must be present and null.
+        let contentLine = qoderLine([
+            "id": "x", "model": "m",
+            "choices": [["delta": ["content": "hi"]]],
+        ])
+        var out = try reparser.feed(Data(contentLine.utf8))
+        out.append(try reparser.finish())
+        let chunks = openAIChunks(out)
+        // The role opener fires first (ADR 0011 §3), so the content chunk is
+        // not necessarily chunks[0]. Find it by payload.
+        let contentChunk = try XCTUnwrap(chunks.first {
+            (($0["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["content"] != nil
+        })
+        let contentChoice = try XCTUnwrap((contentChunk["choices"] as? [[String: Any]])?[0])
+        // delta present and carries the content.
+        let contentDelta = try XCTUnwrap(contentChoice["delta"] as? [String: Any])
+        XCTAssertEqual(contentDelta["content"] as? String, "hi")
+        // finish_reason key present and null (NSNull round-trips to NSNull).
+        XCTAssertNotNil(contentChoice["finish_reason"], "finish_reason key must be present (ADR 0011)")
+        XCTAssertTrue(contentChoice["finish_reason"] is NSNull, "finish_reason must be null on non-terminal chunk")
+
+        // Finish-only chunk: delta must be {} (present, empty), finish_reason populated.
+        var reparser2 = QoderSSEReparser()
+        let finishLine = qoderLine([
+            "id": "y", "model": "m2",
+            "choices": [["delta": [:], "finish_reason": "stop"]],
+        ])
+        var out2 = try reparser2.feed(Data(finishLine.utf8))
+        out2.append(try reparser2.finish())
+        let chunks2 = openAIChunks(out2)
+        let finishChunk = try XCTUnwrap(chunks2.first {
+            ($0["choices"] as? [[String: Any]])?[0]["finish_reason"] != nil
+            && !((($0["choices"] as? [[String: Any]])?[0]["finish_reason"] is NSNull))
+        })
+        let finishChoice = try XCTUnwrap((finishChunk["choices"] as? [[String: Any]])?[0])
+        XCTAssertEqual(finishChoice["finish_reason"] as? String, "stop")
+        // delta must be present (an empty object), not omitted.
+        XCTAssertNotNil(finishChoice["delta"], "delta key must be present (ADR 0011)")
+        let finishDelta = try XCTUnwrap(finishChoice["delta"] as? [String: Any])
+        XCTAssertTrue(finishDelta.isEmpty, "finish chunk delta must be {} when no content")
+    }
+
+    /// ADR 0011 §3: the trailing usage chunk is built by a dedicated
+    /// `buildUsageChunk` and carries `choices: []` (empty array), matching
+    /// OpenAI's `stream_options.include_usage` spec. NOT `choices:[{index:0}]`.
+    func testUsageChunkHasEmptyChoices() throws {
+        var reparser = QoderSSEReparser()
+        let line = qoderLine([
+            "id": "x", "model": "m",
+            "choices": [["delta": [:], "finish_reason": "stop"]],
+            "usage": ["prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15] as [String: Any],
+        ])
+        var out = try reparser.feed(Data(line.utf8))
+        out.append(try reparser.finish())
+        let chunks = openAIChunks(out)
+        // The usage chunk is the only chunk carrying top-level `usage`.
+        let usageChunks = chunks.filter { ($0["usage"] as? [String: Any]) != nil }
+        XCTAssertEqual(usageChunks.count, 1, "exactly one trailing usage chunk")
+        let usageChunk = usageChunks[0]
+        // CRITICAL: spec-mandated empty choices array, not [{index:0,...}].
+        let choices = try XCTUnwrap(usageChunk["choices"] as? [Any])
+        XCTAssertEqual(choices.count, 0, "usage chunk must carry choices: [] (OpenAI spec, ADR 0011)")
+    }
+
+    /// ADR 0011 §4: a synthesized `delta.role: "assistant"` opener fires exactly
+    /// once per stream — on the first content/reasoning/tool emission. Mirrors
+    /// CPA's `message_start`. Two content lines → exactly one opener, and it
+    /// precedes both content chunks.
+    func testRoleOpenerFiresOncePerStream() throws {
+        var reparser = QoderSSEReparser()
+        let line1 = qoderLine([
+            "id": "x", "model": "m",
+            "choices": [["delta": ["content": "Hel"]]],
+        ])
+        let line2 = qoderLine([
+            "choices": [["delta": ["content": "lo"]]],
+        ])
+        var out = try reparser.feed(Data(line1.utf8))
+        out.append(try reparser.feed(Data(line2.utf8)))
+        let chunks = openAIChunks(out)
+        // Exactly one chunk carries delta.role == "assistant".
+        let openers = chunks.filter {
+            (($0["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["role"] as? String == "assistant"
+        }
+        XCTAssertEqual(openers.count, 1, "role opener must fire exactly once per stream")
+        // And the opener is the FIRST chunk in the stream.
+        let firstDelta = (chunks[0]["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any]
+        XCTAssertEqual(firstDelta?["role"] as? String, "assistant", "opener must precede content")
+    }
+
+    /// Issue #18 cross-concern pin (ADR 0011): the finish chunk emitted in
+    /// `finish()` via the #18 stashed-finish path inherits the template — it
+    /// carries `delta: {}` (present, empty) AND `finish_reason: <reason>`.
+    /// This explicitly pins that #18's late finish chunk satisfies the strict
+    /// schema (both keys present), not just the finish_reason half.
+    func testFinishChunkCarriesDeltaAndFinishReason() throws {
+        var reparser = QoderSSEReparser()
+        // The #18 scenario: a single frame carries BOTH content and finish_reason.
+        // processLine stashes the reason (producedContentThisLine suppressed the
+        // immediate emit); finish() then emits it via the #18 path.
+        let line = qoderLine([
+            "id": "x", "model": "m",
+            "choices": [["delta": ["content": "done"], "finish_reason": "stop"]],
+        ])
+        var out = try reparser.feed(Data(line.utf8))
+        out.append(try reparser.finish())
+        let chunks = openAIChunks(out)
+        // The finish chunk is the one with finish_reason == "stop" (a real
+        // string, not NSNull).
+        let finishChunks = chunks.filter {
+            let fr = ($0["choices"] as? [[String: Any]])?[0]["finish_reason"]
+            return fr is String && (fr as? String) == "stop"
+        }
+        XCTAssertEqual(finishChunks.count, 1)
+        let finishChoice = (finishChunks[0]["choices"] as? [[String: Any]])?[0]
+        // CRITICAL #18 pin: the finish chunk inherits ADR 0011's template —
+        // delta is present (empty {}), finish_reason carries the real reason.
+        XCTAssertNotNil(finishChoice?["delta"], "#18 finish chunk must carry delta (ADR 0011 template)")
+        let finishDelta = finishChoice?["delta"] as? [String: Any]
+        XCTAssertTrue(finishDelta?.isEmpty == true, "#18 finish chunk delta must be {} (no content)")
+        XCTAssertEqual(finishChoice?["finish_reason"] as? String, "stop")
+    }
+
+    /// ADR 0011 §4 edge case: a finish-only stream (no content/reasoning/tool
+    /// emission) does NOT get a synthesized role opener. The opener is about
+    /// announcing the assistant role, which only matters if there's assistant
+    /// output. A bare finish (e.g. a `length` truncation with no content) has
+    /// nothing to open. This pins the chosen interpretation: gate the opener on
+    /// a content/reasoning/tool emission, NOT on any non-empty `out`.
+    func testFinishOnlyStreamDoesNotEmitOpener() throws {
+        var reparser = QoderSSEReparser()
+        // A single finish-only frame — no content/reasoning/tool delta.
+        let line = qoderLine([
+            "id": "x", "model": "m",
+            "choices": [["delta": [:], "finish_reason": "stop"]],
+        ])
+        var out = try reparser.feed(Data(line.utf8))
+        out.append(try reparser.finish())
+        let chunks = openAIChunks(out)
+        let openers = chunks.filter {
+            (($0["choices"] as? [[String: Any]])?[0]["delta"] as? [String: Any])?["role"] as? String == "assistant"
+        }
+        XCTAssertEqual(openers.count, 0, "finish-only stream must not synthesize a role opener (ADR 0011 §4 edge case)")
     }
 }

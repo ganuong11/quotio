@@ -109,6 +109,14 @@ nonisolated struct QoderSSEReparser {
     /// double-emit on repeated `finish()` calls.
     private var finished: Bool = false
 
+    /// ADR 0011 §4: one-shot flag for the synthesized `delta.role:"assistant"`
+    /// opener. Fires on the first content/reasoning/tool emission if no explicit
+    /// role opener was sent by the upstream. Mirrors CPA's `message_start`.
+    /// Resets per stream (the reparser is per-request, so this is a
+    /// construction-time default). Gated on a real assistant payload, NOT on a
+    /// finish-only chunk (a bare finish has nothing to open).
+    private var roleOpenerSent: Bool = false
+
     /// Streaming splitter for thinking tags embedded in the `content` channel
     /// (Phase 2b). One per stream — owns cross-delta buffering and the one-shot
     /// "first thinking block only" rule. See `QoderThinkingTagParser`.
@@ -208,9 +216,11 @@ nonisolated struct QoderSSEReparser {
         // Trailing usage chunk (OpenAI convention: usage rides on its own
         // final chunk with an empty `choices` array). Only emit if we have
         // stashed usage that wasn't already attached to a content chunk.
+        // ADR 0011 §3: built by the dedicated `buildUsageChunk` so the
+        // spec-mandated `choices: []` rule cannot be missed (a real choice
+        // object here would be a schema violation).
         if let usage = stashedUsage {
-            let chunk = buildChunk(delta: nil, finishReason: nil, usage: usage)
-            out.append(chunk)
+            out.append(buildUsageChunk(usage))
         }
         out.append(contentsOf: "data: [DONE]\n\n".utf8)
         return out
@@ -324,6 +334,11 @@ nonisolated struct QoderSSEReparser {
         // chunks (reasoning + content-via-parser + tool_calls); accumulate them.
         var out = Data()
         var producedContentThisLine = false
+        // ADR 0011 §4: the synthesized role opener fires on the first line that
+        // emits a content/reasoning/tool chunk — NOT on a finish-only line (a
+        // bare finish has nothing to open). Track whether ANY assistant payload
+        // was appended this line so we can gate the opener below.
+        var producedAssistantPayloadThisLine = false
         if let choices = inner["choices"] as? [Any], !choices.isEmpty {
             guard let choice = choices[0] as? [String: Any] else {
                 throw QoderSSEReparserError.malformedSSELine(snippet: innerStr)
@@ -337,6 +352,7 @@ nonisolated struct QoderSSEReparser {
                     let cleaned = qoderStripThinkingTags(reasoning)
                     if !cleaned.isEmpty {
                         out.append(buildReasoningChunk(cleaned))
+                        producedAssistantPayloadThisLine = true
                     }
                 }
 
@@ -354,8 +370,10 @@ nonisolated struct QoderSSEReparser {
                         case .text(let text):
                             out.append(buildContentChunk(text))
                             producedContentThisLine = true
+                            producedAssistantPayloadThisLine = true
                         case .thinking(let thinking):
                             out.append(buildReasoningChunk(thinking))
+                            producedAssistantPayloadThisLine = true
                         }
                     }
                 }
@@ -386,6 +404,7 @@ nonisolated struct QoderSSEReparser {
                         if let chunk = buildToolCallChunk(index: index, state: state, delta: tc) {
                             out.append(chunk)
                             state.emittedHeader = true
+                            producedAssistantPayloadThisLine = true
                         }
                         toolCallsState[index] = state
                     }
@@ -420,6 +439,14 @@ nonisolated struct QoderSSEReparser {
                     stashedFinishReason = nil
                 }
             }
+        }
+        // ADR 0011 §4: synthesize `delta.role:"assistant"` once per stream, on
+        // the first content/reasoning/tool emission. Prepended so it precedes
+        // the payload. Gated on `producedAssistantPayloadThisLine`, NOT on
+        // `!out.isEmpty`, so a finish-only line does NOT fire the opener (a
+        // bare finish has nothing to open). Mirrors CPA's `message_start`.
+        if producedAssistantPayloadThisLine, !roleOpenerSent {
+            out = emitRoleOpenerIfNeeded() + out
         }
         return out
     }
@@ -527,13 +554,27 @@ nonisolated struct QoderSSEReparser {
     /// SSE frame. Shared by all chunk builders. JSONSerialization is
     /// deterministic per-call but key order is not guaranteed; OpenAI clients
     /// parse JSON, so order is irrelevant.
+    ///
+    /// ADR 0011: this is the single point where the OpenAI streaming chunk
+    /// template is enforced. EVERY choice it serializes carries both `delta`
+    /// (default `{}`) and `finish_reason` (default `null`). Strict SDK schemas
+    /// (zod, pydantic with `required`) reject the key being absent, so the
+    /// contract must hold structurally, not by per-builder discipline. Builders
+    /// that already populate `delta` (content/reasoning/tool) or `finish_reason`
+    /// (finish chunk) keep their values — the guard only fills in the missing
+    /// one. `finish_reason` uses `NSNull()` (not `nil`, which would omit the
+    /// key entirely) so JSONSerialization renders a literal JSON `null`.
     private func emitChunk(choice: [String: Any], usage: [String: Any]?) -> Data {
+        var normalizedChoice = choice
+        normalizedChoice["index"] = normalizedChoice["index"] ?? 0   // preserve builder-set index
+        if normalizedChoice["delta"] == nil { normalizedChoice["delta"] = [String: Any]() }
+        if normalizedChoice["finish_reason"] == nil { normalizedChoice["finish_reason"] = NSNull() }
         var chunk: [String: Any] = [
             "id": responseID ?? "chatcmpl-qoder",
             "object": "chat.completion.chunk",
             "created": created,
             "model": model ?? "",
-            "choices": [choice],
+            "choices": [normalizedChoice],
         ]
         if let usage {
             chunk["usage"] = usage
@@ -542,6 +583,42 @@ nonisolated struct QoderSSEReparser {
             return Data()
         }
         return Data("data: ".utf8) + data + Data("\n\n".utf8)
+    }
+
+    /// Build the trailing usage chunk (ADR 0011 §3). OpenAI's spec mandates this
+    /// chunk carries `choices: []` (no choice object) — separate from `buildChunk`
+    /// so the empty-choices rule cannot be missed. `usage` is attached at top
+    /// level. `stream_options.include_usage` semantics: a single trailing chunk
+    /// with usage and no choices.
+    private func buildUsageChunk(_ usage: [String: Any]) -> Data {
+        var chunk: [String: Any] = [
+            "id": responseID ?? "chatcmpl-qoder",
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model ?? "",
+            "choices": [Any](),   // empty array — spec-mandated for usage-only chunk
+            "usage": usage,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: chunk) else {
+            return Data()
+        }
+        return Data("data: ".utf8) + data + Data("\n\n".utf8)
+    }
+
+    /// ADR 0011 §4: synthesize a `delta.role: "assistant"` opener chunk once
+    /// per stream, on the first content/reasoning/tool emission. Mirrors CPA's
+    /// `message_start`. Returns empty `Data` once already fired (one-shot). The
+    /// caller (`processLine`) prepends this to the first non-empty `out` so the
+    /// opener precedes the payload. Does NOT fire on finish-only chunks (a bare
+    /// finish has nothing to open) — gating is in `processLine`.
+    private mutating func emitRoleOpenerIfNeeded() -> Data {
+        guard !roleOpenerSent else { return Data() }
+        roleOpenerSent = true
+        let choice: [String: Any] = [
+            "index": 0,
+            "delta": ["role": "assistant"],
+        ]
+        return emitChunk(choice: choice, usage: nil)
     }
 
     // MARK: - Snippet redaction
