@@ -137,10 +137,10 @@ nonisolated enum QoderResponsesTranslator {
             ?? (dict["max_completion_tokens"] as? Int)
 
         // Reasoning intent uses the SAME vocabulary as Chat (issue #17):
-        // reasoning_effort / reasoning / thinking. parseReasoningIntent is
-        // private on QoderChatTranslator; re-derive here via the same rules so
-        // the Responses path does not grow a divergent vocabulary.
-        let reasoningIntent = parseReasoningIntent(from: dict)
+        // reasoning_effort / reasoning / thinking. The vocabulary lives in the
+        // shared `QoderReasoningVocabulary` namespace (issue #27), so the
+        // Responses path cannot grow a divergent vocabulary from the Chat path.
+        let reasoningIntent = QoderReasoningVocabulary.parseReasoningIntent(from: dict)
 
         return OpenAIChatRequest(
             model: model,
@@ -361,90 +361,13 @@ nonisolated enum QoderResponsesTranslator {
     }
 
     // MARK: - Reasoning intent
-
-    /// Re-derives the agent's reasoning intent using the SAME vocabulary
-    /// `QoderChatTranslator` recognizes (issue #17): `reasoning_effort` (string
-    /// shortcut) → `reasoning: {effort, exclude}` (object) → `thinking: {type,
-    /// budget_tokens}`. Centralized here (not bridged through
-    /// `QoderChatTranslator.parseReasoningIntent`, which is file-private and
-    /// takes the body dict post-parse) so the Responses path stays self-
-    /// contained for its input shape while honoring the same vocabulary.
-    ///
-    /// The disable-clamp (`none`/`off`/`minimal` → `.disabled`) and tier
-    /// clamping (`low/medium/high/xhigh/max` + aliases) mirror
-    /// `QoderChatTranslator` exactly; deviations would cause two agents
-    /// sending the same intent to get different thinking selections depending
-    /// on which endpoint they hit, which is a correctness bug.
-    private static func parseReasoningIntent(from dict: [String: Any]) -> OpenAIReasoningIntent {
-        if let effortStr = dict["reasoning_effort"] as? String, !effortStr.isEmpty {
-            if isDisableAlias(effortStr) { return .disabled }
-            return .enabled(effort: clampEffort(effortStr))
-        }
-        if let reasoning = dict["reasoning"] as? [String: Any] {
-            if let effortStr = reasoning["effort"] as? String, !effortStr.isEmpty {
-                if isDisableAlias(effortStr) { return .disabled }
-                return .enabled(effort: clampEffort(effortStr))
-            }
-        }
-        if let thinking = dict["thinking"] as? [String: Any] {
-            let type = (thinking["type"] as? String) ?? ""
-            switch type {
-            case "disabled":
-                return .disabled
-            case "enabled":
-                if let budget = thinking["budget_tokens"] as? Int, budget > 0 {
-                    return .enabled(effort: effortForBudget(budget))
-                }
-                return .enabled(effort: nil)
-            default:
-                break
-            }
-        }
-        return .absent
-    }
-
-    /// Whether an effort-string value is a "turn thinking off" signal. Mirrors
-    /// `QoderChatTranslator.isDisableAlias` so both endpoints agree on which
-    /// strings mean "disable" vs. "low effort."
-    private static func isDisableAlias(_ raw: String) -> Bool {
-        switch raw.lowercased() {
-        case "none", "off", "disable", "disabled", "false":
-            return true
-        default:
-            return false
-        }
-    }
-
-    /// Map an arbitrary effort string onto one of Qoder's five tiers. Mirrors
-    /// `QoderChatTranslator.clampEffort`; `minimal` clamps to `low` (NOT
-    /// `.disabled`) because the caller already passed the disable check.
-    private static func clampEffort(_ raw: String) -> String {
-        let known: Set<String> = ["low", "medium", "high", "xhigh", "max"]
-        let lowered = raw.lowercased()
-        if known.contains(lowered) { return lowered }
-        switch lowered {
-        case "minimal":
-            return "low"
-        case "standard", "normal", "default", "auto":
-            return "medium"
-        case "ultra", "extreme", "maximum", "best", "strong":
-            return "max"
-        default:
-            return "medium"
-        }
-    }
-
-    /// Map an Anthropic-style `budget_tokens` to the nearest Qoder tier. Mirrors
-    /// `QoderChatTranslator.effortForBudget`.
-    private static func effortForBudget(_ budget: Int) -> String {
-        switch budget {
-        case ..<4096: return "low"
-        case ..<16384: return "medium"
-        case ..<65536: return "high"
-        case ..<262144: return "xhigh"
-        default: return "max"
-        }
-    }
+    //
+    // The reasoning vocabulary (parseReasoningIntent + isDisableAlias /
+    // clampEffort / effortForBudget) is shared with the Chat translator via
+    // `QoderReasoningVocabulary` (issue #27). These four helpers used to be
+    // duplicated here byte-for-byte; centralizing them removes the risk of the
+    // two endpoints drifting on which strings mean "disable" vs. "low effort"
+    // or how tiers clamp.
 
     // MARK: - Serialization helpers
 
