@@ -1538,13 +1538,16 @@ final class ProxyBridge {
                 // Pre-stream failure → true HTTP error. The status lives on the
                 // error itself (issue #14): requestRejected carries the
                 // translator's chosen 400/413, missingProxyAPIKey → 401,
-                // noAccountsAvailable → 503. ProxyBridge.sendError wraps the
+                // noAccountsAvailable → 503, allAccountsCoolingDown → 429 +
+                // Retry-After (OpenAI-compatible rate-limit shape so agent
+                // clients auto-back-off). ProxyBridge.sendError wraps the
                 // message in the ADR 0010 OpenAI error envelope, so the agent
                 // sees a structured `{"error":{...}}` body matching the status.
                 self.sendError(
                     to: originalConnection,
                     statusCode: error.httpStatus,
-                    message: error.localizedDescription
+                    message: error.localizedDescription,
+                    retryAfter: error.retryAfterSeconds
                 )
                 return
             } catch {
@@ -2336,7 +2339,12 @@ final class ProxyBridge {
     
     // MARK: - Error Response
     
-    private nonisolated func sendError(to connection: NWConnection, statusCode: Int, message: String) {
+    private nonisolated func sendError(
+        to connection: NWConnection,
+        statusCode: Int,
+        message: String,
+        retryAfter: TimeInterval? = nil
+    ) {
         // ADR 0010: build the OpenAI JSON error envelope via the single CPA
         // builder. Every status (Qoder auth → 401, endpoint gate → 404, parse
         // failure → 400, upstream → 502, etc.) flows through the same map, so
@@ -2354,10 +2362,18 @@ final class ProxyBridge {
 
         // Build HTTP response with proper CRLF line endings (no leading whitespace).
         // Content-Type is now application/json (was text/plain) per ADR 0010.
-        let headers = "HTTP/1.1 \(statusCode) \(reasonPhrase)\r\n" +
+        var headers = "HTTP/1.1 \(statusCode) \(reasonPhrase)\r\n" +
             "Content-Type: application/json\r\n" +
-            "Content-Length: \(bodyData.count)\r\n" +
-            "Connection: close\r\n" +
+            "Content-Length: \(bodyData.count)\r\n"
+        // `Retry-After` (delta-seconds, RFC 7231 §7.1.3) — emitted only for the
+        // rate-limit case (HTTP 429 from all-accounts-cooling-down). Agent
+        // clients built for OpenAI's API read this to auto-back-off; without it
+        // they'd busy-retry against accounts still in cooldown. Rounded up so
+        // the agent retries after, never before, the cooldown lifts.
+        if let retryAfter {
+            headers += "Retry-After: \(Int(ceil(retryAfter)))\r\n"
+        }
+        headers += "Connection: close\r\n" +
             "\r\n"
 
         guard let headerData = headers.data(using: .utf8) else {

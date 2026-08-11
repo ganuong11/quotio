@@ -931,7 +931,13 @@ final class QoderFailoverRouterTests: XCTestCase {
 
     // MARK: - All accounts exhausted → throw
 
-    func testAllAccounts429ThrowsNoAccountsAvailable() async throws {
+    /// When all accounts return 429 (rate-limited on the chat path), the
+    /// router now throws `.allAccountsCoolingDown` (HTTP 429 + Retry-After),
+    /// not `.noAccountsAvailable` (HTTP 503). The 503 was wrong for a self-
+    /// healing condition: OpenAI agents won't auto-back-off a 503, and the
+    /// `server_error` body type gave no retry hint. A 429 with a `Retry-After`
+    /// header and `rate_limit_error` body lets the agent wait and retry.
+    func testAllAccounts429ThrowsAllAccountsCoolingDown() async throws {
         let vault = InMemoryCredentialStore()
         let a = makeAccount(key: "a@example.com")
         let b = makeAccount(key: "b@example.com")
@@ -945,14 +951,86 @@ final class QoderFailoverRouterTests: XCTestCase {
         )
         do {
             _ = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
-            XCTFail("expected noAccountsAvailable after all accounts 429")
+            XCTFail("expected allAccountsCoolingDown after all accounts 429")
         } catch let error as QoderFailoverError {
-            if case .noAccountsAvailable = error {} else {
-                XCTFail("expected noAccountsAvailable, got \(error)")
+            guard case .allAccountsCoolingDown(let retryAfter) = error else {
+                return XCTFail("expected .allAccountsCoolingDown, got \(error)")
             }
+            XCTAssertNotNil(retryAfter, "Retry-After must be populated when accounts are cooling")
+            XCTAssertGreaterThan(retryAfter ?? 0, 0, "Retry-After must be positive")
+            XCTAssertEqual(error.httpStatus, 429, "429 case must map to HTTP 429, not 503")
         }
         let callCount = await gateway.callCount
         XCTAssertEqual(callCount, 2, "each account attempted once")
+    }
+
+    /// When all accounts are persistently *disabled* (revoked PAT, not just
+    /// rate-limited), the router must still throw `.noAccountsAvailable`
+    /// (HTTP 503), NOT `.allAccountsCoolingDown` (429). A 429 would make the
+    /// agent retry forever against accounts that need human intervention.
+    /// This guards the classifier in `exhaustionError()`.
+    func testAllAccountsDisabledThrows503Not429() async throws {
+        let vault = InMemoryCredentialStore()
+        let a = makeAccount(key: "a@example.com")
+        let b = makeAccount(key: "b@example.com")
+        await vault.seed(a, makeCredential(accountID: a.id))
+        await vault.seed(b, makeCredential(accountID: b.id))
+        let metadata = makeMetadataStore()
+        try await metadata.setDisabled(true, accountID: a.id)
+        try await metadata.setDisabled(true, accountID: b.id)
+        let gateway = MockGatewayClient()
+        // Gateway never reached — both accounts are filtered pre-attempt.
+        let router = makeRouter(
+            vault: vault, pat: MockPATRefresher(), gateway: gateway,
+            metadata: metadata
+        )
+        do {
+            _ = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
+            XCTFail("expected noAccountsAvailable when all accounts disabled")
+        } catch let error as QoderFailoverError {
+            guard case .noAccountsAvailable = error else {
+                return XCTFail("expected .noAccountsAvailable (503) for disabled accounts, got \(error)")
+            }
+            XCTAssertEqual(error.httpStatus, 503, "disabled accounts must surface as 503, not 429")
+            XCTAssertNil(error.retryAfterSeconds, "503 must not carry a Retry-After hint")
+        }
+    }
+
+    /// The `Retry-After` value on `.allAccountsCoolingDown` reflects the
+    /// earliest cooldown expiry, not the latest. With two accounts returning
+    /// 429 with different `Retry-After` hints (60s floor vs 120s), the thrown
+    /// error carries ~60s — the agent can retry as soon as the first account
+    /// is available, not after both clear.
+    func testRetryAfterReflectsEarliestCooldown() async throws {
+        let vault = InMemoryCredentialStore()
+        let a = makeAccount(key: "a@example.com")
+        let b = makeAccount(key: "b@example.com")
+        await vault.seed(a, makeCredential(accountID: a.id))
+        await vault.seed(b, makeCredential(accountID: b.id))
+        let gateway = MockGatewayClient()
+        // a returns 429 with Retry-After: 5 → clamped to the 60s floor.
+        // b returns 429 with Retry-After: 120 → honored (between floor and ceiling).
+        await gateway.seed([
+            .init(status: 429, headerFields: ["Retry-After": "5"]),
+            .init(status: 429, headerFields: ["Retry-After": "120"]),
+        ])
+        let router = makeRouter(
+            vault: vault, pat: MockPATRefresher(), gateway: gateway,
+            metadata: makeMetadataStore()
+        )
+        do {
+            _ = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
+            XCTFail("expected allAccountsCoolingDown")
+        } catch let error as QoderFailoverError {
+            guard case .allAccountsCoolingDown(let retryAfter) = error else {
+                return XCTFail("expected .allAccountsCoolingDown, got \(error)")
+            }
+            // Earliest cooldown is the floor (60s), not the 120s ceiling.
+            XCTAssertLessThanOrEqual(retryAfter ?? 0, 65,
+                "Retry-After should reflect the earliest (~60s floor), not the latest (120s)")
+            XCTAssertGreaterThanOrEqual(retryAfter ?? 0, 55,
+                "Retry-After should be near the 60s floor")
+        }
     }
 
     // MARK: - 401 → one-shot re-exchange, then retry same account

@@ -95,9 +95,16 @@ nonisolated enum QoderFailoverError: Error, LocalizedError {
     /// (`stream: false` is no longer rejected — non-streaming is served by
     /// aggregation, issue #9 / ADR 0014.)
     case requestRejected(_ detail: String, status: Int = 400)
-    /// No Qoder accounts are configured, or all are disabled / cooled down.
-    /// Maps to HTTP 503 (no upstream available).
+    /// No Qoder accounts are configured, or all are *persistently* disabled
+    /// (revoked PAT). Not self-healing — the user must add/re-enable an
+    /// account. Maps to HTTP 503 (no upstream available).
     case noAccountsAvailable
+    /// Every Qoder account is temporarily rate-limited (chat-path 429 from
+    /// `api3.qoder.sh`, in cooldown). Self-healing: the agent should retry
+    /// after `retryAfterSeconds`. Maps to HTTP 429 + `Retry-After` header +
+    /// OpenAI `rate_limit_error` body (the type/code mapping lives in
+    /// `QoderOpenAIError.body`, which already handled 429).
+    case allAccountsCoolingDown(retryAfterSeconds: TimeInterval?)
     /// The caller's `Authorization: Bearer <key>` was missing or empty. The
     /// CPA path has CPA enforce the key; the Qoder branch bypasses CPA, so the
     /// router owns it. Maps to HTTP 401.
@@ -108,7 +115,19 @@ nonisolated enum QoderFailoverError: Error, LocalizedError {
         switch self {
         case .requestRejected(_, let status): return status
         case .noAccountsAvailable: return 503
+        case .allAccountsCoolingDown: return 429
         case .missingProxyAPIKey: return 401
+        }
+    }
+
+    /// Seconds the agent should wait before retrying, for the rate-limit case.
+    /// Nil for every other case (no retry hint to send). ProxyBridge feeds this
+    /// into the `Retry-After` header. Single source of truth so the catch site
+    /// doesn't switch on the case again.
+    var retryAfterSeconds: TimeInterval? {
+        switch self {
+        case .allAccountsCoolingDown(let seconds): return seconds
+        case .requestRejected, .noAccountsAvailable, .missingProxyAPIKey: return nil
         }
     }
 
@@ -118,6 +137,11 @@ nonisolated enum QoderFailoverError: Error, LocalizedError {
             return detail
         case .noAccountsAvailable:
             return "No Qoder accounts available: add a PAT or wait for cooldown to clear."
+        case .allAccountsCoolingDown(let seconds):
+            if let seconds = seconds {
+                return "All Qoder accounts are rate-limited; retry after \(Int(ceil(seconds)))s."
+            }
+            return "All Qoder accounts are rate-limited; retry later."
         case .missingProxyAPIKey:
             return "Missing or invalid proxy API key (Authorization: Bearer <key>)."
         }
@@ -339,7 +363,7 @@ actor QoderFailoverRouter {
         // Primary (user-designated, or first-enabled) first.
         let candidates = try await enabledQoderAccounts()
         guard !candidates.isEmpty else {
-            throw QoderFailoverError.noAccountsAvailable
+            throw await exhaustionError()
         }
 
         // Track accounts that already burned their one-shot 401 re-exchange
@@ -484,7 +508,7 @@ actor QoderFailoverRouter {
         }
 
         // Every candidate failed.
-        throw QoderFailoverError.noAccountsAvailable
+        throw await exhaustionError()
     }
 
     // MARK: - Per-account attempt
@@ -1131,6 +1155,39 @@ actor QoderFailoverRouter {
             .filter { $0.provider == .qoder }
             .filter { !disabledIDs.contains($0.id) }
             .filter { !cooldowns.keys.contains($0.id) }
+    }
+
+    /// Decide which exhaustion error to throw when no candidate can serve the
+    /// request. The two cases carry different HTTP semantics:
+    ///
+    /// - **429 `allAccountsCoolingDown`** (self-healing): at least one Qoder
+    ///   account is in `cooldowns` (in-memory, 1–5 min TTL) and *not* in
+    ///   `disabledAccountIDs` (persistent). Retrying after the earliest
+    ///   cooldown expiry will succeed, so we surface an OpenAI-shaped rate-
+    ///   limit response with `Retry-After` and let the agent back off.
+    /// - **503 `noAccountsAvailable`** (needs user action): no Qoder accounts
+    ///   exist, or all are persistently disabled (revoked PAT). Waiting won't
+    ///   help, so 503 + the existing "add a PAT" message stays.
+    ///
+    /// `Retry-After` = seconds until the earliest *recoverable* cooldown
+    /// expires, clamped to ≥1s (a sub-second remainder would round to 0 and
+    /// tell the agent "retry immediately," re-tripping the limit). Cooldowns
+    /// on accounts that are *also* disabled are ignored — a disabled account
+    /// won't recover when its cooldown lifts.
+    private func exhaustionError() async -> QoderFailoverError {
+        let disabledIDs = await metadata.disabledAccountIDs()
+        let now = Date()
+        // Only cooldowns on enabled accounts are recoverable. A disabled-
+        // and-cooled account won't serve a request when the cooldown lifts.
+        let recoverableExpiries = cooldowns.filter { id, expiresAt in
+            expiresAt > now && !disabledIDs.contains(id)
+        }
+        if recoverableExpiries.isEmpty {
+            return .noAccountsAvailable
+        }
+        let earliest = recoverableExpiries.values.min() ?? now
+        let seconds = max(1, earliest.timeIntervalSince(now))
+        return .allAccountsCoolingDown(retryAfterSeconds: seconds)
     }
 
     // MARK: - Body parsing helpers (nonisolated, pure)
