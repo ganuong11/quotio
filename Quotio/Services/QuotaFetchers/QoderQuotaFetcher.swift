@@ -144,6 +144,14 @@ actor QoderQuotaFetcher {
     private let metadata: MonitorMetadataStore
     private var session: URLSession
 
+    /// Per-account rate-limit backoff: if `quota/usage` returned 429, skip the
+    /// account for one refresh cycle (or the server's `Retry-After` if longer).
+    /// Prevents the fetcher from feeding a rate limit it already tripped — the
+    /// root cause of "No Qoder accounts available": heavy polling trips the
+    /// limit, every account that needed a job-token rotation then hits a 429 on
+    /// the exchange endpoint too, and the chat path finds zero candidates.
+    private var rateLimitedUntil: [String: Date] = [:]
+
     init(
         vault: MonitorCredentialStore = MonitorCredentialVault.shared,
         metadata: MonitorMetadataStore = .shared
@@ -161,9 +169,22 @@ actor QoderQuotaFetcher {
     func fetchAllQuotas() async -> [String: ProviderQuotaData] {
         var results: [String: ProviderQuotaData] = [:]
         let disabledAccountIDs = await metadata.disabledAccountIDs()
+        let now = Date()
+        // Lazy-evict expired rate-limit backoffs.
+        rateLimitedUntil = rateLimitedUntil.filter { _, until in until > now }
         for account in await vault.accounts()
         where account.provider == .qoder && !disabledAccountIDs.contains(account.id) && !account.isDisabled {
+            // Skip accounts in rate-limit backoff — hitting them again would
+            // extend the limit, not clear it.
+            if let until = rateLimitedUntil[account.accountKey], until > now {
+                continue
+            }
             if let quota = await fetchOwnedQuota(account: account) {
+                if quota.isRateLimited {
+                    // The fetcher saw a 429 and parsed a backoff; record it so
+                    // the next cycle skips this account.
+                    rateLimitedUntil[account.accountKey] = quota.rateLimitedUntil ?? now.addingTimeInterval(60)
+                }
                 results[account.accountKey] = quota
             }
         }
@@ -200,11 +221,13 @@ actor QoderQuotaFetcher {
 
         let data: Data
         let statusCode: Int
+        let retryAfterHeader: String?
         do {
             let (responseData, response) = try await session.data(for: request)
             guard let http = response as? HTTPURLResponse else { return nil }
             data = responseData
             statusCode = http.statusCode
+            retryAfterHeader = http.value(forHTTPHeaderField: "Retry-After")
         } catch {
             Log.quota("Qoder quota fetch failed for \(account.accountKey): \(error.localizedDescription)")
             return nil
@@ -213,6 +236,22 @@ actor QoderQuotaFetcher {
         // Auth failures surface as forbidden — Phase 2 routing owns failover.
         if statusCode == 401 || statusCode == 403 {
             return ProviderQuotaData(isForbidden: true, accountDisplayName: account.displayName)
+        }
+        // Rate limit: mark the account so the fetcher skips it on the next
+        // cycle. Honor the server's `Retry-After` (delta-seconds) when present,
+        // clamped to 60s–15min; default 60s. Without this the fetcher would
+        // re-hit the endpoint every cycle and keep the rate limit alive — the
+        // feed that cascades into "No Qoder accounts available" when the
+        // exchange endpoint is also rate-limited.
+        if statusCode == 429 {
+            let backoff = TimeInterval(retryAfterHeader?.trimmingCharacters(in: .whitespaces) ?? "") ?? 60
+            let clamped = min(max(backoff, 60), 15 * 60)
+            Log.quota("Qoder quota fetch for \(account.accountKey) rate-limited (429); backing off \(Int(clamped))s")
+            return ProviderQuotaData(
+                accountDisplayName: account.displayName,
+                isRateLimited: true,
+                rateLimitedUntil: Date().addingTimeInterval(clamped)
+            )
         }
         guard 200...299 ~= statusCode else {
             Log.quota("Qoder quota fetch for \(account.accountKey) returned HTTP \(statusCode)")

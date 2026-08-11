@@ -921,17 +921,28 @@ actor QoderFailoverRouter {
     }
 
     /// Classify a PAT-service error as permanent (won't fix itself on retry).
-    /// `.network` is transient; everything else (`invalidPAT`,
-    /// `exchangeFailed(4xx)`, `exchangeMalformed`, `userInfoFailed`,
-    /// `identityMissing`) indicates the credential or upstream state is wrong,
-    /// not that the transport is flaky.
+    /// Transient (returns false):
+    ///   - `.network` — transport failure (DNS, timeout, TLS, cancelled).
+    ///   - `.exchangeFailed(429)` — the exchange endpoint itself is rate-
+    ///     limiting us. This is the root cause of the "No Qoder accounts
+    ///     available while the real accounts still have quota" bug: heavy quota
+    ///     polling can trip `openapi.qoder.sh`'s rate limit on the exchange
+    ///     endpoint, and classifying it as permanent disabled every account
+    ///     that needed a job-token rotation, with no recheck.
+    ///   - `.userInfoFailed(429)` — same, on the userinfo endpoint.
+    /// Permanent (returns true): `.invalidPAT`, `.exchangeFailed(401/403)` (a
+    /// real revocation), `.exchangeMalformed`, `.identityMissing`. These won't
+    /// fix themselves on retry.
     private nonisolated static func isPermanentReexchangeFailure(_ error: Error) -> Bool {
         if let patError = error as? QoderPATError {
             switch patError {
             case .network:
                 return false
-            case .invalidPAT, .exchangeFailed, .exchangeMalformed,
-                 .userInfoFailed, .identityMissing:
+            case .exchangeFailed(let status, _), .userInfoFailed(let status, _):
+                // 429 (rate limited) is transient; other 4xx from the exchange
+                // or userinfo endpoints indicate a real auth problem.
+                return status != 429
+            case .invalidPAT, .exchangeMalformed, .identityMissing:
                 return true
             }
         }

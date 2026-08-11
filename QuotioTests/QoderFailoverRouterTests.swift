@@ -1182,6 +1182,69 @@ final class QoderFailoverRouterTests: XCTestCase {
         XCTAssertFalse(disabledAfterRecheck.contains(account.id), "recheck must re-enable when re-exchange succeeds")
     }
 
+    /// Regression: when the PAT exchange endpoint itself is rate-limited (HTTP
+    /// 429 from `openapi.qoder.sh/api/v1/jobToken/exchange`), the PAT service
+    /// throws `.exchangeFailed(status: 429)`. A 429 is *transient* (retry after
+    /// a cool-down), not a permanent revocation — but the classifier lumps
+    /// every `.exchangeFailed` into "permanent," so the router disables the
+    /// account on the first try with no recheck. This is the root cause of the
+    /// user-facing "No Qoder accounts available" while the real accounts still
+    /// have quota: heavy quota polling trips the exchange endpoint's rate
+    /// limit, every account that needs a job-token rotation disables, and the
+    /// chat path finds zero candidates.
+    func testExchangeRateLimit429IsTransientNotPermanent() async throws {
+        let vault = InMemoryCredentialStore()
+        let primary = makeAccount(key: "primary@example.com")
+        let secondary = makeAccount(key: "secondary@example.com")
+        await vault.seed(primary, makeCredential(accountID: primary.id))
+        await vault.seed(secondary, makeCredential(accountID: secondary.id))
+        let gateway = MockGatewayClient()
+        // primary 401 (stale token) → re-exchange hits 429 → must retry, not
+        // disable immediately. Rotation → secondary 200.
+        await gateway.seed([
+            .init(status: 401),
+            .init(status: 200, body: Data("data: [DONE]\n\n".utf8)),
+        ])
+        let pat = MockPATRefresher()
+        // A 429 from the exchange endpoint. Pre-fix: classified permanent →
+        // primary disabled on attempt 1, no recheck. Post-fix: transient →
+        // retried up to the budget, then disabled *with* a recheck.
+        await pat.seed(primary.id, .failure(QoderPATError.exchangeFailed(status: 429, snippet: "rate limited")))
+        await pat.seed(primary.id, .failure(QoderPATError.exchangeFailed(status: 429, snippet: "rate limited")))
+        let metadata = makeMetadataStore()
+        let router = makeRouter(
+            vault: vault, pat: pat, gateway: gateway,
+            metadata: metadata,
+            configuration: QoderFailoverRouterConfiguration(
+                reexchangeRetryCount: 2, recheckInterval: 0.05
+            )
+        )
+
+        let opened = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
+        XCTAssertEqual(opened.accountID, secondary.id, "should rotate to secondary after primary re-exchange retries exhausted")
+
+        // The account IS disabled after the retry budget is exhausted (we
+        // can't keep the chat path spinning forever on a rate-limited
+        // exchange), but a recheck is scheduled — and it re-enables on
+        // success, unlike a hard revocation which never rechecks.
+        let disabledAfterFirst = await metadata.disabledAccountIDs()
+        XCTAssertTrue(disabledAfterFirst.contains(primary.id), "disabled after retry exhaustion")
+
+        // Wait for the scheduled recheck (50ms).
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        // Re-exchange on recheck succeeds → account re-enabled. A real
+        // revocation (.invalidPAT) would NOT re-enable (covered by
+        // testRevocationReexchangeFailureDisablesImmediately).
+        await pat.seed(primary.id, .success(makeCredential(accountID: primary.id, token: "jt-fresh")))
+        // Force the recheck to run by waiting again (the recheck task is
+        // already in flight from the disable above; it picks up the new seed).
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        let disabledAfterRecheck = await metadata.disabledAccountIDs()
+        XCTAssertFalse(disabledAfterRecheck.contains(primary.id), "429-triggered disable must schedule a recheck, unlike a hard revocation")
+    }
+
     // MARK: - 5xx / network transient: retry same account once
 
     func test5xxRetriesSameAccountOnceThenSucceeds() async throws {

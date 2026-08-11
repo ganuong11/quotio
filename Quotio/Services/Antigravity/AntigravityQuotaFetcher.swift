@@ -368,6 +368,11 @@ nonisolated struct ProviderQuotaData: Codable, Sendable {
     var tokenExpiresAt: Date?  // For Kiro: token expiry time
     var analytics: QuotaAnalytics?
     var accountDisplayName: String?
+    /// True when the upstream returned 429 (rate limited). The fetcher should
+    /// skip this account on the next cycle for `rateLimitedUntil`.
+    var isRateLimited: Bool
+    /// When the rate-limit backoff expires and the account can be polled again.
+    var rateLimitedUntil: Date?
 
     init(
         models: [ModelQuota] = [],
@@ -376,7 +381,9 @@ nonisolated struct ProviderQuotaData: Codable, Sendable {
         planType: String? = nil,
         tokenExpiresAt: Date? = nil,
         analytics: QuotaAnalytics? = nil,
-        accountDisplayName: String? = nil
+        accountDisplayName: String? = nil,
+        isRateLimited: Bool = false,
+        rateLimitedUntil: Date? = nil
     ) {
         self.models = models
         self.lastUpdated = lastUpdated
@@ -385,6 +392,8 @@ nonisolated struct ProviderQuotaData: Codable, Sendable {
         self.tokenExpiresAt = tokenExpiresAt
         self.analytics = analytics
         self.accountDisplayName = accountDisplayName
+        self.isRateLimited = isRateLimited
+        self.rateLimitedUntil = rateLimitedUntil
     }
 
     /// Format token expiry time in user's local timezone
