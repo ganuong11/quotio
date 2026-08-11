@@ -304,22 +304,6 @@ final class QuotaViewModel {
                 await self.updateProxyConfiguration()
             }
         }
-        // When the failover router's scheduled recheck re-enables a Qoder
-        // account (transient re-exchange failures recovered), refresh Qoder
-        // quota so the Quota tab reflects the re-enable without waiting for the
-        // next timer tick. The notification carries no token — only the account
-        // key / display name.
-        NotificationCenter.default.addObserver(
-            forName: .qoderAccountAutoReenabled,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                guard let self = self else { return }
-                self.monitorAccounts = await self.monitorCoordinator.discoverAccounts(merging: self.providerQuotas)
-                await self.refreshQuota(for: .qoder)
-            }
-        }
     }
 
     private func normalizedProxyURL(_ rawValue: String?) -> String? {

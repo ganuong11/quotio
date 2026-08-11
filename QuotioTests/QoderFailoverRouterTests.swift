@@ -1106,32 +1106,30 @@ final class QoderFailoverRouterTests: XCTestCase {
         XCTAssertTrue(disabled.contains(primary.id), "primary should be disabled after revoked PAT")
     }
 
-    // MARK: - Re-exchange failure: retry, then disable + schedule recheck
+    // MARK: - Re-exchange failure: retry, then cool down or disable
 
-    /// Regression: a single transient re-exchange failure must NOT disable the
-    /// account. The PAT service distinguishes `.network` (DNS, timeout, TLS —
+    /// Regression: transient re-exchange exhaustion must NOT persistently disable
+    /// the account. The PAT service distinguishes `.network` (DNS, timeout, TLS —
     /// recoverable) from `.invalidPAT` / `.exchangeFailed(401/403)` (revoked —
-    /// permanent). Pre-fix, *any* re-exchange failure disabled permanently,
-    /// taking accounts offline while the real credential was still valid.
-    /// Fix: on a transient failure the router retries re-exchange (default 2
-    /// retries); only after the retries are exhausted does it disable, and it
-    /// schedules a one-shot recheck that re-enables if re-exchange then succeeds.
-    func testTransientReexchangeFailureRetriesBeforeDisabling() async throws {
+    /// permanent). After the transient retry budget is exhausted, the router
+    /// applies an in-memory cooldown and rotates; a user-enabled account therefore
+    /// remains enabled across Quotio restarts.
+    func testTransientReexchangeFailureRetriesBeforeCoolingDown() async throws {
         let vault = InMemoryCredentialStore()
         let primary = makeAccount(key: "primary@example.com")
         let secondary = makeAccount(key: "secondary@example.com")
         await vault.seed(primary, makeCredential(accountID: primary.id))
         await vault.seed(secondary, makeCredential(accountID: secondary.id))
         let gateway = MockGatewayClient()
-        // primary 401, re-exchange fails twice (network), so primary is disabled
-        // + recheck scheduled; rotation → secondary 200.
+        // primary 401, re-exchange fails twice (network), so primary enters an
+        // in-memory cooldown; rotation → secondary 200.
         await gateway.seed([
             .init(status: 401),
             .init(status: 200, body: Data("data: [DONE]\n\n".utf8)),
         ])
         let pat = MockPATRefresher()
-        // Two consecutive transient failures: the retry budget (default 2) is
-        // exhausted, so the account is disabled.
+        // Two consecutive transient failures exhaust the retry budget, so the
+        // account is cooled down without changing persistent metadata.
         await pat.seed(primary.id, .failure(QoderPATError.network("timeout")))
         await pat.seed(primary.id, .failure(QoderPATError.network("timeout")))
         let metadata = makeMetadataStore()
@@ -1143,11 +1141,11 @@ final class QoderFailoverRouterTests: XCTestCase {
         let opened = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
         XCTAssertEqual(opened.accountID, secondary.id, "should rotate to secondary after primary re-exchange retries exhausted")
         let disabled = await metadata.disabledAccountIDs()
-        XCTAssertTrue(disabled.contains(primary.id), "primary disabled only after retry budget exhausted")
+        XCTAssertFalse(disabled.contains(primary.id), "transient exhaustion must not persistently disable the account")
 
         // Exactly two re-exchange attempts (the retry budget), not one.
         let refreshCalls = await pat.callLog.filter { $0 == primary.id }
-        XCTAssertEqual(refreshCalls.count, 2, "re-exchange retried up to the configured budget before disabling")
+        XCTAssertEqual(refreshCalls.count, 2, "re-exchange retried up to the configured budget before cooling down")
     }
 
     /// A transient re-exchange failure followed by a success on retry keeps the
@@ -1211,17 +1209,51 @@ final class QoderFailoverRouterTests: XCTestCase {
         XCTAssertEqual(refreshCalls.count, 1, "permanent failures must not burn the retry budget")
     }
 
-    /// After a disable triggered by exhausted re-exchange retries, a scheduled
-    /// recheck re-enables the account if re-exchange succeeds. This is the
-    /// "Quotio doesn't recheck" half of the bug: the old code disabled forever.
-    /// Configurable recheck interval keeps the test fast.
-    func testScheduledRecheckReenablesAccountOnSuccess() async throws {
+    /// With a single account, transient re-exchange exhaustion is temporary
+    /// routing unavailability: return HTTP-429 semantics with a retry delay, and
+    /// leave persistent metadata untouched. This prevents a manually enabled
+    /// account from being written back as disabled on the next client request.
+    func testTransientReexchangeExhaustionReturnsCooldownWithoutPersistentDisable() async throws {
         let vault = InMemoryCredentialStore()
         let account = makeAccount(key: "user@example.com")
         await vault.seed(account, makeCredential(accountID: account.id))
         let gateway = MockGatewayClient()
-        // First request: 401, re-exchange fails twice (network) → disabled +
-        // recheck scheduled. Second request (after recheck): 200.
+        await gateway.seed([.init(status: 401)])
+        let pat = MockPATRefresher()
+        await pat.seed(account.id, .failure(QoderPATError.network("timeout")))
+        await pat.seed(account.id, .failure(QoderPATError.network("timeout")))
+        let metadata = makeMetadataStore()
+        let router = makeRouter(
+            vault: vault, pat: pat, gateway: gateway,
+            metadata: metadata,
+            configuration: QoderFailoverRouterConfiguration(
+                cooldownTTL: 0.05,
+                reexchangeRetryCount: 2
+            )
+        )
+
+        do {
+            _ = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
+            XCTFail("expected allAccountsCoolingDown after transient exhaustion")
+        } catch let error as QoderFailoverError {
+            guard case .allAccountsCoolingDown(let retryAfter) = error else {
+                return XCTFail("expected allAccountsCoolingDown, got \(error)")
+            }
+            XCTAssertNotNil(retryAfter)
+            XCTAssertGreaterThan(retryAfter ?? 0, 0)
+        }
+
+        let disabled = await metadata.disabledAccountIDs()
+        XCTAssertFalse(disabled.contains(account.id), "transient exhaustion must not persist a disabled ID")
+    }
+
+    /// In-memory cooldowns self-heal without a metadata mutation. Once the TTL
+    /// expires, the same account is eligible again and can serve a later request.
+    func testTransientReexchangeCooldownExpiresAndAccountBecomesEligibleAgain() async throws {
+        let vault = InMemoryCredentialStore()
+        let account = makeAccount(key: "user@example.com")
+        await vault.seed(account, makeCredential(accountID: account.id))
+        let gateway = MockGatewayClient()
         await gateway.seed([
             .init(status: 401),
             .init(status: 200, body: Data("data: [DONE]\n\n".utf8)),
@@ -1229,35 +1261,31 @@ final class QoderFailoverRouterTests: XCTestCase {
         let pat = MockPATRefresher()
         await pat.seed(account.id, .failure(QoderPATError.network("timeout")))
         await pat.seed(account.id, .failure(QoderPATError.network("timeout")))
-        // Recheck re-exchange succeeds.
-        await pat.seed(account.id, .success(makeCredential(accountID: account.id, token: "jt-fresh")))
         let metadata = makeMetadataStore()
-        // Tight recheck interval so the test runs in milliseconds, not minutes.
         let router = makeRouter(
             vault: vault, pat: pat, gateway: gateway,
             metadata: metadata,
             configuration: QoderFailoverRouterConfiguration(
-                reexchangeRetryCount: 2,
-                recheckInterval: 0.05
+                cooldownTTL: 0.05,
+                reexchangeRetryCount: 2
             )
         )
 
-        // First request disables the account but the router still throws
-        // (noAccountsAvailable) because the single account is now disabled.
         do {
             _ = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
-            XCTFail("expected noAccountsAvailable after the only account was disabled")
+            XCTFail("expected cooldown on the first request")
         } catch let error as QoderFailoverError {
-            if case .noAccountsAvailable = error {} else { XCTFail("expected noAccountsAvailable, got \(error)") }
+            guard case .allAccountsCoolingDown = error else {
+                return XCTFail("expected allAccountsCoolingDown, got \(error)")
+            }
         }
-        let disabledAfterFirst = await metadata.disabledAccountIDs()
-        XCTAssertTrue(disabledAfterFirst.contains(account.id), "account disabled after retry exhaustion")
 
-        // Wait for the scheduled recheck (50ms) to fire.
-        try await Task.sleep(nanoseconds: 300_000_000)  // 300ms headroom over 50ms
+        try await Task.sleep(nanoseconds: 100_000_000)
 
-        let disabledAfterRecheck = await metadata.disabledAccountIDs()
-        XCTAssertFalse(disabledAfterRecheck.contains(account.id), "recheck must re-enable when re-exchange succeeds")
+        let opened = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
+        XCTAssertEqual(opened.accountID, account.id)
+        let disabled = await metadata.disabledAccountIDs()
+        XCTAssertFalse(disabled.contains(account.id))
     }
 
     /// Regression: when the PAT exchange endpoint itself is rate-limited (HTTP
@@ -1284,43 +1312,22 @@ final class QoderFailoverRouterTests: XCTestCase {
             .init(status: 200, body: Data("data: [DONE]\n\n".utf8)),
         ])
         let pat = MockPATRefresher()
-        // A 429 from the exchange endpoint. Pre-fix: classified permanent →
-        // primary disabled on attempt 1, no recheck. Post-fix: transient →
-        // retried up to the budget, then disabled *with* a recheck.
+        // A 429 from the exchange endpoint is transient: retry up to the
+        // budget, then cool down without changing persistent account state.
         await pat.seed(primary.id, .failure(QoderPATError.exchangeFailed(status: 429, snippet: "rate limited")))
         await pat.seed(primary.id, .failure(QoderPATError.exchangeFailed(status: 429, snippet: "rate limited")))
         let metadata = makeMetadataStore()
         let router = makeRouter(
             vault: vault, pat: pat, gateway: gateway,
             metadata: metadata,
-            configuration: QoderFailoverRouterConfiguration(
-                reexchangeRetryCount: 2, recheckInterval: 0.05
-            )
+            configuration: QoderFailoverRouterConfiguration(reexchangeRetryCount: 2)
         )
 
         let opened = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
         XCTAssertEqual(opened.accountID, secondary.id, "should rotate to secondary after primary re-exchange retries exhausted")
 
-        // The account IS disabled after the retry budget is exhausted (we
-        // can't keep the chat path spinning forever on a rate-limited
-        // exchange), but a recheck is scheduled — and it re-enables on
-        // success, unlike a hard revocation which never rechecks.
-        let disabledAfterFirst = await metadata.disabledAccountIDs()
-        XCTAssertTrue(disabledAfterFirst.contains(primary.id), "disabled after retry exhaustion")
-
-        // Wait for the scheduled recheck (50ms).
-        try await Task.sleep(nanoseconds: 300_000_000)
-
-        // Re-exchange on recheck succeeds → account re-enabled. A real
-        // revocation (.invalidPAT) would NOT re-enable (covered by
-        // testRevocationReexchangeFailureDisablesImmediately).
-        await pat.seed(primary.id, .success(makeCredential(accountID: primary.id, token: "jt-fresh")))
-        // Force the recheck to run by waiting again (the recheck task is
-        // already in flight from the disable above; it picks up the new seed).
-        try await Task.sleep(nanoseconds: 100_000_000)
-
-        let disabledAfterRecheck = await metadata.disabledAccountIDs()
-        XCTAssertFalse(disabledAfterRecheck.contains(primary.id), "429-triggered disable must schedule a recheck, unlike a hard revocation")
+        let disabled = await metadata.disabledAccountIDs()
+        XCTAssertFalse(disabled.contains(primary.id), "exchange 429 must cool down without persisting a disabled ID")
     }
 
     // MARK: - 5xx / network transient: retry same account once

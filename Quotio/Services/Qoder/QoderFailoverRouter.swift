@@ -156,11 +156,6 @@ nonisolated enum QoderFailoverError: Error, LocalizedError {
 /// account key for the notification body — never the PAT or token.
 nonisolated extension Notification.Name {
     static let qoderPATRevoked = Notification.Name("dev.quotio.qoder.pat-revoked")
-    /// Posted when a scheduled recheck re-enables an account that had been
-    /// auto-disabled by re-exchange retry exhaustion. Same `userInfo` shape as
-    /// `qoderPATRevoked` (accountKey, displayName). The UI can use this to
-    /// refresh its account list without waiting for the next quota tick.
-    static let qoderAccountAutoReenabled = Notification.Name("dev.quotio.qoder.account-auto-reenabled")
 }
 
 /// The PAT-refresh seam the router depends on. Production conformance is
@@ -196,29 +191,21 @@ nonisolated struct QoderFailoverRouterConfiguration: Sendable {
     /// server can't park an account indefinitely. RFC 7231 §7.1.3 permits
     /// arbitrarily large values; 300s keeps a single bad hint bounded.
     let retryAfterCeiling: TimeInterval
-    /// How many times to attempt a transient (`.network`) PAT re-exchange
-    /// before giving up and disabling the account. A genuine revocation
+    /// How many times to attempt a transient (`.network` or endpoint 429) PAT
+    /// re-exchange before cooling the account down. A genuine revocation
     /// (`.invalidPAT`, `.exchangeFailed(401/403)`) disables on the first try
     /// without burning this budget — a malformed PAT won't fix itself on retry.
     /// This is the *total* attempt count (not retries-on-top-of-initial): at
-    /// the default of 2, the router tries re-exchange twice before disabling.
-    /// Pre-fix, any re-exchange failure disabled immediately, so a single
-    /// network blip took a still-valid account offline forever.
+    /// the default of 2, the router tries re-exchange twice before cooldown.
+    /// Transient exhaustion never changes persistent account enablement.
     let reexchangeRetryCount: Int
-    /// Delay before the one-shot recheck that re-enables an account disabled
-    /// by re-exchange-retry exhaustion. The recheck re-exchanges; on success it
-    /// clears the disabled flag so the account returns to rotation. On failure
-    /// it leaves the account disabled (a later user toggle or a future request
-    /// will recheck again). Default 15 minutes; tests inject a small value.
-    let recheckInterval: TimeInterval
 
     init(
         cooldownTTL: TimeInterval = 60,
         silentStallStrikeThreshold: Int = 2,
         retryAfterFloor: TimeInterval? = nil,
         retryAfterCeiling: TimeInterval = 300,
-        reexchangeRetryCount: Int = 2,
-        recheckInterval: TimeInterval = 15 * 60
+        reexchangeRetryCount: Int = 2
     ) {
         self.cooldownTTL = cooldownTTL
         self.silentStallStrikeThreshold = silentStallStrikeThreshold
@@ -227,7 +214,6 @@ nonisolated struct QoderFailoverRouterConfiguration: Sendable {
         self.retryAfterFloor = retryAfterFloor ?? cooldownTTL
         self.retryAfterCeiling = retryAfterCeiling
         self.reexchangeRetryCount = max(0, reexchangeRetryCount)
-        self.recheckInterval = recheckInterval
     }
 
     /// Default production policy (mirrors the pre-issue #12 constants).
@@ -258,14 +244,6 @@ actor QoderFailoverRouter {
     /// current `openStream` call. Cleared per-call (not persistent) — the
     /// "one re-exchange" rule is per-failure-event, not per-account-lifetime.
     /// Implemented as a local in `openStream`, see implementation.
-
-    /// Account IDs with a scheduled one-shot recheck in flight. Dedupes so a
-    /// burst of failures schedules at most one recheck per account; the entry
-    /// is removed when the recheck completes (success or failure). In-memory
-    /// only — a restart drops pending rechecks, which is fine because disabled
-    /// state persists in `MonitorMetadataStore` and the next manual toggle or
-    /// quota refresh will revisit it.
-    private var rechecksInFlight: Set<String> = []
 
     private let vault: any MonitorCredentialStore
     private let metadata: MonitorMetadataStore
@@ -400,10 +378,9 @@ actor QoderFailoverRouter {
                 switch action {
                 case .reexchangeAndRetry:
                     // Re-exchange with a transient-retry budget, then retry the
-                    // same account. `isPermanent` tells us whether the failure
-                    // is recoverable (`.network`) — only transient-failure
-                    // disables get a scheduled recheck, since a hard revocation
-                    // won't fix itself by waiting.
+                    // same account. `isPermanent` selects the terminal policy:
+                    // proven revocations persistently disable; recoverable
+                    // failures enter the in-memory cooldown.
                     var isPermanent = false
                     if let refreshed = await reexchangeWithRetry(
                         for: account,
@@ -454,17 +431,16 @@ actor QoderFailoverRouter {
                         }
                         // Other errors fall through to the next account.
                     } else {
-                        // Re-exchange failed. If the failure was permanent
-                        // (revoked PAT, malformed exchange), disable + notify so
-                        // the user learns — a recheck won't help. If it was
-                        // transient (network) and the retry budget is exhausted,
-                        // disable + notify too, but schedule a one-shot recheck
-                        // so a network blip doesn't take a still-valid account
-                        // offline forever — the next re-exchange may succeed.
-                        await disableAndNotifyRevoked(
-                            account: account,
-                            scheduleRecheck: !isPermanent
-                        )
+                        // Re-exchange failed. Proven permanent failures (revoked
+                        // PAT, malformed exchange) disable + notify. Transient
+                        // exhaustion (network or endpoint 429) is temporary: put
+                        // the account in the existing in-memory cooldown and
+                        // rotate, preserving the user's enabled state on disk.
+                        if isPermanent {
+                            await disableAndNotifyRevoked(account: account)
+                        } else {
+                            applyCooldown(accountID: account.id)
+                        }
                         continue
                     }
                 case .cooldownAndRotate:
@@ -910,12 +886,11 @@ actor QoderFailoverRouter {
     ///
     /// Returns the refreshed credential on success, or nil if every attempt
     /// failed. The caller (the reactive `.reexchangeAndRetry` site in
-    /// `openStream`) treats nil as "account unusable this round" and — per the
-    /// fix for the over-disable bug — only disables persistently after this
-    /// budget is exhausted, scheduling a one-shot recheck.
+    /// `openStream`) disables only proven permanent failures; transient
+    /// exhaustion enters the existing in-memory cooldown.
     ///
-    /// `isPermanent` is exposed for the caller to decide disable-immediately vs.
-    /// disable-after-retries without re-classifying.
+    /// `isPermanent` is exposed so the caller can choose persistent disable vs.
+    /// cooldown without re-classifying.
     private func reexchangeWithRetry(
         for account: MonitorAccount,
         credential: MonitorOAuthCredential,
@@ -1051,21 +1026,12 @@ actor QoderFailoverRouter {
     }
 
     /// Persistently disable the account (so it's skipped on subsequent
-    /// requests too) and post the reliable revocation notification. ADR 0006
-    /// §2: "the user must learn via Quotio's notification, not via a failed
-    /// agent request." The notification carries the account key (display
-    /// name) — never the PAT or token.
-    ///
-    /// `scheduleRecheck`: when the disable was triggered by re-exchange retry
-    /// exhaustion (transient network failures), schedule a one-shot recheck so
-    /// the account is not parked forever — the real credential may still be
-    /// valid and the failures may have been a network blip. Defaults to false
-    /// for call sites that disable on hard revocation evidence (e.g. a second
-    /// 401 after a *successful* re-exchange) where a recheck is pointless.
-    private func disableAndNotifyRevoked(
-        account: MonitorAccount,
-        scheduleRecheck: Bool = false
-    ) async {
+    /// requests too) and post the reliable revocation notification. Reserved
+    /// for proven permanent failures; transient re-exchange exhaustion uses an
+    /// in-memory cooldown instead. ADR 0006 §2: "the user must learn via
+    /// Quotio's notification, not via a failed agent request." The notification
+    /// carries the account key (display name) — never the PAT or token.
+    private func disableAndNotifyRevoked(account: MonitorAccount) async {
         try? await metadata.setDisabled(true, accountID: account.id)
         Task { @MainActor in
             NotificationCenter.default.post(
@@ -1073,68 +1039,6 @@ actor QoderFailoverRouter {
                 object: nil,
                 userInfo: ["accountKey": account.accountKey, "displayName": account.displayName]
             )
-        }
-        if scheduleRecheck {
-            scheduleReEnableRecheck(for: account)
-        }
-    }
-
-    /// Schedule a one-shot recheck that re-enables the account if re-exchange
-    /// succeeds after `recheckInterval`. Dedupes on `rechecksInFlight` so a
-    /// burst of failures schedules at most one recheck per account at a time.
-    /// Fire-and-forget — the task detaches from the caller's request lifecycle.
-    private func scheduleReEnableRecheck(for account: MonitorAccount) {
-        guard !rechecksInFlight.contains(account.id) else { return }
-        rechecksInFlight.insert(account.id)
-        let interval = configuration.recheckInterval
-        let metadata = self.metadata
-        let vault = self.vault
-        let patService = self.patService
-        let accountID = account.id
-        Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
-            await self?.performReEnableRecheck(
-                accountID: accountID,
-                account: account,
-                metadata: metadata,
-                vault: vault,
-                patService: patService
-            )
-        }
-    }
-
-    /// The body of the scheduled recheck. Re-exchanges once; on success clears
-    /// the disabled flag (the account returns to rotation) and posts a
-    /// notification so the UI can reflect the re-enable. On failure leaves the
-    /// account disabled — a later user toggle or a future request will revisit.
-    private func performReEnableRecheck(
-        accountID: String,
-        account: MonitorAccount,
-        metadata: MonitorMetadataStore,
-        vault: any MonitorCredentialStore,
-        patService: any QoderPATRefreshing
-    ) async {
-        defer { rechecksInFlight.remove(accountID) }
-        // If the user manually re-enabled the account in the meantime, we're a
-        // no-op — `setDisabled(false)` already cleared the flag.
-        let disabled = await metadata.disabledAccountIDs()
-        guard disabled.contains(accountID) else { return }
-        guard let credential = await vault.credential(for: accountID) else { return }
-        do {
-            let refreshed = try await patService.refreshCredential(credential, account: account)
-            try? await vault.save(refreshed, metadata: account)
-            try? await metadata.setDisabled(false, accountID: accountID)
-            Task { @MainActor in
-                NotificationCenter.default.post(
-                    name: .qoderAccountAutoReenabled,
-                    object: nil,
-                    userInfo: ["accountKey": account.accountKey, "displayName": account.displayName]
-                )
-            }
-        } catch {
-            // Re-exchange still failing — leave the account disabled. A later
-            // manual toggle or a future recheck (triggered by the next disable)
-            // will try again.
         }
     }
 
