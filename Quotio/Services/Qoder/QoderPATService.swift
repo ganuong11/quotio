@@ -108,8 +108,22 @@ actor QoderPATService: QoderPATRefreshing {
 
     private var session: URLSession
 
-    init() {
-        session = URLSession(configuration: ProxyConfigurationService.createProxiedConfigurationStatic(timeout: 20))
+    /// Minimum gap between successive `jobToken/exchange` call *starts*
+    /// (ADR 0017). Empirical default 1s — the repo has no measurement of
+    /// Qoder's exchange rate limit. Tests inject a smaller value; `session`
+    /// lets tests stub the network via `URLProtocol`. `QoderPATService.shared`
+    /// uses both defaults.
+    private let minExchangeInterval: TimeInterval
+
+    /// When the next exchange may start. Claimed synchronously inside
+    /// `waitForExchangeSlot` (no suspension between check and claim) so
+    /// concurrent callers — quota polling and failover re-exchange, which run
+    /// on separate actors but funnel into this one — stay spaced apart.
+    private var nextExchangeAt: Date = .distantPast
+
+    init(minExchangeInterval: TimeInterval = 1.0, session: URLSession? = nil) {
+        self.minExchangeInterval = minExchangeInterval
+        self.session = session ?? URLSession(configuration: ProxyConfigurationService.createProxiedConfigurationStatic(timeout: 20))
     }
 
     /// Rebuild the URLSession after the user changes their upstream proxy.
@@ -218,6 +232,37 @@ actor QoderPATService: QoderPATRefreshing {
         )
     }
 
+    // MARK: - Exchange pacing
+
+    /// Wait until this caller may start an exchange, then claim the slot.
+    ///
+    /// Loop body: read `nextExchangeAt`; if the slot is free (`<= now`), claim
+    /// it (`nextExchangeAt = now + minExchangeInterval`) and return immediately
+    /// — no suspension between check and claim, so only one caller wins a given
+    /// slot. If the slot is taken, sleep until it frees, then loop and
+    /// *re-check*: another caller may have claimed the next slot while we were
+    /// waking, in which case we sleep again.
+    ///
+    /// The first caller is never delayed (initial `nextExchangeAt` is
+    /// `.distantPast`, so the first slot is always free).
+    ///
+    /// Cancellation during the sleep propagates as `CancellationError` (the
+    /// `try` is not swallowed), consistent with `perform()`'s mapping of a
+    /// cancelled `session.data(for:)` to `QoderPATError.network`: the caller
+    /// already handles transport cancellation through that shape.
+    private func waitForExchangeSlot() async throws {
+        while true {
+            let now = Date()
+            if nextExchangeAt <= now {
+                nextExchangeAt = now.addingTimeInterval(minExchangeInterval)
+                return
+            }
+            let wait = nextExchangeAt.timeIntervalSince(now)
+            try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+            // Loop: re-read nextExchangeAt after waking.
+        }
+    }
+
     // MARK: - Exchange
 
     private struct PatExchangeResult: Sendable {
@@ -229,6 +274,11 @@ actor QoderPATService: QoderPATRefreshing {
     /// `POST /api/v1/jobToken/exchange { personal_token }`.
     /// No COSY signature required for this endpoint (CONTEXT.md).
     private func exchangeJobToken(pat: String) async throws -> PatExchangeResult {
+        // Pace every exchange through one slot — quota polling, failover
+        // re-exchange, and onboarding all funnel through this method, so a
+        // multi-account burst (synchronized job-token expiries) cannot hammer
+        // the rate-limited exchange endpoint. ADR 0017.
+        try await waitForExchangeSlot()
         var request = URLRequest(url: Self.exchangeURL)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
