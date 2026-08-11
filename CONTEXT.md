@@ -57,6 +57,10 @@ _Avoid_: qoder-cn, Qoder China, Qoder CN — explicitly out of scope
 `POST openapi.qoder.sh/api/v1/jobToken/exchange { personal_token } → { token, refresh_token, expires_at }`. Turns a PAT into a Job Token. No COSY signature required for this call.
 _Avoid_: token refresh (that's OAuth terminology; this is re-exchange)
 
+**Exchange pacing**:
+`QoderPATService` gates every `jobToken/exchange` call with a minimum interval (default 1s, sleep-recheck-claim slot) so multi-account bursts — synchronized job-token expiries tripped by quota polling, plus failover re-exchanges — cannot hammer the rate-limited exchange endpoint. Single funnel: quota poller (`credentials(fromPat:)`), failover router (`refreshCredential`), and onboarding all route through `QoderPATService.shared`. ADR 0017.
+_Avoid_: per-path throttling (leaves the other path unpaced), claim-before-sleep (wrong under actor reentrancy)
+
 **COSY signature**:
 Qoder's request-signing scheme for the chat/models gateway. RSA-encrypts an AES key, AES-CBC-encrypts a user-info JSON blob, then MD5s (`payloadB64 \n cosyKey \n timestamp \n body \n sigPath`) into an `Authorization: Bearer COSY.<payload>.<sig>` header, plus ~15 `Cosy-*` headers. Required for all `api3.qoder.sh/algo/...` calls; not required for `openapi.qoder.sh/api/...`.
 _Avoid_: Qoder auth (ambiguous with PAT exchange)
