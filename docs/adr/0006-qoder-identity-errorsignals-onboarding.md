@@ -24,7 +24,7 @@ the official Qoder CLI or pi provider is also installed on the machine.
 |---|---|
 | HTTP 429 + quota body | Rotate to next enabled account; cool down this one. If the response carries a `Retry-After` header (RFC 7231 §7.1.3 — delta-seconds, best-effort HTTP-date), use it as the cooldown duration clamped to `[cooldownTTL, retryAfterCeiling]` (default `[60s, 300s]`); fall back to `cooldownTTL` (default 60s) when absent or unparseable. (Issue #12.) |
 | HTTP 401/403 (first occurrence) | Re-exchange PAT once, retry same account |
-| HTTP 401/403 (after re-exchange) | Mark PAT revoked: disable account, notify user, silently rotate to next account |
+| HTTP 401/403 (after successful re-exchange) | Cool down this account and rotate. A newly exchanged job token may take time to propagate from `openapi.qoder.sh` to the `api3.qoder.sh` chat gateway; this signal alone does not prove PAT revocation. If every account is in this state, return HTTP 429 + `Retry-After`. Gateway responses never persistently disable; that remains limited to failures the PAT-refresh classifier marks permanent. |
 | HTTP 5xx | Transient: retry same account with backoff, do NOT rotate |
 | Network timeout | Transient: retry same account |
 | HTTP 200 + non-200 `statusCodeValue` on the **first** SSE chunk | Rotate (the 200 head has NOT been written to the agent yet — the router peeks the leading bytes before handing the stream off). Classify by the in-envelope status: 429 → quota, 401/403 → auth, 5xx → transient. |

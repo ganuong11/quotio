@@ -11,7 +11,7 @@ Treat exhausted transient PAT re-exchange failures as temporary routing unavaila
 - For transient failures (`QoderPATError.network`, exchange/user-info HTTP 429, or an unknown error conservatively classified transient), apply the router's existing in-memory cooldown and rotate to another account.
 - Do not add the account to `disabledAccountIDs`, post a PAT-revoked notification, or schedule a persistent-disable recovery task.
 - If all usable accounts fail this way, return the existing `allAccountsCoolingDown` error: HTTP 429 with `Retry-After` and an OpenAI-compatible `rate_limit_error` body.
-- Preserve persistent disable behavior for proven permanent failures: invalid/missing PAT material, malformed exchange/identity responses, exchange/user-info failures other than 429, or a second gateway 401/403 after a successful re-exchange.
+- Preserve persistent disable behavior for failures the PAT-refresh classifier marks permanent. A repeated gateway 401/403 after successful exchange uses cooldown because fresh job tokens can take time to propagate to the chat gateway; gateway responses alone never persistently disable.
 - Preserve user-initiated disables. The router already excludes IDs in `disabledAccountIDs`; this change does not clear or reinterpret them.
 
 ## Scope

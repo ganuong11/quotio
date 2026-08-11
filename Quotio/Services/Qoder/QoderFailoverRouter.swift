@@ -26,8 +26,9 @@
 //                                    #12); fall back to `cooldownTTL` otherwise.
 //    - 401/403 (first occurrence)  → one-shot PAT re-exchange (machineID-
 //                                    preserving), retry same account.
-//    - 401/403 (after re-exchange) → disable account persistently, post a
-//                                    reliable user-visible notification, rotate.
+//    - 401/403 (after re-exchange) → cooldown + rotate. Fresh job tokens can
+//                                    take time to propagate to the chat gateway;
+//                                    this is not proof the PAT is revoked.
 //    - 5xx / network               → retry same account once with short backoff.
 //    - Silent stall (HTTP 200, no first chunk within the peek timeout):
 //                                    strong-evidence threshold (issue #12). On
@@ -148,12 +149,13 @@ nonisolated enum QoderFailoverError: Error, LocalizedError {
     }
 }
 
-/// Notification posted when a Qoder PAT is revoked (two consecutive 401/403s on
-/// the same account, even after re-exchange). ADR 0006 §2 requires the
-/// notification be reliable: the user must learn about the revocation via
-/// Quotio, not via a failed agent request (the rotation silently keeps the
-/// agent working as long as another account exists). `userInfo` carries the
-/// account key for the notification body — never the PAT or token.
+/// Notification posted when PAT refresh returns a failure classified as
+/// permanent (invalid PAT, a non-429 exchange/user-info status, malformed
+/// exchange, or missing identity). ADR 0006 §2 requires the notification be reliable: the user must
+/// learn about the revocation via Quotio, not via a failed agent request. A
+/// gateway auth response alone does not post this notification because newly
+/// exchanged tokens can take time to propagate. `userInfo` carries the account
+/// key for the notification body — never the PAT or token.
 nonisolated extension Notification.Name {
     static let qoderPATRevoked = Notification.Name("dev.quotio.qoder.pat-revoked")
 }
@@ -239,11 +241,6 @@ actor QoderFailoverRouter {
     /// account (see `confirmStreamAndHandOff`) and whenever a cooldown is
     /// applied (see `applyCooldown`). In-memory only — lost on restart.
     private var silentStallStrikes: [String: Int] = [:]
-
-    /// Accounts we've already done a one-shot 401 re-exchange for within the
-    /// current `openStream` call. Cleared per-call (not persistent) — the
-    /// "one re-exchange" rule is per-failure-event, not per-account-lifetime.
-    /// Implemented as a local in `openStream`, see implementation.
 
     private let vault: any MonitorCredentialStore
     private let metadata: MonitorMetadataStore
@@ -344,11 +341,6 @@ actor QoderFailoverRouter {
             throw await exhaustionError()
         }
 
-        // Track accounts that already burned their one-shot 401 re-exchange
-        // within this call. The set is per-call: a future request gets a fresh
-        // one-shot budget per account.
-        var reexchangedAccounts: Set<String> = []
-
         for account in candidates {
             // Refresh the job token if expired before signing. A 401 from the
             // gateway is the other path that triggers re-exchange; this pro-
@@ -370,11 +362,7 @@ actor QoderFailoverRouter {
                 )
                 return stream
             } catch let failure as QoderAccountFailure {
-                let action = decideAction(
-                    for: failure,
-                    account: account,
-                    reexchangedAccounts: &reexchangedAccounts
-                )
+                let action = decideAction(for: failure, account: account)
                 switch action {
                 case .reexchangeAndRetry:
                     // Re-exchange with a transient-retry budget, then retry the
@@ -387,7 +375,6 @@ actor QoderFailoverRouter {
                         credential: credential,
                         isPermanent: &isPermanent
                     ) {
-                        reexchangedAccounts.insert(account.id)
                         do {
                             let stream = try await attempt(
                                 account: account,
@@ -401,9 +388,9 @@ actor QoderFailoverRouter {
                             return stream
                         } catch let failure2 as QoderAccountFailure {
                             // Second failure on the same account after re-
-                            // exchange. If it's another 401/403, the PAT is
-                            // revoked — disable + notify + rotate. A quota 429
-                            // cools the account. A silent stall is deliberately
+                            // exchange. Auth and quota responses cool + rotate;
+                            // a fresh token may not have propagated to api3 yet.
+                            // A silent stall is deliberately
                             // NOT cooled here, consistent with the two-strike
                             // weak-evidence policy in `decideAction`: a single
                             // stall right after a fresh token (cold start, slow
@@ -413,7 +400,13 @@ actor QoderFailoverRouter {
                             // post-reexchange stall alone won't trip the
                             // threshold unless strikes already accumulated.
                             if failure2.isAuthFailure {
-                                await disableAndNotifyRevoked(account: account)
+                                // A newly exchanged job token can take a short
+                                // time to propagate from openapi.qoder.sh to the
+                                // api3 chat gateway. A repeated auth response in
+                                // that window is not proof the PAT is revoked:
+                                // cool down and let the agent retry after the
+                                // refreshed token has propagated.
+                                applyCooldown(accountID: account.id)
                             } else if failure2.isQuota {
                                 applyCooldown(
                                     accountID: account.id,
@@ -448,9 +441,6 @@ actor QoderFailoverRouter {
                         accountID: account.id,
                         retryAfterSeconds: failure.retryAfterSeconds
                     )
-                    continue
-                case .disableNotifyAndRotate:
-                    await disableAndNotifyRevoked(account: account)
                     continue
                 case .rotateWithoutCooldown:
                     // Issue #12: silent stall below the strike threshold. The
@@ -795,7 +785,6 @@ actor QoderFailoverRouter {
     private enum FailureAction {
         case reexchangeAndRetry
         case cooldownAndRotate
-        case disableNotifyAndRotate
         case retrySameOnce
         /// Rotate to the next account for request progress, but do NOT apply a
         /// cooldown yet (issue #12). Used for a silent stall below the
@@ -806,19 +795,15 @@ actor QoderFailoverRouter {
 
     private func decideAction(
         for failure: QoderAccountFailure,
-        account: MonitorAccount,
-        reexchangedAccounts: inout Set<String>
+        account: MonitorAccount
     ) -> FailureAction {
         switch failure.kind {
         case .quota:
             return .cooldownAndRotate
         case .auth:
-            // The one-shot 401 re-exchange is per-call per-account: if we
-            // haven't already tried re-exchanging for this account during
-            // this `openStream`, do so; otherwise the PAT is revoked.
-            if reexchangedAccounts.contains(account.id) {
-                return .disableNotifyAndRotate
-            }
+            // Auth failures reach this decision only before the one-shot
+            // re-exchange. The nested retry handles the post-exchange response
+            // directly and cools on repeated auth while the token propagates.
             return .reexchangeAndRetry
         case .transient:
             return .retrySameOnce

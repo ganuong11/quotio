@@ -1074,15 +1074,17 @@ final class QoderFailoverRouterTests: XCTestCase {
         XCTAssertEqual(receivedCreds.last?.machineID, originalMachineID)
     }
 
-    func test401AfterReexchangeDisablesAndRotates() async throws {
+    /// A gateway can briefly reject a newly exchanged job token while the token
+    /// propagates from openapi.qoder.sh to api3.qoder.sh. A second auth response
+    /// immediately after successful exchange is therefore temporary evidence:
+    /// cool the account down and rotate, but preserve its enabled state on disk.
+    func test401AfterSuccessfulReexchangeCoolsDownAndRotates() async throws {
         let vault = InMemoryCredentialStore()
         let primary = makeAccount(key: "primary@example.com")
         let secondary = makeAccount(key: "secondary@example.com")
         await vault.seed(primary, makeCredential(accountID: primary.id))
         await vault.seed(secondary, makeCredential(accountID: secondary.id))
         let gateway = MockGatewayClient()
-        // primary 401, re-exchange "succeeds" (returns same cred), retry 401
-        // again → PAT revoked: disable primary, rotate to secondary → 200.
         await gateway.seed([
             .init(status: 401),
             .init(status: 401),
@@ -1097,13 +1099,43 @@ final class QoderFailoverRouterTests: XCTestCase {
         )
 
         let opened = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
-        XCTAssertEqual(opened.accountID, secondary.id, "should rotate to secondary after revoked PAT")
+        XCTAssertEqual(opened.accountID, secondary.id, "should rotate while the refreshed token propagates")
         let callCount = await gateway.callCount
-        XCTAssertEqual(callCount, 3, "primary×2 (401+401 after re-exchange) then secondary×1")
+        XCTAssertEqual(callCount, 3, "primary×2 then secondary×1")
 
-        // Primary is now persistently disabled.
         let disabled = await metadata.disabledAccountIDs()
-        XCTAssertTrue(disabled.contains(primary.id), "primary should be disabled after revoked PAT")
+        XCTAssertFalse(disabled.contains(primary.id), "post-exchange auth must not persistently disable the account")
+    }
+
+    /// With no secondary account, the same propagation window must surface as a
+    /// retryable cooldown (HTTP 429 semantics), not terminal no-accounts (503).
+    func test401AfterSuccessfulReexchangeSingleAccountReturnsCooldown() async throws {
+        let vault = InMemoryCredentialStore()
+        let account = makeAccount(key: "user@example.com")
+        await vault.seed(account, makeCredential(accountID: account.id))
+        let gateway = MockGatewayClient()
+        await gateway.seed([.init(status: 401), .init(status: 401)])
+        let pat = MockPATRefresher()
+        await pat.seed(account.id, .success(makeCredential(accountID: account.id, token: "jt-rotated")))
+        let metadata = makeMetadataStore()
+        let router = makeRouter(
+            vault: vault, pat: pat, gateway: gateway,
+            metadata: metadata,
+            configuration: QoderFailoverRouterConfiguration(cooldownTTL: 0.05)
+        )
+
+        do {
+            _ = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
+            XCTFail("expected allAccountsCoolingDown during token propagation")
+        } catch let error as QoderFailoverError {
+            guard case .allAccountsCoolingDown(let retryAfter) = error else {
+                return XCTFail("expected allAccountsCoolingDown, got \(error)")
+            }
+            XCTAssertGreaterThan(retryAfter ?? 0, 0)
+        }
+
+        let disabled = await metadata.disabledAccountIDs()
+        XCTAssertFalse(disabled.contains(account.id), "propagation delay must not persistently disable the account")
     }
 
     // MARK: - Re-exchange failure: retry, then cool down or disable
@@ -1291,9 +1323,9 @@ final class QoderFailoverRouterTests: XCTestCase {
     /// Regression: when the PAT exchange endpoint itself is rate-limited (HTTP
     /// 429 from `openapi.qoder.sh/api/v1/jobToken/exchange`), the PAT service
     /// throws `.exchangeFailed(status: 429)`. A 429 is *transient* (retry after
-    /// a cool-down), not a permanent revocation — but the classifier lumps
-    /// every `.exchangeFailed` into "permanent," so the router disables the
-    /// account on the first try with no recheck. This is the root cause of the
+    /// a cool-down), not a permanent revocation. Pre-fix, the classifier lumped
+    /// every `.exchangeFailed` into "permanent," so the router disabled the
+    /// account on the first try. This was one root cause of the
     /// user-facing "No Qoder accounts available" while the real accounts still
     /// have quota: heavy quota polling trips the exchange endpoint's rate
     /// limit, every account that needs a job-token rotation disables, and the
