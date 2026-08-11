@@ -304,6 +304,22 @@ final class QuotaViewModel {
                 await self.updateProxyConfiguration()
             }
         }
+        // When the failover router's scheduled recheck re-enables a Qoder
+        // account (transient re-exchange failures recovered), refresh Qoder
+        // quota so the Quota tab reflects the re-enable without waiting for the
+        // next timer tick. The notification carries no token — only the account
+        // key / display name.
+        NotificationCenter.default.addObserver(
+            forName: .qoderAccountAutoReenabled,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                self.monitorAccounts = await self.monitorCoordinator.discoverAccounts(merging: self.providerQuotas)
+                await self.refreshQuota(for: .qoder)
+            }
+        }
     }
 
     private func normalizedProxyURL(_ rawValue: String?) -> String? {
@@ -500,6 +516,22 @@ final class QuotaViewModel {
         await monitorCoordinator.setDisabled(disabled, accountID: accountID)
         monitorAccounts = await monitorCoordinator.discoverAccounts(merging: providerQuotas)
         syncMenuBarSelection()
+
+        // Re-enabling an account must sync to the Quota tab, which derives its
+        // account list from `providerQuotas` (not `monitorAccounts`). Qoder is
+        // vault-backed — it never appears in `authFiles` — so the Quota tab can
+        // only learn about a re-enabled Qoder account by fetching its quota.
+        // Without this, the account shows in Providers immediately but is
+        // invisible in Quota until the next timer-driven refresh (or forever if
+        // auto-refresh is off). Disabling already strips quota via
+        // `removeDisabledMonitorQuotas` on the next refresh; re-enabling is the
+        // asymmetric case that needs the explicit fetch. Per-provider (not
+        // per-account) because that's the existing refresh seam, and a Qoder
+        // install typically has only a handful of accounts.
+        if !disabled, let account = monitorAccounts.first(where: { $0.id == accountID }),
+           account.provider == .qoder {
+            await refreshQuota(for: .qoder)
+        }
     }
 
     func deleteMonitorAccount(accountID: String) async {
