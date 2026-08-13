@@ -37,6 +37,7 @@ struct AccountRowData: Identifiable, Hashable {
     let id: String
     let provider: AIProvider
     let displayName: String       // Email or account identifier
+    let subtitle: String?         // Secondary line (Qoder email) when it adds info
     let menuBarAccountKey: String
     let source: AccountSource
     let status: String?           // "ready", "cooling", "error", etc.
@@ -51,6 +52,7 @@ struct AccountRowData: Identifiable, Hashable {
         id: String,
         provider: AIProvider,
         displayName: String,
+        subtitle: String? = nil,
         menuBarAccountKey: String? = nil,
         source: AccountSource,
         status: String?,
@@ -63,6 +65,7 @@ struct AccountRowData: Identifiable, Hashable {
         self.id = id
         self.provider = provider
         self.displayName = displayName
+        self.subtitle = subtitle
         self.menuBarAccountKey = menuBarAccountKey ?? displayName
         self.source = source
         self.status = status
@@ -132,10 +135,15 @@ struct AccountRowData: Identifiable, Hashable {
         status: String?,
         statusMessage: String?
     ) -> AccountRowData {
-        AccountRowData(
+        // Email subtitle only when it adds information: suppressed when absent
+        // or when displayName already fell back to the email itself.
+        let email = monitorAccount.email?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let subtitle = (email?.isEmpty == false && email != monitorAccount.displayName) ? email : nil
+        return AccountRowData(
             id: monitorAccount.id,
             provider: monitorAccount.provider,
             displayName: monitorAccount.displayName,
+            subtitle: subtitle,
             menuBarAccountKey: monitorAccount.accountKey,
             source: .monitor(monitorAccount.source),
             status: status,
@@ -202,7 +210,14 @@ struct AccountRow: View {
                 Text(maskedDisplayName)
                     .fontWeight(.medium)
                     .lineLimit(1)
-                
+
+                if let subtitle = account.subtitle {
+                    Text(subtitle.masked(if: settings.hideSensitiveInfo))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
                 HStack(spacing: 6) {
                     // Provider name
                     Text(account.provider.displayName)
