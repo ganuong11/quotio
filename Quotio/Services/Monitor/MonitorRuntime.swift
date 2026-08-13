@@ -92,6 +92,27 @@ nonisolated struct MonitorAccount: Identifiable, Codable, Hashable, Sendable {
             credentialReference: file.filePath
         )
     }
+
+    /// Quotio-managed Qoder account from a resolved PAT identity (ADR 0006 §3).
+    /// `accountKey` prefers userID (stable across email changes), `displayName`
+    /// prefers the human-readable name; `email` is stored separately so the UI
+    /// can show it as a disambiguating subtitle.
+    static func makeQoder(from identity: QoderUserIdentity) throws -> MonitorAccount {
+        let userID = identity.userID.nilIfBlank
+        let email = identity.email.nilIfBlank
+        let name = identity.name.nilIfBlank
+        let accountKey = userID ?? email ?? ""
+        guard !accountKey.isEmpty else { throw QoderPATError.identityMissing }
+        return make(
+            provider: .qoder,
+            accountKey: accountKey,
+            displayName: name ?? email ?? accountKey,
+            source: .quotioKeychain,
+            credentialReference: "keychain",
+            canDelete: true,
+            email: email
+        )
+    }
 }
 
 nonisolated struct MonitorRefreshIssue: Codable, Hashable, Sendable {

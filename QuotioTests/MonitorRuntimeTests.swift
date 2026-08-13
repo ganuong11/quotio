@@ -1053,4 +1053,44 @@ final class MonitorRuntimeTests: XCTestCase {
         XCTAssertEqual(enriched.first?.email, "john@corp.com")
         XCTAssertEqual(enriched.first?.id, account.id)
     }
+
+    func testMakeQoderAccountPrefersNameAndStoresEmail() throws {
+        let account = try MonitorAccount.makeQoder(
+            from: QoderUserIdentity(userID: "12345", email: "john@corp.com", name: "John Doe")
+        )
+        XCTAssertEqual(account.provider, .qoder)
+        XCTAssertEqual(account.accountKey, "12345")
+        XCTAssertEqual(account.displayName, "John Doe")
+        XCTAssertEqual(account.email, "john@corp.com")
+        XCTAssertEqual(account.source, .quotioKeychain)
+        XCTAssertTrue(account.canDelete)
+    }
+
+    func testMakeQoderAccountBlankEmailPersistsNil() throws {
+        let account = try MonitorAccount.makeQoder(
+            from: QoderUserIdentity(userID: "12345", email: "   ", name: "John Doe")
+        )
+        XCTAssertNil(account.email)
+        XCTAssertEqual(account.displayName, "John Doe")
+    }
+
+    func testMakeQoderAccountFallsBackDisplayNameAndKey() throws {
+        let unnamed = try MonitorAccount.makeQoder(
+            from: QoderUserIdentity(userID: "12345", email: "john@corp.com", name: "")
+        )
+        XCTAssertEqual(unnamed.displayName, "john@corp.com")
+        XCTAssertEqual(unnamed.email, "john@corp.com")
+
+        let bare = try MonitorAccount.makeQoder(
+            from: QoderUserIdentity(userID: "12345", email: "", name: "")
+        )
+        XCTAssertEqual(bare.displayName, "12345")
+        XCTAssertNil(bare.email)
+    }
+
+    func testMakeQoderAccountRejectsMissingIdentity() {
+        XCTAssertThrowsError(try MonitorAccount.makeQoder(
+            from: QoderUserIdentity(userID: "", email: "", name: "")
+        ))
+    }
 }
