@@ -40,6 +40,9 @@ nonisolated struct MonitorAccount: Identifiable, Codable, Hashable, Sendable {
     let credentialReference: String?
     let canDelete: Bool
     var isDisabled: Bool
+    /// Account email for display disambiguation (Qoder only today). Optional so
+    /// metadata persisted before this field decodes as nil — no migration.
+    var email: String? = nil
 
     var deduplicationKey: String {
         let identity = accountKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -53,7 +56,8 @@ nonisolated struct MonitorAccount: Identifiable, Codable, Hashable, Sendable {
         source: MonitorAccountSource,
         credentialReference: String? = nil,
         canDelete: Bool = false,
-        isDisabled: Bool = false
+        isDisabled: Bool = false,
+        email: String? = nil
     ) -> MonitorAccount {
         let normalized = accountKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let idSeed = "\(provider.rawValue)|\(normalized.lowercased())"
@@ -65,7 +69,8 @@ nonisolated struct MonitorAccount: Identifiable, Codable, Hashable, Sendable {
             source: source,
             credentialReference: credentialReference,
             canDelete: canDelete,
-            isDisabled: isDisabled
+            isDisabled: isDisabled,
+            email: email
         )
     }
 
@@ -654,7 +659,8 @@ actor MonitorRefreshCoordinator {
                 source: account.source,
                 credentialReference: account.credentialReference,
                 canDelete: account.canDelete,
-                isDisabled: account.isDisabled
+                isDisabled: account.isDisabled,
+                email: account.email
             )
         }
     }

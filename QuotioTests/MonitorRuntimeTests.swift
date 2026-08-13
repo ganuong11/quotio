@@ -1014,4 +1014,43 @@ final class MonitorRuntimeTests: XCTestCase {
             }
         }
     }
+
+    func testMonitorAccountDecodesLegacyMetadataWithoutEmail() throws {
+        let json = """
+        {
+          "id": "monitor-x",
+          "provider": "qoder",
+          "accountKey": "12345",
+          "displayName": "John Doe",
+          "source": "quotioKeychain",
+          "credentialReference": "keychain",
+          "canDelete": true,
+          "isDisabled": false
+        }
+        """
+        let account = try JSONDecoder().decode(MonitorAccount.self, from: Data(json.utf8))
+        XCTAssertNil(account.email)
+        XCTAssertEqual(account.displayName, "John Doe")
+    }
+
+    func testQuotaDisplayNameEnrichmentPreservesEmail() {
+        var account = MonitorAccount.make(
+            provider: .qoder,
+            accountKey: "12345",
+            displayName: "John Doe",
+            source: .quotioKeychain,
+            email: "john@corp.com"
+        )
+        account.isDisabled = false
+        let quota = ProviderQuotaData(accountDisplayName: "John D.")
+
+        let enriched = MonitorRefreshCoordinator.applyingQuotaDisplayNames(
+            [account],
+            quotas: [.qoder: [account.accountKey: quota]]
+        )
+
+        XCTAssertEqual(enriched.first?.displayName, "John D.")
+        XCTAssertEqual(enriched.first?.email, "john@corp.com")
+        XCTAssertEqual(enriched.first?.id, account.id)
+    }
 }
