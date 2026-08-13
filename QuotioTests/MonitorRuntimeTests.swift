@@ -1093,4 +1093,38 @@ final class MonitorRuntimeTests: XCTestCase {
             from: QoderUserIdentity(userID: "", email: "", name: "")
         ))
     }
+
+    func testEmailSubtitleLookupSkipsMissingAndRedundantEmails() {
+        let withEmail = MonitorAccount.make(
+            provider: .qoder,
+            accountKey: "12345",
+            displayName: "John Doe",
+            source: .quotioKeychain,
+            email: "john@corp.com"
+        )
+        let redundant = MonitorAccount.make(
+            provider: .qoder,
+            accountKey: "67890",
+            displayName: "dup@corp.com",
+            source: .quotioKeychain,
+            email: "dup@corp.com"
+        )
+        let blankEmail = MonitorAccount.make(
+            provider: .qoder,
+            accountKey: "11111",
+            displayName: "Blank",
+            source: .quotioKeychain,
+            email: "   "
+        )
+        let otherProvider = MonitorAccount.make(
+            provider: .gemini,
+            accountKey: "g@example.com",
+            source: .nativeCredential
+        )
+
+        let lookup = MonitorAccount.emailSubtitlesByAccountKey(
+            accounts: [withEmail, redundant, blankEmail, otherProvider]
+        )
+        XCTAssertEqual(lookup, ["12345": "john@corp.com"])
+    }
 }

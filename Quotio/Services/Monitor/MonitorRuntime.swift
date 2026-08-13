@@ -113,6 +113,17 @@ nonisolated struct MonitorAccount: Identifiable, Codable, Hashable, Sendable {
             email: email
         )
     }
+
+    /// accountKey → email for rows that should render an email subtitle.
+    /// Skips accounts without an email and ones whose displayName already is
+    /// the email (no-name fallback) so the UI never shows the same string twice.
+    static func emailSubtitlesByAccountKey(accounts: [MonitorAccount]) -> [String: String] {
+        accounts.reduce(into: [:]) { result, account in
+            guard let email = account.email?.nilIfBlank,
+                  email != account.displayName else { return }
+            result[account.accountKey] = email
+        }
+    }
 }
 
 nonisolated struct MonitorRefreshIssue: Codable, Hashable, Sendable {

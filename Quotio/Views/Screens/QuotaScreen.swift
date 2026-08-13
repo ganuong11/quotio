@@ -371,13 +371,21 @@ private struct ProviderQuotaView: View {
     /// Get all accounts (from auth files or quota data keys)
     private var allAccounts: [AccountInfo] {
         var accounts: [AccountInfo] = []
-        
+
+        // Email subtitles for providers that store them (Qoder today). The
+        // lookup is keyed by accountKey, which is also this section's quota key
+        // for Qoder, so both the auth-file and quota-data branches share it.
+        let emailSubtitles: [String: String] = provider == .qoder
+            ? MonitorAccount.emailSubtitlesByAccountKey(accounts: viewModel.monitorAccounts)
+            : [:]
+
         // From auth files
         for file in authFiles {
             let key = file.quotaLookupKey
             accounts.append(AccountInfo(
                 key: key,
                 email: file.email ?? file.name,
+                subtitle: emailSubtitles[key],
                 status: file.status,
                 statusColor: file.statusColor,
                 authFile: file,
@@ -400,6 +408,7 @@ private struct ProviderQuotaView: View {
                 accounts.append(AccountInfo(
                     key: key,
                     email: data.accountDisplayName ?? directAuthEmailsByKey[key] ?? key,
+                    subtitle: emailSubtitles[key],
                     status: "active",
                     statusColor: .green,
                     authFile: nil,
@@ -453,6 +462,7 @@ private struct ProviderQuotaView: View {
 private struct AccountInfo {
     let key: String
     let email: String
+    let subtitle: String?
     let status: String
     let statusColor: Color
     let authFile: AuthFile?
@@ -610,6 +620,13 @@ private struct AccountQuotaCardV2: View {
                     Text(displayEmail)
                         .font(.headline)
                         .fontWeight(.semibold)
+                        .lineLimit(1)
+                }
+
+                if let subtitle = account.subtitle {
+                    Text(subtitle.masked(if: settings.hideSensitiveInfo))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
 
