@@ -86,8 +86,10 @@ final class QoderSSEReparserTests: XCTestCase {
         var out = try reparser.feed(Data((line1 + line2).utf8))
         out.append(try reparser.finish())
         let chunks = openAIChunks(out)
-        // ADR 0011: opener + "Hel" + "lo" = 3 chunks.
-        XCTAssertEqual(chunks.count, 3)
+        // ADR 0011: opener + "Hel" + "lo" = 3, plus the stream-end synthesized
+        // finish chunk (this stream ends with no upstream finish_reason frame —
+        // see testEOFSynthesizesFinishReasonWhenUpstreamOmitsTerminal) = 4.
+        XCTAssertEqual(chunks.count, 4)
         XCTAssertEqual(chunks[0]["id"] as? String, "chatcmpl-x")
         XCTAssertEqual(chunks[1]["id"] as? String, "chatcmpl-x")  // stable ID
         // chunks[0] = role opener; chunks[1] = "Hel"; chunks[2] = "lo".
@@ -774,6 +776,95 @@ final class QoderSSEReparserTests: XCTestCase {
             (finishChunk?["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String,
             "tool_calls"
         )
+    }
+
+    // MARK: - Stream-end finish_reason synthesis (2026-08-17 live incident)
+
+    /// Live regression (ZCode, 2026-08-17): the upstream stream ended cleanly
+    /// after content deltas but WITHOUT any finish_reason frame. finish()
+    /// emitted only `[DONE]`, so the client saw a well-formed SSE stream whose
+    /// every chunk carried `finish_reason: null` — ZCode's StreamAdapter warns
+    /// "Stream ended without finish_reason (text-only)", surfaces it as an
+    /// error, and error-retries into the account-cooldown 429 wall. OpenAI's
+    /// streaming contract requires exactly one non-null `finish_reason` before
+    /// `[DONE]`; finish() must synthesize `stop` when a text-only stream ends
+    /// with no terminal. The value mirrors the client's own degradation for
+    /// this case (it synthesizes `end_turn`); KNOWN failures (reparser gates,
+    /// transport drops) still take the ADR 0010 mid-stream error-frame path in
+    /// ProxyBridge and are not masked by a success terminal.
+    func testEOFSynthesizesFinishReasonWhenUpstreamOmitsTerminal() throws {
+        var reparser = QoderSSEReparser()
+        let line = qoderLine([
+            "id": "x", "model": "m",
+            "choices": [["delta": ["content": "partial answer"]]],
+        ])
+        var out = try reparser.feed(Data(line.utf8))
+        out.append(try reparser.finish())
+        let text = String(data: out, encoding: .utf8) ?? ""
+        XCTAssertTrue(text.hasSuffix("data: [DONE]\n\n"))
+        let finishChunks = openAIChunks(out).filter {
+            (($0["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String) != nil
+        }
+        XCTAssertEqual(finishChunks.count, 1, "exactly one terminal finish chunk must be synthesized")
+        XCTAssertEqual(
+            ((finishChunks.first?["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String),
+            "stop"
+        )
+    }
+
+    /// Same contract when the upstream DID send its own `[DONE]` sentinel but
+    /// never a finish_reason frame — the sentinel is not a terminal. The
+    /// reparser owns the client-facing `[DONE]` and must still synthesize the
+    /// finish chunk before it.
+    func testUpstreamDoneWithoutFinishReasonStillSynthesizes() throws {
+        var reparser = QoderSSEReparser()
+        let line = qoderLine([
+            "id": "x", "model": "m",
+            "choices": [["delta": ["content": "hi"]]],
+        ])
+        var out = try reparser.feed(Data((line + "data: [DONE]\n\n").utf8))
+        out.append(try reparser.finish())
+        let finishChunks = openAIChunks(out).filter {
+            (($0["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String) != nil
+        }
+        XCTAssertEqual(finishChunks.count, 1)
+        XCTAssertEqual(
+            ((finishChunks.first?["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String),
+            "stop"
+        )
+    }
+
+    /// Guard: an EMPTY stream (no content, no finish) must NOT synthesize a
+    /// finish chunk — that would hand the client an "empty but complete"
+    /// assistant message and mask a genuine empty-response failure. finish()
+    /// still owns the lone `[DONE]` (pinned by testInnerDoneIgnored).
+    func testEmptyStreamDoesNotSynthesizeFinishReason() throws {
+        var reparser = QoderSSEReparser()
+        let out = try reparser.finish()
+        XCTAssertEqual(String(data: out, encoding: .utf8) ?? "", "data: [DONE]\n\n")
+    }
+
+    /// Guard: a stream that emitted tool calls but ended without an upstream
+    /// finish_reason must NOT synthesize one. ZCode's StreamAdapter repairs
+    /// truncated tool-call JSON only on the no-finish_reason path; a
+    /// synthesized terminal would close the blocks un-repaired and hand the
+    /// agent invalid `arguments` JSON. The tool-stream truncation path stays
+    /// unterminated (client-side repair owns it).
+    func testToolCallStreamWithoutFinishDoesNotSynthesize() throws {
+        var reparser = QoderSSEReparser()
+        let line = qoderLine([
+            "id": "x", "model": "m",
+            "choices": [["delta": ["tool_calls": [[
+                "index": 0, "id": "call_1", "type": "function",
+                "function": ["name": "f", "arguments": "{\"par"],
+            ]]]]],
+        ])
+        var out = try reparser.feed(Data(line.utf8))
+        out.append(try reparser.finish())
+        let finishChunks = openAIChunks(out).filter {
+            (($0["choices"] as? [[String: Any]])?[0]["finish_reason"] as? String) != nil
+        }
+        XCTAssertTrue(finishChunks.isEmpty, "tool streams ending without finish stay unterminated for client-side repair")
     }
 
     /// finish() is idempotent — calling it twice emits [DONE] once.

@@ -145,6 +145,11 @@ nonisolated struct QoderSSEReparser {
     /// Stashed `finish_reason`. Emitted on the final chunk before `[DONE]`.
     private var stashedFinishReason: String?
 
+    /// True once a chunk carrying a non-null `finish_reason` has been emitted
+    /// (the immediate path in `processLine` or the stash flush in `finish()`).
+    /// Guards the stream-end synthesis below from double-terminating.
+    private var finishReasonEmitted: Bool = false
+
     /// Whether `finish()` has emitted its terminal `[DONE]`. Guards against
     /// double-emit on repeated `finish()` calls.
     private var finished: Bool = false
@@ -281,6 +286,26 @@ nonisolated struct QoderSSEReparser {
     /// client-facing chunk follows OpenAI's `stream_options.include_usage`
     /// contract). `capturedUsage` exposes the stashed usage regardless of the
     /// gate for Quotio's internal accounting.
+    ///
+    /// Stream-end synthesis (2026-08-17 live ZCode incident): OpenAI's
+    /// streaming contract requires exactly one chunk with a non-null
+    /// `finish_reason` before `[DONE]`. When the upstream stream ends cleanly
+    /// (EOF or its own `[DONE]`) after assistant content but WITHOUT any
+    /// finish_reason frame, `finish` synthesizes a `stop` terminal — the value
+    /// strict clients themselves degrade to (ZCode's StreamAdapter synthesizes
+    /// `end_turn` for exactly this case, after warning about the contract
+    /// violation and treating the turn as failed). Two deliberate exclusions:
+    ///   - No assistant payload ever reached the client (`roleOpenerSent`
+    ///     false): an empty response is a genuine failure, not a completed
+    ///     turn — no terminal is invented.
+    ///   - Tool calls were emitted: clients repair truncated tool-call JSON
+    ///     only on the no-finish_reason path (ZCode's StreamAdapter repair
+    ///     loop); a synthesized terminal would close those blocks un-repaired
+    ///     and hand the agent invalid `arguments` JSON. The unterminated end
+    ///     is the recovery signal.
+    /// Known mid-stream failures (reparser gates, transport drops) never reach
+    /// `finish` — ProxyBridge emits the ADR 0010 error frame on that path and
+    /// a real failure is not masked with a success terminal.
     mutating func finish() throws -> Data {
         guard !finished else { return Data() }
         finished = true
@@ -311,6 +336,15 @@ nonisolated struct QoderSSEReparser {
         if let reason = stashedFinishReason {
             out.append(buildChunk(delta: nil, finishReason: reason, usage: nil))
             stashedFinishReason = nil
+            finishReasonEmitted = true
+        } else if !finishReasonEmitted,
+                  roleOpenerSent,
+                  !toolCallsState.values.contains(where: { $0.emittedHeader }) {
+            // Stream ended with no finish_reason after delivering content —
+            // synthesize the terminal (see method doc). Ordering matches the
+            // stash flush: finish chunk → usage chunk (if any) → [DONE].
+            out.append(buildChunk(delta: nil, finishReason: "stop", usage: nil))
+            finishReasonEmitted = true
         }
 
         // Trailing usage chunk (OpenAI convention: usage rides on its own
@@ -551,6 +585,7 @@ nonisolated struct QoderSSEReparser {
                 if !producedContentThisLine {
                     out.append(buildChunk(delta: nil, finishReason: effective, usage: nil))
                     stashedFinishReason = nil
+                    finishReasonEmitted = true
                 }
             }
         }
