@@ -287,9 +287,11 @@ nonisolated struct QoderChatTranslatorOptions: Sendable {
 /// `QoderFailoverError.requestRejected` → `ProxyBridge.sendError`, which wraps
 /// the message in the ADR 0010 OpenAI error envelope.
 nonisolated struct QoderTranslatorLimits: Sendable, Equatable {
-    /// Maximum number of messages accepted in one request. 500 comfortably
-    /// covers long CLI-agent conversations while bounding the O(n) message
-    /// transform and the recordID hash. Above this, reject as 400.
+    /// Maximum number of messages forwarded in one request. Over-cap
+    /// conversations are trimmed to the system preamble + newest turns
+    /// (ADR 0019); only an untrimmable request (preamble alone ≥ cap,
+    /// pathological) is rejected as 400. Bounds the O(n) message transform
+    /// and the recordID hash.
     let maxMessages: Int
     /// Maximum decoded byte length of a single `image_url` data-URL payload
     /// (base64 portion decoded). 10 MB matches the headroom the upstream
@@ -307,10 +309,21 @@ nonisolated struct QoderTranslatorLimits: Sendable, Equatable {
     let maxToolSchemaBytes: Int
 
     /// Production defaults (see per-field docs for sizing rationale).
+    /// `maxMessages` 9999 (user decision 2026-08-18): over-cap conversations
+    /// are trimmed to it (ADR 0019) rather than rejected, so availability
+    /// never depends on the number. Note the upstream gateway's own
+    /// message-count limit is unverified above 999 (the last
+    /// empirically-observed-accepted count); if it rejects between 999 and
+    /// 9999, that surfaces as the upstream's own 4xx. The byte caps must stay
+    /// in their ADR 0013 pairing with Tier 1's body cap: an inline image
+    /// travels as base64 (~4/3x), so `maxImageBytes * 4/3 +
+    /// maxToolSchemaBytes` must stay under
+    /// `HTTP1RequestParser.defaultMaxBodyBytes` (pinned by
+    /// `testBodyCapStaysAboveImageCapWireFootprint`).
     static let `default` = QoderTranslatorLimits(
-        maxMessages: 999,
+        maxMessages: 9999,
         maxImageBytes: 90 * 1024 * 1024,
-        maxTools: 999,
+        maxTools: 9999,
         maxToolSchemaBytes: 5 * 1024 * 1024
     )
 }
@@ -408,7 +421,8 @@ nonisolated enum QoderChatTranslator {
     /// `limits` runs Tier 2 semantic caps (issue #14): message count, image
     /// size, tool count, per-tool schema size. Defaults (`.default`) are sized
     /// to never reject a legitimate CLI-agent request; tests inject tighter
-    /// values. Over-limit throws `QoderTranslatorError.limitCountExceeded`
+    /// values. Message-count overages are trimmed first (ADR 0019); the
+    /// remaining overages throw `QoderTranslatorError.limitCountExceeded`
     /// (HTTP 400) or `.limitSizeExceeded` (HTTP 413).
     static func translate(
         body: Data,
@@ -440,26 +454,44 @@ nonisolated enum QoderChatTranslator {
         options: QoderChatTranslatorOptions = .deferringToRandom,
         limits: QoderTranslatorLimits = .default
     ) throws -> QoderTranslationResult {
+        // ADR 0019: an over-cap conversation is trimmed to the system
+        // preamble + newest turns instead of rejected — a long CLI-agent
+        // session crossing `maxMessages` must keep working, not 400 on every
+        // subsequent request (observed 2026-08-18: a 1001-message ZCode
+        // session). `trimmingMessages` returns the input unchanged when it
+        // cannot get under the cap (preamble alone ≥ cap); the Tier 2 gate
+        // below still rejects that residue.
+        let trimmedMessages = trimmingMessages(request.messages, cap: limits.maxMessages)
+        let effectiveRequest = trimmedMessages.count == request.messages.count
+            ? request
+            : OpenAIChatRequest(
+                model: request.model,
+                messages: trimmedMessages,
+                tools: request.tools,
+                maxTokens: request.maxTokens,
+                reasoningIntent: request.reasoningIntent
+            )
+
         // Tier 2 semantic caps (issue #14, defense-in-depth). The upstream
         // Qoder gateway enforces its own limits; these bound the translator's
         // working set and fail-fast at the cheapest point. O(n) over the
         // parsed request — no extra re-parses (tool schema size reuses the
         // already-stored `parameters: Data` bytes; image size decodes the
         // base64 slice of the data-URL string only when present).
-        try enforceLimits(request: request, limits: limits)
+        try enforceLimits(request: effectiveRequest, limits: limits)
 
         // Model key: prefer the resolved config; fall back to the request model
         // when the catalog had no entry (defaultUnknown carries an empty key).
         let modelKey = modelConfig.key.isEmpty ? request.model : modelConfig.key
 
         let maxTokens = resolveMaxTokens(requestMax: request.maxTokens, modelCap: modelConfig.maxOutputTokens)
-        let normalizedMessages = transformMessagesForQoder(request.messages)
+        let normalizedMessages = transformMessagesForQoder(effectiveRequest.messages)
 
         // Transform tools once: used both for the recordID hash (prompt-cache
         // affinity includes the tool surface — pi hashes `JSON.stringify(tools)`,
         // stream.ts ~173) and for the envelope's `tools` field. Empty when the
         // request carried no tools.
-        let transformedTools = transformTools(request.tools ?? [])
+        let transformedTools = transformTools(effectiveRequest.tools ?? [])
         let toolsJSON = transformedTools.isEmpty ? "" : canonicalToolsJSON(transformedTools)
 
         // Content-derived record IDs (deterministic). toolsJSON is "" on the
@@ -535,7 +567,9 @@ nonisolated enum QoderChatTranslator {
         request: OpenAIChatRequest,
         limits: QoderTranslatorLimits
     ) throws {
-        // 1. Message count (HTTP 400 on overage).
+        // 1. Message count (HTTP 400 on overage). Over-cap conversations are
+        //    trimmed before this gate (ADR 0019), so only the untrimmable
+        //    residue — preamble alone ≥ cap — reaches this throw.
         if request.messages.count > limits.maxMessages {
             throw QoderTranslatorError.limitCountExceeded(
                 kind: .messages, limit: limits.maxMessages, actual: request.messages.count
@@ -769,6 +803,42 @@ nonisolated enum QoderChatTranslator {
     ///     base64 byte model; OpenAI input already carries a ready `image_url`
     ///     URL (often a `data:` URL), so Phase 2b passes the URL string through
     ///     verbatim instead of reconstructing bytes (advisor deviation, ADR 0004).
+    /// Trim an over-cap conversation to `cap` messages instead of rejecting
+    /// it (ADR 0019). Long CLI-agent sessions legitimately cross
+    /// `maxMessages`; recency beats completeness, so:
+    ///   1. Keep the maximal leading system/developer preamble verbatim — the
+    ///      system prompt is load-bearing for CLI agents.
+    ///   2. Keep the newest body messages that fit the remaining budget.
+    ///   3. Advance the cut to a safe boundary so the kept suffix never opens
+    ///      on a `tool` message orphaned from its assistant tool-call turn:
+    ///      prefer the next `user` message, else the next non-`tool` message.
+    ///
+    /// Returns the input unchanged when already within the cap, or when the
+    /// preamble alone is ≥ cap (untrimmable) — the caller's `enforceLimits`
+    /// gate still rejects the latter.
+    static func trimmingMessages(
+        _ messages: [OpenAIChatMessage], cap: Int
+    ) -> [OpenAIChatMessage] {
+        guard cap > 0, messages.count > cap else { return messages }
+
+        var preambleEnd = 0
+        while preambleEnd < messages.count,
+              messages[preambleEnd].role == "system" || messages[preambleEnd].role == "developer" {
+            preambleEnd += 1
+        }
+        let budget = cap - preambleEnd
+        guard budget > 0 else { return messages }
+
+        // Newest `budget` body messages; never reach into the preamble.
+        var start = max(messages.count - budget, preambleEnd)
+        if messages[start].role != "user",
+           let safeStart = messages[start...].firstIndex(where: { $0.role == "user" })
+                ?? messages[start...].firstIndex(where: { $0.role != "tool" }) {
+            start = safeStart
+        }
+        return Array(messages[0..<preambleEnd]) + messages[start...]
+    }
+
     static func transformMessagesForQoder(_ messages: [OpenAIChatMessage]) -> [QoderMessage] {
         var out: [QoderMessage] = []
         out.reserveCapacity(messages.count)

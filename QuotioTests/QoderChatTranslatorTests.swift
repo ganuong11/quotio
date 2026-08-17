@@ -1047,29 +1047,52 @@ final class QoderChatTranslatorTests: XCTestCase {
         _ = try translateWithTightLimits(request)  // does not throw
     }
 
-    /// Over-limit message count is rejected with 400 + the message-count error.
-    func testMessageCountOverLimitRejected() {
+    /// Envelope `messages` array from a translation result (each entry an
+    /// OpenAI-shape `{role, content}` dict, per `messageToJSONObject`).
+    private static func envelopeMessages(
+        _ result: QoderTranslationResult, file: StaticString = #filePath, line: UInt = #line
+    ) throws -> [[String: Any]] {
+        let envelope = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: result.envelopeJSON) as? [String: Any],
+            "envelope JSON should be an object", file: file, line: line
+        )
+        return try XCTUnwrap(
+            envelope["messages"] as? [[String: Any]],
+            "envelope should carry a messages array", file: file, line: line
+        )
+    }
+
+    /// Over-limit message count is trimmed, not rejected (ADR 0019): a
+    /// long-running CLI-agent session must keep working past the cap. Tight
+    /// limit = 3, send 4 user messages → accepted with the newest 3.
+    func testMessageCountOverLimitTrimsToNewest() throws {
         let msgs = (0..<4).map {
             OpenAIChatMessage(role: "user", content: .text("m\($0)"), toolCalls: nil, toolCallID: nil)
         }
         let request = OpenAIChatRequest(model: "m", messages: msgs, tools: nil, maxTokens: nil)
-        assertLimitError(
-            { try translateWithTightLimits(request) },
-            expectedStatus: 400,
-            kindDescriptionContains: "messages"
+        let result = try translateWithTightLimits(request)
+        let envelopeMsgs = try Self.envelopeMessages(result)
+        XCTAssertEqual(envelopeMsgs.count, 3)
+        XCTAssertEqual(
+            envelopeMsgs.map { ($0["content"] as? String) ?? "" },
+            ["m1", "m2", "m3"]
         )
     }
 
-    /// The error reports the actual count and the limit, but not message content.
-    func testMessageCountErrorNamesLimitAndActualNotContent() {
-        let msgs = (0..<5).map { _ in
-            OpenAIChatMessage(role: "user", content: .text("SECRET"), toolCalls: nil, toolCallID: nil)
+    /// When trimming cannot help (preamble alone ≥ cap), the request is still
+    /// rejected; the error reports the actual count and the limit, but never
+    /// message content.
+    func testUntrimmableMessageCountErrorNamesLimitAndActualNotContent() {
+        var msgs = (0..<4).map { _ in
+            OpenAIChatMessage(role: "system", content: .text("SECRET"), toolCalls: nil, toolCallID: nil)
         }
+        msgs.append(OpenAIChatMessage(role: "user", content: .text("SECRET"), toolCalls: nil, toolCallID: nil))
         let request = OpenAIChatRequest(model: "m", messages: msgs, tools: nil, maxTokens: nil)
         do {
             _ = try translateWithTightLimits(request)
             XCTFail("expected throw")
         } catch let error as QoderTranslatorError {
+            XCTAssertEqual(error.httpStatus, 400)
             let msg = error.localizedDescription
             XCTAssertTrue(msg.contains("5"), "should report actual count 5: \(msg)")
             XCTAssertTrue(msg.contains("3"), "should report limit 3: \(msg)")
@@ -1077,6 +1100,96 @@ final class QoderChatTranslatorTests: XCTestCase {
         } catch {
             XCTFail("expected QoderTranslatorError, got \(error)")
         }
+    }
+
+    /// Regression (2026-08-18): a long ZCode session failed on every request
+    /// with `400 Qoder translator: messages count 1001 exceeds limit of 999`
+    /// (the original symptom, then at the 999 cap). The exact production
+    /// path — `translate(body:)` with default limits, now `maxMessages: 9999`
+    /// — trims to the cap instead of throwing: 10001 messages → 9999 kept.
+    func testTranslateBodyWith10001MessagesIsTrimmedNotRejected() throws {
+        var messages: [[String: Any]] = [["role": "system", "content": "sys"]]
+        messages += (0..<10000).map { ["role": "user", "content": "m\($0)"] as [String: Any] }
+        let body = try JSONSerialization.data(withJSONObject: [
+            "model": "qoder/ultimate",
+            "messages": messages,
+        ])
+        let result = try QoderChatTranslator.translate(
+            body: body,
+            userID: "u",
+            proxyAPIKey: "k",
+            modelConfig: QoderModelConfig(
+                key: "ultimate", isReasoning: false, maxOutputTokens: 32768, source: "system"
+            ),
+            options: .deferringToRandom,
+            limits: .default
+        )
+        let envelopeMsgs = try Self.envelopeMessages(result)
+        XCTAssertEqual(envelopeMsgs.count, 9999)
+        XCTAssertEqual(envelopeMsgs.first?["role"] as? String, "system")
+        XCTAssertEqual(envelopeMsgs.first?["content"] as? String, "sys")
+        XCTAssertEqual(envelopeMsgs.last?["content"] as? String, "m9999")
+    }
+
+    // -- Message trim policy (ADR 0019) --------------------------------------
+
+    /// Trim keeps the leading system/developer preamble plus the newest body
+    /// messages and drops the oldest middle. Cap 5 on
+    /// [sys, u1, a2, u3, a4, u5, u6] → [sys, u3, a4, u5, u6].
+    func testTrimKeepsSystemPreambleAndNewestBody() {
+        let msgs = [
+            OpenAIChatMessage(role: "system", content: .text("sys"), toolCalls: nil, toolCallID: nil),
+            OpenAIChatMessage(role: "user", content: .text("u1"), toolCalls: nil, toolCallID: nil),
+            OpenAIChatMessage(role: "assistant", content: .text("a2"), toolCalls: nil, toolCallID: nil),
+            OpenAIChatMessage(role: "user", content: .text("u3"), toolCalls: nil, toolCallID: nil),
+            OpenAIChatMessage(role: "assistant", content: .text("a4"), toolCalls: nil, toolCallID: nil),
+            OpenAIChatMessage(role: "user", content: .text("u5"), toolCalls: nil, toolCallID: nil),
+            OpenAIChatMessage(role: "user", content: .text("u6"), toolCalls: nil, toolCallID: nil),
+        ]
+        let trimmed = QoderChatTranslator.trimmingMessages(msgs, cap: 5)
+        XCTAssertEqual(trimmed.map(\.content), [
+            .text("sys"), .text("u3"), .text("a4"), .text("u5"), .text("u6")
+        ])
+    }
+
+    /// Under-cap input passes through untouched.
+    func testTrimUnderCapReturnsInputUnchanged() {
+        let msgs = [
+            OpenAIChatMessage(role: "user", content: .text("u1"), toolCalls: nil, toolCallID: nil),
+            OpenAIChatMessage(role: "assistant", content: .text("a2"), toolCalls: nil, toolCallID: nil),
+        ]
+        XCTAssertEqual(QoderChatTranslator.trimmingMessages(msgs, cap: 3), msgs)
+    }
+
+    /// The cut never orphans a tool result: when the newest-window boundary
+    /// lands on a `tool` message, the cut advances to the next `user` message
+    /// (dropping the assistant tool-call turn with it). Cap 3 on
+    /// [sys, u_q, a(tool_calls), tool, u_r2] → [sys, u_r2].
+    func testTrimCutSkipsOrphanedToolResult() {
+        let msgs = [
+            OpenAIChatMessage(role: "system", content: .text("sys"), toolCalls: nil, toolCallID: nil),
+            OpenAIChatMessage(role: "user", content: .text("u_q"), toolCalls: nil, toolCallID: nil),
+            OpenAIChatMessage(
+                role: "assistant", content: nil,
+                toolCalls: [OpenAIToolCall(id: "t1", function: .init(name: "f", arguments: "{}"))],
+                toolCallID: nil
+            ),
+            OpenAIChatMessage(role: "tool", content: .text("tool_res"), toolCalls: nil, toolCallID: "t1"),
+            OpenAIChatMessage(role: "user", content: .text("u_r2"), toolCalls: nil, toolCallID: nil),
+        ]
+        let trimmed = QoderChatTranslator.trimmingMessages(msgs, cap: 3)
+        XCTAssertEqual(trimmed.map(\.role), ["system", "user"])
+        XCTAssertEqual(trimmed.map(\.content), [.text("sys"), .text("u_r2")])
+    }
+
+    /// A preamble alone at/over the cap cannot be trimmed — the input is
+    /// returned unchanged so the `enforceLimits` gate still fails fast.
+    func testTrimUntrimmablePreambleReturnsInputUnchanged() {
+        var msgs = (0..<4).map { _ in
+            OpenAIChatMessage(role: "system", content: .text("s"), toolCalls: nil, toolCallID: nil)
+        }
+        msgs.append(OpenAIChatMessage(role: "user", content: .text("u"), toolCalls: nil, toolCallID: nil))
+        XCTAssertEqual(QoderChatTranslator.trimmingMessages(msgs, cap: 3), msgs)
     }
 
     // -- Image size cap ------------------------------------------------------
@@ -1292,36 +1405,38 @@ final class QoderChatTranslatorTests: XCTestCase {
 
     // -- Production defaults sanity -----------------------------------------
 
-    /// Production defaults are the values documented in the issue and ADR 0013.
-    /// Pins them so a future edit can't silently shrink them.
-    /// (Raised in the "raise translator default limits" change: 999 messages /
-    /// 90 MiB images / 999 tools / 5 MiB tool schemas.)
-    func testProductionDefaultsMatchIssue14() {
+    /// Pins production defaults so a future edit can't silently change them.
+    /// `maxMessages` 9999 (user decision 2026-08-18; upstream's own limit is
+    /// unverified above 999), with over-cap conversations trimmed to it
+    /// (ADR 0019). The byte caps are in the ADR 0013 pairing with Tier 1's
+    /// body cap (image wire footprint math, pinned by
+    /// `testBodyCapStaysAboveImageCapWireFootprint`).
+    func testProductionDefaultsPinned() {
         let d = QoderTranslatorLimits.default
-        XCTAssertEqual(d.maxMessages, 999)
+        XCTAssertEqual(d.maxMessages, 9999)
         XCTAssertEqual(d.maxImageBytes, 90 * 1024 * 1024)
-        XCTAssertEqual(d.maxTools, 999)
+        XCTAssertEqual(d.maxTools, 9999)
         XCTAssertEqual(d.maxToolSchemaBytes, 5 * 1024 * 1024)
     }
 
-    /// Defaults are injectable and a request that's over the tight limit but
-    /// under the production limit is accepted under `.default` — proving the
-    /// tight-limit rejections above are about the injected limits, not a hard
-    /// structural cap.
+    /// Defaults are injectable: the same 4-message request is trimmed to 3
+    /// under a tiny injected cap and forwarded untouched under `.default` —
+    /// proving the caps are configuration, not a hard structural limit.
     func testDefaultsAreInjectableAndMorePermissive() throws {
-        // 4 messages: rejected by tightLimits (cap 3), accepted by .default.
         let msgs = (0..<4).map {
             OpenAIChatMessage(role: "user", content: .text("m\($0)"), toolCalls: nil, toolCallID: nil)
         }
         let request = OpenAIChatRequest(model: "m", messages: msgs, tools: nil, maxTokens: nil)
-        XCTAssertThrowsError(try translateWithTightLimits(request))
-        _ = try QoderChatTranslator.translate(
+        let tightResult = try translateWithTightLimits(request)
+        XCTAssertEqual(try Self.envelopeMessages(tightResult).count, 3)
+        let defaultResult = try QoderChatTranslator.translate(
             request: request,
             userID: "u", proxyAPIKey: "k",
             modelConfig: QoderModelConfig(key: "m", isReasoning: false, maxOutputTokens: 32768, source: "system"),
             options: .deferringToRandom,
             limits: .default
         )
+        XCTAssertEqual(try Self.envelopeMessages(defaultResult).count, 4)
     }
 
     // -- Status code propagation through QoderFailoverError -----------------

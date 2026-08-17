@@ -385,7 +385,10 @@ final class QoderFailoverRouterTests: XCTestCase {
         XCTAssertEqual(callCount, 0, "translator cap must reject before any gateway call")
     }
 
-    /// End-to-end: a translator count cap (messages → 400) surfaces as 400.
+    /// End-to-end: an untrimmable message count (preamble alone ≥ cap, ADR
+    /// 0019) surfaces as 400 before any gateway call. Over-cap conversations
+    /// that CAN be trimmed no longer reject — the trim contract is covered in
+    /// `QoderChatTranslatorTests`.
     func testTranslatorMessageCountCapSurfacesAs400() async throws {
         let vault = InMemoryCredentialStore()
         let account = makeAccount(key: "primary@example.com")
@@ -398,13 +401,14 @@ final class QoderFailoverRouterTests: XCTestCase {
                 maxMessages: 1, maxImageBytes: 1024, maxTools: 128, maxToolSchemaBytes: 1024
             )
         )
-        // Two user messages > 1-message cap.
+        // Cap 1 with a system preamble of 1 → untrimmable (the preamble is
+        // always kept, so nothing fits under the cap).
         let body: [String: Any] = [
             "model": "qoder/auto",
             "stream": true,
             "messages": [
+                ["role": "system", "content": "s"],
                 ["role": "user", "content": "a"],
-                ["role": "user", "content": "b"],
             ],
         ]
         let bodyData = try JSONSerialization.data(withJSONObject: body)

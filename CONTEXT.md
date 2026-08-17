@@ -74,3 +74,7 @@ An obfuscation wrapper applied to chat/model-list request bodies before signing.
 **Non-streaming aggregation (`QoderCompletionAggregator`)**:
 The Qoder gateway speaks SSE only, so for a `stream != true` Chat Completions request (missing `stream` or `stream: false` — OpenAI's spec default is `false`), Quotio keeps consuming the SSE upstream and folds the streamed deltas into a single `chat.completion` JSON object returned with `Content-Type: application/json`. The streaming `QoderSSEReparser` remains the single parser of the Qoder envelope; the aggregator consumes its OpenAI-shape output. See ADR 0014.
 _Avoid_: "non-streaming mode" implying an upstream change — the upstream is always SSE.
+
+**Message trim (`QoderChatTranslator.trimmingMessages`)**:
+What happens to a Chat Completions request whose `messages` exceed `maxMessages` (9999): the translator keeps the leading system/developer preamble plus the newest turns, cutting at a boundary that never orphans a `tool` result — instead of rejecting with 400 (issue #14's original behavior, which permanently broke any session that crossed the cap, since client history only grows). Upstream's own message limit is unverified above 999; a request between 1000 and 9999 messages is forwarded untrimmed and could still hit it. See ADR 0019.
+_Avoid_: "context window" (that's token-based, client-side compaction), message cap rejection (the old behavior)
