@@ -1418,6 +1418,100 @@ final class QoderFailoverRouterTests: XCTestCase {
         XCTAssertEqual(opened2.accountID, a.id, "transient failure should not apply cooldown")
     }
 
+    // MARK: - HTTP 408 timeout: transient, not request-level (live regression 2026-08-18)
+
+    /// A gateway 408 (Request Timeout) is a server-side timeout condition, not
+    /// a malformed-request signal: it must take the transient path (retry the
+    /// same account once with backoff), not the terminal non-rotatable path.
+    /// Live symptom before the fix: "Qoder gateway returned HTTP 408
+    /// (non-rotatable)" killed the request outright on a blip a retry would
+    /// have survived.
+    func test408RetriesSameAccountOnceThenSucceeds() async throws {
+        let vault = InMemoryCredentialStore()
+        let account = makeAccount(key: "user@example.com")
+        await vault.seed(account, makeCredential(accountID: account.id))
+        let gateway = MockGatewayClient()
+        await gateway.seed([
+            .init(status: 408),
+            .init(status: 200, body: Data("data: [DONE]\n\n".utf8)),
+        ])
+        let router = makeRouter(
+            vault: vault, pat: MockPATRefresher(), gateway: gateway,
+            metadata: makeMetadataStore()
+        )
+
+        let opened = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
+        XCTAssertEqual(opened.accountID, account.id)
+        let callCount = await gateway.callCount
+        XCTAssertEqual(callCount, 2, "408 then 200 on the same account (one retry)")
+    }
+
+    /// 408 twice on the same account rotates without applying a cooldown —
+    /// the same policy as 5xx. A timeout is not quota evidence, so the account
+    /// stays eligible for the next request.
+    func test408TwiceRotatesWithoutCooldown() async throws {
+        let vault = InMemoryCredentialStore()
+        let a = makeAccount(key: "a@example.com")
+        let b = makeAccount(key: "b@example.com")
+        await vault.seed(a, makeCredential(accountID: a.id))
+        await vault.seed(b, makeCredential(accountID: b.id))
+        let gateway = MockGatewayClient()
+        // a: 408, 408 (two transient failures → rotate, no cooldown applied).
+        // b: 200.
+        await gateway.seed([
+            .init(status: 408),
+            .init(status: 408),
+            .init(status: 200, body: Data("data: [DONE]\n\n".utf8)),
+        ])
+        let router = makeRouter(
+            vault: vault, pat: MockPATRefresher(), gateway: gateway,
+            metadata: makeMetadataStore()
+        )
+
+        let opened = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
+        XCTAssertEqual(opened.accountID, b.id)
+
+        // No cooldown on transient failures — a is still eligible next round.
+        await gateway.seed(.init(status: 200, body: Data("data: [DONE]\n\n".utf8)))
+        let opened2 = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
+        XCTAssertEqual(opened2.accountID, a.id, "408 must not apply cooldown")
+    }
+
+    /// The in-envelope shape: HTTP 200 whose first SSE frame carries
+    /// `statusCodeValue: 408`. Must classify as transient (retry same account
+    /// once, then rotate) — mirroring the HTTP-status path, not the terminal
+    /// non-rotatable rejection.
+    func test408InEnvelopeIsTransientNotTerminal() async throws {
+        let vault = InMemoryCredentialStore()
+        let a = makeAccount(key: "a@example.com")
+        let b = makeAccount(key: "b@example.com")
+        await vault.seed(a, makeCredential(accountID: a.id))
+        await vault.seed(b, makeCredential(accountID: b.id))
+
+        let timeoutEnvelope = """
+        data: {"statusCodeValue":408,"body":"\\"request timeout\\""}
+
+        """.data(using: .utf8)!
+
+        let gateway = MockGatewayClient()
+        // a: envelope-408 twice (transient retry of the same account, then
+        // rotate). b: clean.
+        await gateway.seed([
+            .init(status: 200, body: timeoutEnvelope),
+            .init(status: 200, body: timeoutEnvelope),
+            .init(status: 200, body: Data("data: [DONE]\n\n".utf8)),
+        ])
+        let router = makeRouter(
+            vault: vault, pat: MockPATRefresher(), gateway: gateway,
+            metadata: makeMetadataStore()
+        )
+
+        let opened = try await router.openStream(requestBody: makeBody(), proxyAPIKey: "key")
+        XCTAssertEqual(opened.accountID, b.id, "in-envelope 408 must rotate, not reject")
+        let callCount = await gateway.callCount
+        XCTAssertEqual(callCount, 3, "a tried twice (transient retry), then b")
+    }
+
     // MARK: - Account filtering: disabled + non-Qoder accounts skipped
 
     func testDisabledAccountsAreSkipped() async throws {

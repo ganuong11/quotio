@@ -29,7 +29,10 @@
 //    - 401/403 (after re-exchange) → cooldown + rotate. Fresh job tokens can
 //                                    take time to propagate to the chat gateway;
 //                                    this is not proof the PAT is revoked.
-//    - 5xx / network               → retry same account once with short backoff.
+//    - 408 / 5xx / network         → retry same account once with short
+//                                    backoff. 408 is a server-side timeout,
+//                                    not a malformed-request signal (live
+//                                    regression 2026-08-18).
 //    - Silent stall (HTTP 200, no first chunk within the peek timeout):
 //                                    strong-evidence threshold (issue #12). On
 //                                    the first N-1 stalls we rotate to the next
@@ -575,15 +578,21 @@ actor QoderFailoverRouter {
             )
         case 401, 403:
             throw QoderAccountFailure(kind: .auth, status: status)
-        case 500...599:
+        case 408, 500...599:
+            // 408 (Request Timeout) is a server-side timeout condition, not a
+            // malformed-request signal — same transient bucket as 5xx (live
+            // regression 2026-08-18: it previously fell to the non-rotatable
+            // default and killed the request on a retryable blip).
             throw QoderAccountFailure(kind: .transient, status: status)
         default:
-            // 4xx other than 429/401/403 (e.g. 400 bad request, 404, 413, 422)
-            // is a request-level rejection, not an account-level one — rotating
-            // accounts won't fix a malformed envelope. Surface it as a terminal
-            // request rejection, passing the gateway's status through so
-            // ProxyBridge returns the real status (400/404/413/422/...) to the
-            // agent rather than collapsing them all to 400.
+            // 4xx other than 408/429/401/403 (e.g. 400 bad request, 404, 413,
+            // 422) is a request-level rejection, not an account-level one —
+            // rotating accounts won't fix a malformed envelope. (408 is the
+            // exception: a server-side timeout is transient, classified above.)
+            // Surface it as a terminal request rejection, passing the gateway's
+            // status through so ProxyBridge returns the real status
+            // (400/404/413/422/...) to the agent rather than collapsing them
+            // all to 400.
             throw QoderFailoverError.requestRejected(
                 "Qoder gateway returned HTTP \(status) (non-rotatable).", status: status
             )
@@ -699,13 +708,14 @@ actor QoderFailoverRouter {
                 throw QoderAccountFailure(kind: .quota, status: signal)
             case 401, 403:
                 throw QoderAccountFailure(kind: .auth, status: signal)
-            case 500...599:
+            case 408, 500...599:
                 throw QoderAccountFailure(kind: .transient, status: signal)
             default:
                 // Other non-200 codes inside the envelope are request-level
                 // rejections, same as the HTTP-status path — rotating accounts
                 // won't fix a malformed envelope. Pass the in-envelope status
                 // through so ProxyBridge returns it verbatim to the agent.
+                // (408 is transient, classified above.)
                 throw QoderFailoverError.requestRejected(
                     "Qoder upstream returned status \(signal) (non-rotatable).", status: signal
                 )
