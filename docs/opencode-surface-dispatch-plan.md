@@ -144,10 +144,11 @@ Not in this pass. `chatRequestToResponses` (`messages` → `input` items with **
 
 ## Verification (live)
 
-- **Translated-body gate probes (B4):** the original probes used native-shape bodies only. Probe each direction with the actual translated body shape through the running proxy — 2a (responses client → translated chat body) must clear the gate (200 SSE). A 403 `FreeTierError` here means the gate inspects deeper body structure than the matrix showed — escalate before shipping.
-- Rebuild app, run the 2×2 matrix on `:8317` — all four cells return usable responses (muse-spark×responses passthrough, mimo×chat passthrough, mimo×responses via 2a; muse-spark×chat = expected 422 until 2b). Plus a stream:false cell on each arm (single JSON body, correct `object` type).
+- **VERIFIED 2026-10-15** (fresh Debug build, real upstream, `mimo-v2.6-flash-free` + `muse-spark-1.3-contributor-free`): all cells pass — ① chat×mimo stream (verbatim SSE), ② chat×mimo stream:false (single `chat.completion` JSON, usage + model echo — the B3 fix), ③ responses×mimo stream (**2a translated body cleared the free-tier gate**; `response.created`… events), ④ responses×mimo stream:false (`response` object via `responsesObject`), ⑤ responses×muse-spark stream (native passthrough), ⑥ responses×muse-spark stream:false (terminal-event capture — full response with usage), ⑦ chat×muse-spark → 422 naming `/v1/responses`, ⑧ `previous_response_id` → 400 with the resend hint. `/v1/models` advertised 10 opencode entries (9 chat + muse-spark; no messages/gemini). ZCode end-to-end (chat-surface cells) left for the user's own client.
+- **Translated-body gate probes (B4):** the original probes used native-shape bodies only. Probe each direction with the actual translated body shape through the running proxy — 2a (responses client → translated chat body) must clear the gate (200 SSE). A 403 `FreeTierError` here means the gate inspects deeper body structure than the matrix showed — escalate before shipping. *(Done — see ③ above.)*
+- Rebuild app, run the 2×2 matrix on `:8317` — all four cells return usable responses (muse-spark×responses passthrough, mimo×chat passthrough, mimo×responses via 2a; muse-spark×chat = expected 422 until 2b). Plus a stream:false cell on each arm (single JSON body, correct `object` type). *(Done.)*
 - ZCode end-to-end covers only the chat-surface cells; the responses-surface cells need a Responses-speaking client (plain `curl` against `localhost:8317` is fine — the TLS gate is upstream-side only; the local hop is plain HTTP).
-- `xcodebuild -project Quotio.xcodeproj -scheme Quotio -configuration Debug build` + `xcodebuild test`.
+- `xcodebuild -project Quotio.xcodeproj -scheme Quotio -configuration Debug build` + `xcodebuild test`. *(Both green, full suite.)*
 
 ## Risks / non-obvious constraints
 
