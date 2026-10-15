@@ -118,6 +118,7 @@ This is also a **bug fix for today**: the current passthrough arm forces `stream
   - responses → `{"type":"function","name":"read",…}` flat
 - Normalize client tools: for any tool whose resolved name ∈ `{read, bash, write, edit, glob, grep}` (**six** gated names) with missing/empty `parameters.properties`, substitute the real opencode schema for that tool — the **six** canonical schemas embedded as constants, pinned from `sst/opencode` at the UA-pinned version with a provenance comment.
 - Keep: prefix strip, `stream:true` upstream, verbatim status/error forwarding, `x-opencode-*`/UA headers untouched.
+- **Responses-target conformance clamps (live-verified with 2b):** the zen upstream enforces `max_output_tokens >= 16` and rejects `reasoning.effort "none"` on always-reasoning models (supported: minimal…max; ZCode's 1-token thinking-off connectivity probe tripped both). `shapeUpstreamBody` raises sub-minimum caps to 16 and clamps `none` → `minimal` when the target surface is responses — translated and passthrough arms alike. Only moves toward representable values; no clamps on the chat target.
 
 ## Phase 4 — Model advertisement hygiene
 

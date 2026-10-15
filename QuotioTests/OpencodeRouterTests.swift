@@ -316,6 +316,105 @@ final class OpencodeRouterTests: XCTestCase {
         XCTAssertTrue(calls.isEmpty)
     }
 
+    /// The zen/responses upstream enforces `max_output_tokens >= 16` —
+    /// ZCode's connectivity probe sends a 1-token cap and upstream 400'd
+    /// with "The number must be `>= 16`" (verified live). Sub-minimum caps
+    /// are floored at 16 when the TARGET surface is responses, on both the
+    /// translated (2b) and passthrough arms.
+    func testSubMinimumOutputCapFlooredTo16OnResponsesTarget() async throws {
+        await seedVaultAccount()
+        await upstream.seed(.success(cannedStream(status: 200, body: "ok")))
+        let router = makeRouter()
+
+        // Translated arm: chat client × responses-native model.
+        let chatBody = Data(#"{"model":"opencode/muse-spark-1.3-contributor-free","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":1}"#.utf8)
+        _ = try await router.open(requestBody: chatBody, route: .chat)
+        var calls = await upstream.calls
+        var json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: XCTUnwrap(calls.first).body) as? [String: Any])
+        XCTAssertEqual(json["max_output_tokens"] as? Int, 16)
+
+        // Passthrough arm: responses client × responses-native model.
+        await upstream.seed(.success(cannedStream(status: 200, body: "ok")))
+        let responsesBody = Data(#"{"model":"opencode/muse-spark-1.3-contributor-free","input":"hi","max_output_tokens":1}"#.utf8)
+        _ = try await router.open(requestBody: responsesBody, route: .responses)
+        calls = await upstream.calls
+        json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: XCTUnwrap(calls.last).body) as? [String: Any])
+        XCTAssertEqual(json["max_output_tokens"] as? Int, 16)
+    }
+
+    /// The floor only raises: caps at or above 16 pass untouched, and the
+    /// chat upstream accepts 1 — no floor when the target is chat.
+    func testOutputCapAboveFloorAndChatTargetUntouched() async throws {
+        await seedVaultAccount()
+        await upstream.seed(.success(cannedStream(status: 200, body: "ok")))
+        let router = makeRouter()
+
+        let capped = Data(#"{"model":"opencode/muse-spark-1.3-contributor-free","input":"hi","max_output_tokens":100}"#.utf8)
+        _ = try await router.open(requestBody: capped, route: .responses)
+        var calls = await upstream.calls
+        var json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: XCTUnwrap(calls.last).body) as? [String: Any])
+        XCTAssertEqual(json["max_output_tokens"] as? Int, 100)
+
+        // Chat target (passthrough): the 1-token cap survives — the chat
+        // upstream accepts it (verified live: mimo probe passed with 1).
+        await upstream.seed(.success(cannedStream(status: 200, body: "ok")))
+        let one = Data(#"{"model":"opencode/big-pickle","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":1}"#.utf8)
+        _ = try await router.open(requestBody: one, route: .chat)
+        calls = await upstream.calls
+        json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: XCTUnwrap(calls.last).body) as? [String: Any])
+        XCTAssertEqual(json["max_completion_tokens"] as? Int, 1)
+        XCTAssertNil(json["max_output_tokens"])
+    }
+
+    /// muse-spark is an always-reasoning model: the zen responses upstream
+    /// rejects `reasoning.effort "none"` (supported: minimal…max — verified
+    /// live). ZCode's probe sends `none` (thinking disabled); clamp it to
+    /// `minimal`, the closest representable intent, on both arms.
+    func testReasoningEffortNoneClampedToMinimalOnResponsesTarget() async throws {
+        await seedVaultAccount()
+        await upstream.seed(.success(cannedStream(status: 200, body: "ok")))
+        let router = makeRouter()
+
+        // Translated arm: chat client's reasoning_effort → reasoning.effort.
+        let chatBody = Data(#"{"model":"opencode/muse-spark-1.3-contributor-free","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"none"}"#.utf8)
+        _ = try await router.open(requestBody: chatBody, route: .chat)
+        var calls = await upstream.calls
+        var json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: XCTUnwrap(calls.last).body) as? [String: Any])
+        XCTAssertEqual((json["reasoning"] as? [String: Any])?["effort"] as? String, "minimal")
+
+        // Passthrough arm: responses client's reasoning.effort verbatim.
+        await upstream.seed(.success(cannedStream(status: 200, body: "ok")))
+        let responsesBody = Data(#"{"model":"opencode/muse-spark-1.3-contributor-free","input":"hi","reasoning":{"effort":"none"}}"#.utf8)
+        _ = try await router.open(requestBody: responsesBody, route: .responses)
+        calls = await upstream.calls
+        json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: XCTUnwrap(calls.last).body) as? [String: Any])
+        XCTAssertEqual((json["reasoning"] as? [String: Any])?["effort"] as? String, "minimal")
+
+        // Only "none" is clamped — representable efforts and absent
+        // reasoning pass untouched.
+        await upstream.seed(.success(cannedStream(status: 200, body: "ok")))
+        let high = Data(#"{"model":"opencode/muse-spark-1.3-contributor-free","input":"hi","reasoning":{"effort":"high"}}"#.utf8)
+        _ = try await router.open(requestBody: high, route: .responses)
+        calls = await upstream.calls
+        json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: XCTUnwrap(calls.last).body) as? [String: Any])
+        XCTAssertEqual((json["reasoning"] as? [String: Any])?["effort"] as? String, "high")
+
+        await upstream.seed(.success(cannedStream(status: 200, body: "ok")))
+        let absent = Data(#"{"model":"opencode/muse-spark-1.3-contributor-free","input":"hi"}"#.utf8)
+        _ = try await router.open(requestBody: absent, route: .responses)
+        calls = await upstream.calls
+        json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: XCTUnwrap(calls.last).body) as? [String: Any])
+        XCTAssertNil(json["reasoning"])
+    }
+
     /// Non-streaming chat clients get `stream_options.include_usage`
     /// injected — the aggregator needs the usage chunk (issue #19 rule).
     /// Streaming chat clients are left alone (spec default: no usage chunk).

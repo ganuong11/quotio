@@ -760,6 +760,26 @@ actor OpencodeRouter {
             options["include_usage"] = true
             json["stream_options"] = options
         }
+        // Upstream conformance: the zen/responses surface enforces
+        // `max_output_tokens >= 16` (verified live — a 1-token connectivity
+        // probe 400'd with "The number must be `>= 16`"; ZCode's probe sends
+        // exactly that). Raise sub-minimum caps, never lower; chat-native
+        // upstreams accept 1, so no floor there.
+        if target == .responses, let cap = json["max_output_tokens"] as? Int, cap < 16 {
+            json["max_output_tokens"] = 16
+        }
+        // Same conformance class: always-reasoning zen models reject
+        // `reasoning.effort "none"` (supported: minimal…max, verified live
+        // on muse-spark). Clamp `none` to `minimal` — the closest
+        // representable intent to "disabled". Only the responses target;
+        // the chat surface accepts `none`.
+        if target == .responses,
+           let reasoning = json["reasoning"] as? [String: Any],
+           (reasoning["effort"] as? String) == "none" {
+            var clamped = reasoning
+            clamped["effort"] = "minimal"
+            json["reasoning"] = clamped
+        }
         var tools = (json["tools"] as? [Any]) ?? []
         normalizeGatedToolSchemas(&tools)
         let hasRead = tools.contains { entry in

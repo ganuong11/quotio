@@ -49,6 +49,15 @@ surface differs:
   mapper exists): `422 unsupported_surface`; excluded from `/v1/models`
   advertisement (filter, not annotation — never advertise what we can't
   serve).
+- **Upstream conformance clamps (added with 2b, live-verified):** the zen
+  responses surface rejects `max_output_tokens < 16` ("The number must be
+  `>= 16`") and, on always-reasoning models, `reasoning.effort "none"`
+  (supported: minimal…max) — ZCode's connectivity probe sends exactly both.
+  `shapeUpstreamBody` raises sub-minimum caps to 16 and clamps effort
+  `none` → `minimal` when the TARGET surface is responses — both the
+  translated and passthrough arms. Chat-native upstreams accept 1 and
+  `none`, so no clamps there; both only ever move toward representable
+  values, never the reverse.
 - **Non-streaming is aggregated on every arm** (not only translated ones):
   upstream is forced `stream:true` by the free-tier gate, so `stream:false`
   clients get one JSON body folded from the SSE (`chat.completion` /
