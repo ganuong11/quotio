@@ -693,11 +693,13 @@ struct DashboardScreen: View {
             VStack(alignment: .leading, spacing: 12) {
                 FlowLayout(spacing: 8) {
                     ForEach(viewModel.connectedProviders) { provider in
-                        // Qoder has no CPA auth file, so authFilesByProvider
-                        // undercounts it in proxy mode; read its vault accounts
+                        // ProxyBridge-native providers (Qoder, OpenCode) have
+                        // no CPA auth file, so authFilesByProvider undercounts
+                        // them in proxy mode; read their monitor accounts
                         // instead so the ×N badge (shown only when >1) is right.
-                        let count = (provider == .qoder && modeManager.isLocalProxyMode)
-                            ? viewModel.monitorAccounts.lazy.filter { $0.provider == .qoder }.count
+                        let count = (AIProvider.proxyBridgeNativeProviders.contains(provider)
+                            && modeManager.isLocalProxyMode)
+                            ? viewModel.monitorAccounts.lazy.filter { $0.provider == provider }.count
                             : viewModel.authFilesByProvider[provider]?.count ?? 0
                         ProviderChip(provider: provider, count: count)
                     }

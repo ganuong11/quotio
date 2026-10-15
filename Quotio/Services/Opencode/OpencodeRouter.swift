@@ -97,6 +97,10 @@ actor OpencodeRouter {
     /// `["accountKey", "displayName"]` — never tokens.
     static let opencodeAccountStale = Notification.Name("dev.quotio.opencode.account-stale")
     static let opencodeAccountRecovered = Notification.Name("dev.quotio.opencode.account-recovered")
+    /// 429 → cooldown notification. `userInfo` adds `"retryAfter"`
+    /// (seconds until the account leaves cooldown); the Quota tab renders
+    /// the account as rate-limited while that window is still open.
+    static let opencodeAccountRateLimited = Notification.Name("dev.quotio.opencode.account-rate-limited")
 
     /// Released-client User-Agent pinned from the Task 0 spike: observed on
     /// the local opencode 1.18.30 (Homebrew) install; the upstream free-tier
@@ -200,7 +204,7 @@ actor OpencodeRouter {
                             markStale(candidate.key, displayName: candidate.displayName)
                             continue
                         case 429:
-                            cooldowns[candidate.key] = Date().addingTimeInterval(Self.cooldownTTL)
+                            setCooldown(candidate)
                             continue
                         default:
                             return openedStream(retry)
@@ -213,7 +217,7 @@ actor OpencodeRouter {
                 }
                 continue   // bad credential on this account → next
             case 429:
-                cooldowns[candidate.key] = Date().addingTimeInterval(Self.cooldownTTL)
+                setCooldown(candidate)
                 continue
             default:
                 return openedStream(stream)
@@ -354,6 +358,22 @@ actor OpencodeRouter {
         else { return nil }
         let headers = Self.upstreamHeaders(token: reloaded.accessToken, orgID: reloaded.orgID)
         return try await upstream.post(url: url, headers: headers, body: body)
+    }
+
+    /// Records a 429 cooldown and notifies the UI so the account renders
+    /// as rate-limited. Expiry is passive (cooldownTTL) — no recovery
+    /// notification; consumers compare the reported window against now.
+    private func setCooldown(_ candidate: Candidate) {
+        cooldowns[candidate.key] = Date().addingTimeInterval(Self.cooldownTTL)
+        let info: [String: Any] = [
+            "accountKey": candidate.key,
+            "displayName": candidate.displayName,
+            "retryAfter": Self.cooldownTTL,
+        ]
+        Task { @MainActor in
+            NotificationCenter.default.post(
+                name: OpencodeRouter.opencodeAccountRateLimited, object: nil, userInfo: info)
+        }
     }
 
     // MARK: - Stale / recovered notifications

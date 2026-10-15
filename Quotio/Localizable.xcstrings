@@ -14293,6 +14293,93 @@
         }
       }
     },
+    "quota.opencode.connected" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Connected — free models only"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Connecté — modèles gratuits uniquement"
+          }
+        },
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Đã kết nối — chỉ các mô hình miễn phí"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已连接 — 仅限免费模型"
+          }
+        }
+      }
+    },
+    "quota.opencode.freeModels" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Free models on OpenCode Zen"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modèles gratuits sur OpenCode Zen"
+          }
+        },
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Các mô hình miễn phí trên OpenCode Zen"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "OpenCode Zen 上的免费模型"
+          }
+        }
+      }
+    },
+    "quota.opencode.rateLimited" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Rate limited — retry in"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Débit limité — nouvel essai dans"
+          }
+        },
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bị giới hạn tốc độ — thử lại sau"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已达速率上限 — 重试倒计时"
+          }
+        }
+      }
+    },
     "quota.reauthenticate" : {
       "comment" : "Button label shown when Claude Code token has expired and re-authentication is needed",
       "extractionState" : "stale",

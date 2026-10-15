@@ -40,6 +40,45 @@ final class OpencodeConsoleClientTests: XCTestCase {
         XCTAssertEqual(code.interval, 5)
     }
 
+    /// The live console returns `verification_uri_complete` SERVER-RELATIVE
+    /// (`/console/device?user_code=…`), verified against production. The
+    /// client must resolve it against the console server origin like the
+    /// released client does (`new URL(uri, server + "/")`) — a raw relative
+    /// path handed to NSWorkspace.open fails with error -50.
+    func testDeviceCodeResolvesRelativeVerificationURI() async throws {
+        StubURLProtocol.handler = { _ in
+            StubURLProtocol.json([
+                "device_code": "dc-1", "user_code": "UC-1234",
+                "verification_uri": "/console/device",
+                "verification_uri_complete": "/console/device?user_code=UC-1234&client_id=opencode-cli",
+                "expires_in": 600, "interval": 5
+            ])
+        }
+        let code = try await makeClient().requestDeviceCode()
+        XCTAssertEqual(
+            code.verificationURIComplete,
+            "https://opencode.ai/console/device?user_code=UC-1234&client_id=opencode-cli")
+    }
+
+    /// A verification URI that can't be resolved to http(s) is rejected —
+    /// the released client throws on non-http(s) schemes too.
+    func testDeviceCodeRejectsNonHTTPVerificationURI() async throws {
+        StubURLProtocol.handler = { _ in
+            StubURLProtocol.json([
+                "device_code": "dc-1", "user_code": "UC-1234",
+                "verification_uri_complete": "opencode://device?user_code=UC-1234",
+                "expires_in": 600, "interval": 5
+            ])
+        }
+        do {
+            _ = try await makeClient().requestDeviceCode()
+            XCTFail("expected invalidResponse")
+        } catch OpencodeConsoleError.invalidResponse {
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
+
     func testPollDeviceTokenPendingAndSlowDown() async throws {
         let client = makeClient()
         StubURLProtocol.handler = { _ in StubURLProtocol.json(["error": "authorization_pending"], status: 400) }

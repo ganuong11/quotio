@@ -282,6 +282,12 @@ nonisolated enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendab
     var supportsLocalProxySetup: Bool {
         supportsManualAuth && !isQuotaTrackingOnly
     }
+
+    /// Providers routed natively by ProxyBridge — they never become CPA auth
+    /// files (`cliProxyType` returns nil for them), so code that derives
+    /// "connected" state from `authFiles` must read their accounts from
+    /// `monitorAccounts` (vault logins + detected native stores) instead.
+    static let proxyBridgeNativeProviders: Set<AIProvider> = [.qoder, .opencode]
 }
 
 /// Stable identity for one account in the provider quota dictionary.

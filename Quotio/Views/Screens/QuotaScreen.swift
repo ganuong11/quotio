@@ -29,7 +29,16 @@ struct QuotaScreen: View {
         for provider in viewModel.providerQuotas.keys {
             providers.insert(provider)
         }
-        
+
+        // OpenCode serves free models with no quota endpoint — it never
+        // produces auth files or quota data, so surface its monitor accounts
+        // (vault logins + detected installs) as a connection-status provider.
+        // Remote mode reflects the remote server, not the local vault.
+        if !modeManager.isRemoteProxyMode,
+           viewModel.monitorAccounts.contains(where: { $0.provider == .opencode }) {
+            providers.insert(.opencode)
+        }
+
         return providers.sorted { $0.displayName < $1.displayName }
     }
     
@@ -48,7 +57,14 @@ struct QuotaScreen: View {
                 accounts.insert(key)
             }
         }
-        
+
+        // OpenCode accounts come from monitorAccounts, not quota data
+        if provider == .opencode {
+            for account in viewModel.monitorAccounts where account.provider == .opencode {
+                accounts.insert(account.accountKey)
+            }
+        }
+
         return accounts.count
     }
     
@@ -72,7 +88,10 @@ struct QuotaScreen: View {
         if modeManager.isMonitorMode {
             return !viewModel.providerQuotas.isEmpty || !viewModel.monitorAccounts.isEmpty
         }
-        return !viewModel.authFiles.isEmpty || !viewModel.providerQuotas.isEmpty
+        // OpenCode accounts have no auth files or quota data, but still count.
+        let hasOpencode = !modeManager.isRemoteProxyMode
+            && viewModel.monitorAccounts.contains(where: { $0.provider == .opencode })
+        return !viewModel.authFiles.isEmpty || !viewModel.providerQuotas.isEmpty || hasOpencode
     }
     
     var body: some View {
@@ -417,7 +436,27 @@ private struct ProviderQuotaView: View {
                 ))
             }
         }
-        
+
+        // OpenCode has no quota endpoint — its rows come from the monitor
+        // account list (vault logins + detected installs) and render as
+        // connection-status cards.
+        if provider == .opencode {
+            let keys = Set(accounts.map(\.key))
+            for account in viewModel.monitorAccounts
+            where account.provider == .opencode && !keys.contains(account.accountKey) {
+                accounts.append(AccountInfo(
+                    key: account.accountKey,
+                    email: account.displayName,
+                    subtitle: account.email,
+                    status: "active",
+                    statusColor: .green,
+                    authFile: nil,
+                    quotaData: nil,
+                    subscriptionInfo: nil
+                ))
+            }
+        }
+
         return accounts.sorted { $0.email < $1.email }
     }
     
@@ -435,7 +474,55 @@ private struct ProviderQuotaView: View {
                         isLoading: isLoading && account.quotaData == nil
                     )
                 }
+                if provider == .opencode {
+                    opencodeFreeModelsCard
+                }
             }
+        }
+    }
+
+    /// OpenCode Zen has no quota API — instead of quota bars, this card lists
+    /// the free models the route gate currently allows (live /v1/models ∩
+    /// models.dev zero-cost, minus internal models). The catalog refreshes
+    /// hourly during proxy lifecycle; the `.task` primes it so the list is
+    /// populated even when the Quota tab is viewed with the proxy stopped
+    /// (monitor mode / cold start).
+    /// The catalog's resolved box isn't Observable — flipping this after
+    /// `prime()` re-renders the card with the freshly loaded model list.
+    @State private var opencodeCatalogPrimed = false
+
+    private var opencodeFreeModelsCard: some View {
+        let models = OpencodeModelCatalog.shared.models
+        return VStack(alignment: .leading, spacing: 10) {
+            Label("quota.opencode.freeModels".localized(), systemImage: "square.stack.3d.up")
+                .font(.subheadline.weight(.medium))
+            if models.isEmpty {
+                Text("quota.noDataYet".localized())
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                FlowLayout(spacing: 6) {
+                    ForEach(models, id: \.id) { model in
+                        Text(model.displayName?.nilIfBlank ?? model.id)
+                            .font(.caption)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Capsule().fill(Color.primary.opacity(0.06)))
+                    }
+                }
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.primary.opacity(0.03))
+        )
+        .task {
+            if OpencodeModelCatalog.shared.isEmpty {
+                await OpencodeModelCatalog.shared.prime()
+            }
+            opencodeCatalogPrimed = true
         }
     }
     
@@ -587,6 +674,8 @@ private struct AccountQuotaCardV2: View {
                 QuotaLoadingView()
             } else if hasQuotaData {
                 usageSection
+            } else if provider == .opencode {
+                opencodeStatusRow
             } else if let message = account.authFile?.humanReadableStatus {
                 Text(message)
                     .font(.subheadline)
@@ -814,6 +903,47 @@ private struct AccountQuotaCardV2: View {
     }
     
     // MARK: - Usage Section
+
+    /// OpenCode has no quota endpoint — the card shows connection status:
+    /// disabled / stale credential / router-reported 429 cooldown (with a
+    /// live countdown) / connected on the free-tier models.
+    @ViewBuilder
+    private var opencodeStatusRow: some View {
+        let monitorAccount = viewModel.monitorAccounts.first {
+            $0.provider == .opencode && $0.accountKey == account.key
+        }
+        let issue = viewModel.monitorAccountIssues[accountID]
+        let rateLimitUntil = viewModel.opencodeRateLimitUntil(accountKey: account.key)
+
+        HStack(spacing: 8) {
+            if monitorAccount?.isDisabled == true {
+                Image(systemName: "pause.circle.fill")
+                    .foregroundStyle(.secondary)
+                Text("providers.disabled".localized())
+                    .foregroundStyle(.secondary)
+            } else if let issue {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text(issue.message)
+                    .foregroundStyle(.secondary)
+            } else if let rateLimitUntil {
+                Image(systemName: "clock.badge.exclamationmark.fill")
+                    .foregroundStyle(.orange)
+                Text("quota.opencode.rateLimited".localized() + " ")
+                    .foregroundStyle(.secondary)
+                + Text(rateLimitUntil, style: .timer)
+                    .foregroundStyle(.orange)
+                    .monospacedDigit()
+            } else {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                Text("quota.opencode.connected".localized())
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .font(.subheadline)
+        .padding(.top, 4)
+    }
 
     private var isQuotaUnavailable: Bool {
         guard let data = account.quotaData else { return false }

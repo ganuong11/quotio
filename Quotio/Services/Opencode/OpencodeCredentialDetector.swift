@@ -11,8 +11,13 @@ import Foundation
 import SQLite3
 
 nonisolated struct DetectedOpencodeCredential: Sendable, Equatable {
+    /// How the native store describes the credential: `oauth` (console
+    /// session, refreshable by opencode itself) or `api` (opaque inference
+    /// key — no identity, no expiry, not usable with /api/user).
+    enum Kind: String, Sendable { case oauth, api }
     /// canonical dedup key: console userID → email → fingerprint(sourcePath + server)
     let accountKey: String
+    let kind: Kind
     let accessToken: String
     let refreshToken: String?
     let expiresAt: Date?
@@ -90,6 +95,7 @@ nonisolated enum OpencodeCredentialDetector {
             let accountID = (entry["accountId"] as? String)?.nilIfBlank
             results.append(DetectedOpencodeCredential(
                 accountKey: canonicalKey(accountID: accountID, email: nil, source: source, server: server),
+                kind: type == "api" ? .api : .oauth,
                 accessToken: accessToken,
                 refreshToken: (entry["refresh"] as? String)?.nilIfBlank,
                 expiresAt: expiresMs.map { Date(timeIntervalSince1970: $0 / 1000) },
@@ -179,6 +185,7 @@ nonisolated enum OpencodeCredentialDetector {
         let expiresMs = number(value["expires"])
         return DetectedOpencodeCredential(
             accountKey: canonicalKey(accountID: accountID, email: email, source: source, server: server),
+            kind: type == "api" ? .api : .oauth,
             accessToken: accessToken,
             refreshToken: (value["refresh"] as? String)?.nilIfBlank,
             expiresAt: expiresMs.map { Date(timeIntervalSince1970: $0 / 1000) },

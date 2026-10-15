@@ -137,4 +137,27 @@ final class OpencodeProviderTests: XCTestCase {
             accountKey: "nobody", stale: true, to: [], issues: &issues)
         XCTAssertTrue(issues.isEmpty)
     }
+
+    // MARK: - Rate-limit map (Quota tab status)
+
+    /// The rate-limit map is keyed case-insensitively by accountKey and
+    /// self-expires: a past `until` reads as "not blocked".
+    func testOpencodeRateLimitMapCaseAndExpiry() {
+        var limits: [String: Date] = [:]
+        let now = Date()
+        QuotaViewModel.applyOpencodeRateLimit(
+            accountKey: "Usr_ABC", retryAfter: 60, to: &limits, now: now)
+        XCTAssertEqual(
+            QuotaViewModel.opencodeRateLimitUntil(
+                accountKey: "usr_abc", in: limits, now: now),
+            now.addingTimeInterval(60))
+        // expired entry → nil
+        XCTAssertNil(
+            QuotaViewModel.opencodeRateLimitUntil(
+                accountKey: "usr_abc", in: limits, now: now.addingTimeInterval(61)))
+        // unknown account → nil
+        XCTAssertNil(
+            QuotaViewModel.opencodeRateLimitUntil(
+                accountKey: "nobody", in: limits, now: now))
+    }
 }

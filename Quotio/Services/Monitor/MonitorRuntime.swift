@@ -500,11 +500,24 @@ actor MonitorAccountDiscovery {
             .make(
                 provider: .opencode,
                 accountKey: credential.accountKey,
-                displayName: credential.email,
+                displayName: credential.email ?? Self.opencodeDetectedLabel(for: credential),
                 source: .nativeCredential,
                 credentialReference: credential.sourcePath
             )
         }
+    }
+
+    /// Display label for a detected credential with no email. API-key
+    /// credentials carry no identity at all (the key is opaque — not a JWT —
+    /// and the console rejects it on /api/user), so label them by the key's
+    /// last 4 chars, e.g. "API key …Py6v". OAuth credentials without an
+    /// email fall through to their accountKey (the console userID), which is
+    /// a real — if cryptic — identity.
+    nonisolated static func opencodeDetectedLabel(
+        for credential: DetectedOpencodeCredential
+    ) -> String? {
+        guard credential.kind == .api else { return nil }
+        return "API key …" + String(credential.accessToken.suffix(4))
     }
 
     private func discoverCodexFiles(aliases: [String: String]) -> [MonitorAccount] {

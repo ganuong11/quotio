@@ -63,7 +63,8 @@ actor OpencodeConsoleClient {
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let deviceCode = json["device_code"] as? String,
               let userCode = json["user_code"] as? String,
-              let uri = json["verification_uri_complete"] as? String,
+              let rawURI = json["verification_uri_complete"] as? String,
+              let uri = Self.resolveVerificationURI(rawURI, server: server),
               let expiresIn = json["expires_in"] as? Int,
               let interval = json["interval"] as? Int
         else {
@@ -73,6 +74,21 @@ actor OpencodeConsoleClient {
             deviceCode: deviceCode, userCode: userCode,
             verificationURIComplete: uri, expiresIn: expiresIn, interval: interval
         )
+    }
+
+    /// The live console returns `verification_uri_complete` server-relative
+    /// (`/console/device?user_code=…`); the released client resolves it
+    /// against `${server}/` and requires http(s) before opening. Resolving
+    /// here means every downstream consumer (auto-open, the device-code
+    /// notification `url`, the Copy/Open Link buttons) gets an absolute,
+    /// openable URL — `NSWorkspace.open` on a raw relative path fails with
+    /// "The application can't be opened" (-50).
+    nonisolated static func resolveVerificationURI(_ uri: String, server: String) -> String? {
+        guard let base = URL(string: server + "/"),
+              let resolved = URL(string: uri, relativeTo: base)?.absoluteURL,
+              let scheme = resolved.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else { return nil }
+        return resolved.absoluteString
     }
 
     /// One poll attempt — the caller owns the loop/sleep/cancel.

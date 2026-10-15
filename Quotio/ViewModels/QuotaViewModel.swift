@@ -111,6 +111,11 @@ final class QuotaViewModel {
     var monitorAccounts: [MonitorAccount] = []
     var monitorIssues: [AIProvider: MonitorRefreshIssue] = [:]
     var monitorAccountIssues: [QuotaAccountID: MonitorRefreshIssue] = [:]
+    /// OpenCode 429 cooldowns reported by the router, keyed by lowercased
+    /// accountKey → cooldown expiry. Entries self-expire: consumers render
+    /// them only while the expiry is still in the future, so no recovery
+    /// notification is needed.
+    var opencodeRateLimits: [String: Date] = [:]
 
     func monitorStatus(for account: MonitorAccount) -> (status: String?, message: String?) {
         let updated = Self.monitorLastUpdated(for: account, providerQuotas: providerQuotas)
@@ -182,6 +187,7 @@ final class QuotaViewModel {
     @ObservationIgnored private let opencodeDetectedCache = OpencodeDetectedCache()
     @ObservationIgnored private var opencodeStaleObserver: NSObjectProtocol?
     @ObservationIgnored private var opencodeRecoveredObserver: NSObjectProtocol?
+    @ObservationIgnored private var opencodeRateLimitObserver: NSObjectProtocol?
     @ObservationIgnored private var isStartingProxyFlow = false
     @ObservationIgnored private var lastLogTimestamp: Int?
     @ObservationIgnored private var isWarmupRunning = false
@@ -500,7 +506,10 @@ final class QuotaViewModel {
     /// Load auth files directly from filesystem
     func loadDirectAuthFiles() async {
         directAuthFiles = await directAuthService.scanAllAuthFiles()
-        if modeManager.isMonitorMode {
+        // Local Proxy mode also consumes monitorAccounts: ProvidersScreen and
+        // the dashboard read ProxyBridge-native accounts (Qoder, OpenCode)
+        // from it — rescanning keeps detected installs picked up on refresh.
+        if modeManager.isMonitorMode || modeManager.isLocalProxyMode {
             monitorAccounts = await monitorCoordinator.discoverAccounts(merging: providerQuotas)
         }
     }
@@ -1510,16 +1519,18 @@ final class QuotaViewModel {
             return Array(Set(monitorAccounts.map(\.provider))).sorted { $0.displayName < $1.displayName }
         }
         var providers = Set(authFiles.compactMap { $0.providerType })
-        if modeManager.isLocalProxyMode,
-           monitorAccounts.contains(where: { $0.provider == .qoder }) {
-            // Qoder is vault-backed and routed direct from the vault in proxy
-            // mode, but it has no CPA auth file (cliProxyType(.qoder) == nil),
-            // so the authFiles set above never includes it. Without this it
-            // falls into disconnectedProviders and renders as a grey "+" chip
-            // on the dashboard even though it is connected (and listed) on the
-            // Providers screen. Remote mode is intentionally untouched: its
-            // dashboard reflects the remote server, not the local vault.
-            providers.insert(.qoder)
+        if modeManager.isLocalProxyMode {
+            // Qoder and OpenCode are routed natively by ProxyBridge in proxy
+            // mode (vault / detected-store backed), but they never get a CPA
+            // auth file, so the authFiles set above never includes them.
+            // Without this they fall into disconnectedProviders and render
+            // as grey "+" chips on the dashboard even though they are
+            // connected (and listed) on the Providers screen. Remote mode is
+            // intentionally untouched: its dashboard reflects the remote
+            // server, not the local vault.
+            providers.formUnion(AIProvider.proxyBridgeNativeProviders.filter { provider in
+                monitorAccounts.contains(where: { $0.provider == provider })
+            })
         }
         return Array(providers).sorted { $0.displayName < $1.displayName }
     }
@@ -1533,13 +1544,15 @@ final class QuotaViewModel {
     var totalAccounts: Int {
         let proxyCount = authFiles.count
         guard modeManager.isLocalProxyMode else { return proxyCount }
-        // Qoder has no CPA auth file, so authFiles undercounts the dashboard
-        // "Accounts" KPI in proxy mode by exactly the Qoder vault accounts.
-        // Add them so the KPI matches the Providers screen (which lists Qoder
-        // from monitorAccounts). readyAccounts is left auth-file-only: there is
+        // ProxyBridge-native providers (Qoder, OpenCode) have no CPA auth
+        // file, so authFiles undercounts the dashboard "Accounts" KPI in
+        // proxy mode by exactly those monitor accounts. Add them so the KPI
+        // matches the Providers screen (which lists them from
+        // monitorAccounts). readyAccounts is left auth-file-only: there is
         // no vault "ready" notion (monitor mode's own dashboard shows only a
         // tracked total), so fabricating one here would be inconsistent.
-        return proxyCount + monitorAccounts.lazy.filter { $0.provider == .qoder }.count
+        return proxyCount + monitorAccounts.lazy
+            .filter { AIProvider.proxyBridgeNativeProviders.contains($0.provider) }.count
     }
     var readyAccounts: Int { authFiles.filter { $0.isReady }.count }
     
@@ -1723,6 +1736,13 @@ final class QuotaViewModel {
             guard let key = note.userInfo?["accountKey"] as? String else { return }
             Task { @MainActor in self?.applyOpencodeIssue(accountKey: key, stale: false) }
         }
+        opencodeRateLimitObserver = NotificationCenter.default.addObserver(
+            forName: OpencodeRouter.opencodeAccountRateLimited, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let key = note.userInfo?["accountKey"] as? String else { return }
+            let retryAfter = (note.userInfo?["retryAfter"] as? TimeInterval) ?? 0
+            Task { @MainActor in self?.applyOpencodeRateLimit(accountKey: key, retryAfter: retryAfter) }
+        }
 
         // One lifecycle task, three independent intervals: catalog 1 h,
         // detected-snapshot 5 min (picks up system re-auth quickly), vault
@@ -1762,6 +1782,11 @@ final class QuotaViewModel {
             NotificationCenter.default.removeObserver(observer)
             opencodeRecoveredObserver = nil
         }
+        if let observer = opencodeRateLimitObserver {
+            NotificationCenter.default.removeObserver(observer)
+            opencodeRateLimitObserver = nil
+        }
+        opencodeRateLimits.removeAll()
         proxyManager.proxyBridge.opencodeRouter = nil
     }
 
@@ -1800,6 +1825,39 @@ final class QuotaViewModel {
         } else {
             issues.removeValue(forKey: id)
         }
+    }
+
+    /// Record a router-reported 429 cooldown for the Quota tab's status row.
+    /// Instance state is thin over the static core for testability (a live
+    /// QuotaViewModel can't be constructed inside the test host — see
+    /// `applyOpencodeIssue`'s note).
+    func applyOpencodeRateLimit(accountKey: String, retryAfter: TimeInterval) {
+        Self.applyOpencodeRateLimit(
+            accountKey: accountKey, retryAfter: retryAfter, to: &opencodeRateLimits)
+    }
+
+    nonisolated static func applyOpencodeRateLimit(
+        accountKey: String,
+        retryAfter: TimeInterval,
+        to limits: inout [String: Date],
+        now: Date = Date()
+    ) {
+        limits[accountKey.lowercased()] = now.addingTimeInterval(retryAfter)
+    }
+
+    /// Cooldown expiry for an opencode account still inside its rate-limit
+    /// window — nil for unknown keys and expired entries.
+    func opencodeRateLimitUntil(accountKey: String) -> Date? {
+        Self.opencodeRateLimitUntil(accountKey: accountKey, in: opencodeRateLimits)
+    }
+
+    nonisolated static func opencodeRateLimitUntil(
+        accountKey: String,
+        in limits: [String: Date],
+        now: Date = Date()
+    ) -> Date? {
+        guard let until = limits[accountKey.lowercased()], until > now else { return nil }
+        return until
     }
 
     private func setupAPIClient() {

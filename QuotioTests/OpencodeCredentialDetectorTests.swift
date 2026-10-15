@@ -47,6 +47,7 @@ final class OpencodeCredentialDetectorTests: XCTestCase {
         XCTAssertEqual(found.count, 2)
         let byKey = Dictionary(uniqueKeysWithValues: found.map { ($0.accountKey, $0) })
         let json = try XCTUnwrap(byKey["usr_json"])
+        XCTAssertEqual(json.kind, .oauth)
         XCTAssertEqual(json.accessToken, "at-json")
         XCTAssertEqual(json.refreshToken, "rt-json")
         XCTAssertEqual(json.expiresAt, Date(timeIntervalSince1970: 2_000_000_000))
@@ -65,6 +66,7 @@ final class OpencodeCredentialDetectorTests: XCTestCase {
         let found = OpencodeCredentialDetector.discover(in: tempDir)
         XCTAssertEqual(found.count, 1)
         let cred = try XCTUnwrap(found.first)
+        XCTAssertEqual(cred.kind, .api)
         XCTAssertEqual(cred.accessToken, "sk-test")
         XCTAssertNil(cred.refreshToken)
         XCTAssertNil(cred.expiresAt)
@@ -148,5 +150,24 @@ final class OpencodeCredentialDetectorTests: XCTestCase {
         XCTAssertEqual(cred?.accountKey, "usr_1")
         // unknown entry -> nil
         XCTAssertNil(OpencodeCredentialDetector.reload(sourcePath: tempDir.appendingPathComponent("auth.json").path + "#nope"))
+    }
+
+    /// An api-key credential has no email to show — the row label falls back
+    /// to a masked-key hint ("API key …Py6v") instead of the fingerprint
+    /// accountKey. OAuth creds without email keep the accountKey fallback
+    /// (a real console userID), so the helper returns nil for them.
+    func testDetectedLabelMasksAPIKeyAndSkipsOAuth() throws {
+        try write("auth.json", """
+        {
+            "opencode": {"type": "api", "key": "sk-AllvSEPy6vQx"},
+            "opencode-work": {"type": "oauth", "access": "at-1", "expires": 2000000000000,
+                              "accountId": "usr_work"}
+        }
+        """)
+        let found = OpencodeCredentialDetector.discover(in: tempDir)
+        let api = try XCTUnwrap(found.first { $0.kind == .api })
+        let oauth = try XCTUnwrap(found.first { $0.kind == .oauth })
+        XCTAssertEqual(MonitorAccountDiscovery.opencodeDetectedLabel(for: api), "API key …6vQx")
+        XCTAssertNil(MonitorAccountDiscovery.opencodeDetectedLabel(for: oauth))
     }
 }

@@ -80,21 +80,23 @@ struct ProvidersScreen: View {
             }
         }
 
-        // Qoder is vault-backed and routed direct from the vault in proxy mode
-        // (ProxyBridge + QoderFailoverRouter); it never becomes a CPA auth file
-        // (cliProxyType(.qoder) == nil), so the proxy/else branches above can
-        // never include it. Surface it from monitorAccounts in Local Proxy mode
+        // Qoder and OpenCode are routed natively by ProxyBridge — vault- or
+        // detected-store-backed, never CPA auth files (cliProxyType returns
+        // nil for them), so the proxy/else branches above can never include
+        // them. Surface them from monitorAccounts in Local Proxy mode
         // *regardless of whether the proxy is running* — otherwise a Qoder
-        // account added in monitor mode is invisible here after a mode switch
-        // (and on a cold start in proxy mode). Monitor mode already lists it
-        // via the branch above; remote mode shows the remote server's accounts,
-        // not the local vault, so neither is touched here. The merge is scoped
-        // to .qoder so CPA-exported providers (claude/codex/…) are not
-        // double-listed alongside their auth-file rows.
+        // login or a detected system OpenCode account is invisible here
+        // after a mode switch (and on a cold start in proxy mode). Monitor
+        // mode already lists them via the branch above; remote mode shows
+        // the remote server's accounts, not the local vault, so neither is
+        // touched here. The merge is scoped to these providers so
+        // CPA-exported providers (claude/codex/…) are not double-listed
+        // alongside their auth-file rows.
         if modeManager.isLocalProxyMode {
-            for account in viewModel.monitorAccounts where account.provider == .qoder {
+            for account in viewModel.monitorAccounts
+            where AIProvider.proxyBridgeNativeProviders.contains(account.provider) {
                 let state = viewModel.monitorStatus(for: account)
-                groups[.qoder, default: []].append(
+                groups[account.provider, default: []].append(
                     AccountRowData.from(
                         monitorAccount: account,
                         status: state.status,

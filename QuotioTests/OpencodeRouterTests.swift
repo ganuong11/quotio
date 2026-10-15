@@ -198,7 +198,7 @@ final class OpencodeRouterTests: XCTestCase {
         try #"{"opencode":{"type":"oauth","access":"fresh-at","refresh":"fresh-rt","expires":4102444800000,"accountId":"usr_det"}}"#
             .write(toFile: authPath, atomically: true, encoding: .utf8)
         let expiredDetected = DetectedOpencodeCredential(
-            accountKey: "usr_det", accessToken: "stale-at", refreshToken: "stale-rt",
+            accountKey: "usr_det", kind: .oauth, accessToken: "stale-at", refreshToken: "stale-rt",
             expiresAt: Date().addingTimeInterval(-10), orgID: nil,
             server: OpencodeConsoleClient.defaultServer,
             sourcePath: authPath + "#opencode", email: nil)
@@ -221,7 +221,7 @@ final class OpencodeRouterTests: XCTestCase {
             .write(toFile: authPath, atomically: true, encoding: .utf8)
         await seedVaultAccount(key: "usr_vault", accessToken: "vault-at")
                 let expiredDetected = DetectedOpencodeCredential(
-            accountKey: "usr_det", accessToken: "old", refreshToken: "old",
+            accountKey: "usr_det", kind: .oauth, accessToken: "old", refreshToken: "old",
             expiresAt: Date(timeIntervalSince1970: 1000), orgID: nil,
             server: OpencodeConsoleClient.defaultServer,
             sourcePath: authPath + "#opencode", email: nil)
@@ -288,13 +288,33 @@ final class OpencodeRouterTests: XCTestCase {
         XCTAssertEqual(headers["authorization"], "Bearer at-b")
     }
 
+    /// A 429 cooldown notifies the UI so the account can be shown as
+    /// rate-limited (Quota tab connection-status card).
+    func test429PostsRateLimitedNotification() async throws {
+        await seedVaultAccount(key: "usr_a", accessToken: "at-a")
+        await seedVaultAccount(key: "usr_b", accessToken: "at-b")
+        await upstream.seed(.success(cannedStream(status: 429, body: "limited")))
+        await upstream.seed(.success(cannedStream(status: 200, body: "ok")))
+
+        let limited = expectation(description: "rate-limited notification")
+        let observer = NotificationCenter.default.addObserver(
+            forName: OpencodeRouter.opencodeAccountRateLimited, object: nil, queue: nil) { note in
+            if (note.userInfo?["accountKey"] as? String) == "usr_a" { limited.fulfill() }
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        let router = makeRouter()
+        _ = try await router.open(requestBody: chatBody, route: .chat)
+        await fulfillment(of: [limited], timeout: 5)
+    }
+
     func testRecoveredClearsStale() async throws {
         let authPath = tempDir.appendingPathComponent("auth.json").path
         try #"{"opencode":{"type":"oauth","access":"still-stale","refresh":"x","expires":1000,"accountId":"usr_det"}}"#
             .write(toFile: authPath, atomically: true, encoding: .utf8)
         await seedVaultAccount(key: "usr_vault", accessToken: "vault-at")
                 let expiredDetected = DetectedOpencodeCredential(
-            accountKey: "usr_det", accessToken: "old", refreshToken: "old",
+            accountKey: "usr_det", kind: .oauth, accessToken: "old", refreshToken: "old",
             expiresAt: Date(timeIntervalSince1970: 1000), orgID: nil,
             server: OpencodeConsoleClient.defaultServer,
             sourcePath: authPath + "#opencode", email: nil)
@@ -377,7 +397,7 @@ final class OpencodeRouterTests: XCTestCase {
     /// serve — the disabled set applies to detected candidates too.
     func testDisabledDetectedAccountIsSkipped() async throws {
         let detected = DetectedOpencodeCredential(
-            accountKey: "usr_det", accessToken: "det-at", refreshToken: nil,
+            accountKey: "usr_det", kind: .oauth, accessToken: "det-at", refreshToken: nil,
             expiresAt: Date().addingTimeInterval(3600), orgID: nil,
             server: OpencodeConsoleClient.defaultServer,
             sourcePath: "/tmp/x#opencode", email: nil)
@@ -411,7 +431,7 @@ final class OpencodeRouterTests: XCTestCase {
             .write(toFile: authPath, atomically: true, encoding: .utf8)
         // snapshot still holds the old (revoked-but-unexpired) token
         let detected = DetectedOpencodeCredential(
-            accountKey: "usr_det", accessToken: "revoked-at", refreshToken: "old",
+            accountKey: "usr_det", kind: .oauth, accessToken: "revoked-at", refreshToken: "old",
             expiresAt: Date().addingTimeInterval(3600), orgID: nil,
             server: OpencodeConsoleClient.defaultServer,
             sourcePath: authPath + "#opencode", email: nil)
@@ -438,7 +458,7 @@ final class OpencodeRouterTests: XCTestCase {
         try #"{"opencode":{"type":"oauth","access":"revoked-at","refresh":"r","expires":4102444800000,"accountId":"usr_det"}}"#
             .write(toFile: authPath, atomically: true, encoding: .utf8)
         let detected = DetectedOpencodeCredential(
-            accountKey: "usr_det", accessToken: "revoked-at", refreshToken: "r",
+            accountKey: "usr_det", kind: .oauth, accessToken: "revoked-at", refreshToken: "r",
             expiresAt: Date().addingTimeInterval(3600), orgID: nil,
             server: OpencodeConsoleClient.defaultServer,
             sourcePath: authPath + "#opencode", email: nil)
