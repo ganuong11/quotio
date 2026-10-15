@@ -2325,11 +2325,16 @@ final class ProxyBridge {
                     json = nil
                 }
 
-                if aggregateFailed || json == nil {
+                // An upstream-reported failure (response.failed / error
+                // event) reached the adapter — the chat non-streaming
+                // contract is an HTTP error, and nothing is written yet.
+                let adapterFailed = box.chatAdapter?.failed ?? false
+                if aggregateFailed || adapterFailed || json == nil {
                     statusCodeForMetadata = nil
                     self.sendError(
                         to: originalConnection, statusCode: 502,
-                        message: "opencode upstream stream ended before completion.")
+                        message: box.chatAdapter?.failureMessage
+                            ?? "opencode upstream stream ended before completion.")
                 } else {
                     let bodyBytes = (try? JSONSerialization.data(withJSONObject: json!))
                         ?? Data("{\"error\":\"failed to serialize completion\"}".utf8)

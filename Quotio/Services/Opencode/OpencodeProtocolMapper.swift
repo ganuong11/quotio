@@ -225,7 +225,10 @@ nonisolated enum OpencodeProtocolMapper {
     /// `function_call_output` correlated by `tool_call_id`.
     private static func chatMessageToInputItems(_ message: [String: Any]) -> [[String: Any]] {
         let role = (message["role"] as? String) ?? "user"
-        if role == "tool" {
+        // The deprecated `function` role is the legacy spelling of `tool` —
+        // map it the same way rather than emitting a message item with an
+        // invalid Responses role.
+        if role == "tool" || role == "function" {
             return [[
                 "type": "function_call_output",
                 "call_id": (message["tool_call_id"] as? String) ?? "",

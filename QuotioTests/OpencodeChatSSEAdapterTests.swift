@@ -249,4 +249,85 @@ final class OpencodeChatSSEAdapterTests: XCTestCase {
         let usage = try XCTUnwrap(json["usage"] as? [String: Any])
         XCTAssertEqual(usage["prompt_tokens"] as? Int, 7)
     }
+
+    // MARK: - Failure surfacing (review pass)
+
+    func testFailedStreamMarksAdapterFailedNotCleanCompletion() throws {
+        // The non-streaming fold's contract: an upstream-reported failure is
+        // a true HTTP error (the bridge checks adapter.failed) — NOT a
+        // choices-less error frame folded into an empty-but-200 completion.
+        var adapter = OpencodeChatSSEAdapter(model: "m")
+        var aggregator = QoderCompletionAggregator()
+        let upstream = Data(
+            ("event: x\ndata: " + #"{"type":"response.created","response":{"id":"resp_1","created_at":756000000}}"# + "\n\n"
+                + "event: x\ndata: " + #"{"type":"response.output_text.delta","delta":"par"}"# + "\n\n"
+                + "event: x\ndata: "
+                + #"{"type":"response.failed","response":{"id":"resp_1","error":{"code":"server_error","message":"overloaded"}}}"#
+                + "\n\n").utf8)
+        try aggregator.ingest(try adapter.ingest(upstream))
+        XCTAssertTrue(adapter.failed)
+        XCTAssertEqual(adapter.failureMessage, "overloaded")
+        // What the aggregator alone would (wrongly) fold — documents why the
+        // bridge must check the adapter, not just the aggregate:
+        let json = aggregator.completionJSON(requestModel: "m")
+        XCTAssertEqual(((json["choices"] as? [[String: Any]])?.first?["message"] as? [String: Any])?["content"] as? String, "par")
+    }
+
+    func testTopLevelErrorEventIsErrorFrame() throws {
+        var adapter = OpencodeChatSSEAdapter(model: "m")
+        let out = try adapter.ingest(Data(
+            ("event: x\ndata: " + #"{"type":"response.created","response":{"id":"resp_1","created_at":756000000}}"# + "\n\n"
+                + "event: x\ndata: " + #"{"type":"error","error":{"code":"rate_limit","message":"slow down"}}"# + "\n\n").utf8))
+        XCTAssertTrue(adapter.failed)
+        XCTAssertEqual(adapter.failureMessage, "slow down")
+        let text = try XCTUnwrap(String(data: out, encoding: .utf8))
+        XCTAssertTrue(text.hasSuffix("data: [DONE]\n\n"))
+        let chunks = try Self.parseChunks(out)
+        let error = try XCTUnwrap((chunks.last?["error"] as? [String: Any]))
+        XCTAssertEqual(error["message"] as? String, "slow down")
+    }
+
+    func testMultipleFunctionCallsGetDistinctIndices() throws {
+        let chunks = try run([
+            #"{"type":"response.created","response":{"id":"resp_1","created_at":756000000}}"#,
+            #"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_a","name":"read","arguments":"{}"}}"#,
+            #"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_b","name":"grep","arguments":"{}"}}"#,
+            #"{"type":"response.completed","response":{"id":"resp_1","usage":null}}"#,
+        ])
+        let toolChunks = chunks.filter { c in
+            !((c["choices"] as? [[String: Any]])?.isEmpty ?? true)
+                && ((c["choices"] as? [[String: Any]])?.first?["delta"] as? [String: Any])?["tool_calls"] != nil
+        }
+        XCTAssertEqual(toolChunks.count, 2)
+        let indices = try toolChunks.compactMap { chunk -> Int? in
+            let delta = try XCTUnwrap(((try choices(chunk)[0])["delta"] as? [String: Any]))
+            let calls = try XCTUnwrap(delta["tool_calls"] as? [[String: Any]])
+            return calls[0]["index"] as? Int
+        }
+        XCTAssertEqual(indices, [0, 1])
+    }
+
+    func testFinishIsIdempotentAfterSynthesis() throws {
+        var adapter = OpencodeChatSSEAdapter(model: "m")
+        _ = try adapter.ingest(Data(
+            ("event: x\ndata: " + #"{"type":"response.created","response":{"id":"resp_1","created_at":756000000}}"# + "\n\n").utf8))
+        let first = try adapter.finish()
+        XCTAssertFalse(first.isEmpty)
+        let second = try adapter.finish()
+        XCTAssertTrue(second.isEmpty)
+    }
+
+    func testSecondTerminalAfterDoneIsDropped() throws {
+        // One [DONE] per stream — a duplicated terminal must not emit a
+        // second finish sequence (nor may stray deltas follow the sentinel).
+        var adapter = OpencodeChatSSEAdapter(model: "m")
+        let out = try adapter.ingest(Data(
+            ("event: x\ndata: " + #"{"type":"response.created","response":{"id":"resp_1","created_at":756000000}}"# + "\n\n"
+                + "event: x\ndata: " + #"{"type":"response.completed","response":{"id":"resp_1","usage":null}}"# + "\n\n"
+                + "event: x\ndata: " + #"{"type":"response.completed","response":{"id":"resp_1","usage":null}}"# + "\n\n"
+                + "event: x\ndata: " + #"{"type":"response.output_text.delta","delta":"stray"}"# + "\n\n").utf8))
+        let text = try XCTUnwrap(String(data: out, encoding: .utf8))
+        XCTAssertEqual(text.components(separatedBy: "data: [DONE]").count - 1, 1)
+        XCTAssertFalse(text.contains("stray"))
+    }
 }

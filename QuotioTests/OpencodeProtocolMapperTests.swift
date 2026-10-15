@@ -416,4 +416,18 @@ final class OpencodeProtocolMapperTests: XCTestCase {
         ])
         XCTAssertNil(responses["stream_options"])
     }
+
+    func testLegacyFunctionRoleMapsToFunctionCallOutput() throws {
+        // The deprecated `function` role is the legacy spelling of `tool` —
+        // it must not become a message item with an invalid role.
+        let responses = try translateBack([
+            "model": "m",
+            "messages": [
+                ["role": "user", "content": "hi"],
+                ["role": "function", "name": "lookup", "content": "result bytes"],
+            ],
+        ])
+        let input = try XCTUnwrap(responses["input"] as? [[String: Any]])
+        XCTAssertEqual(input.last?["type"] as? String, "function_call_output")
+    }
 }

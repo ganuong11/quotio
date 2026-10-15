@@ -73,8 +73,19 @@ nonisolated struct OpencodeChatSSEAdapter {
     private var sawToolCalls: Bool = false
 
     /// Whether a terminal (completed/incomplete/failed/error) already
-    /// emitted its finish sequence — makes `finish()` idempotent-empty.
+    /// emitted its finish sequence — makes `finish()` idempotent-empty and
+    /// drops any events after the terminal (nothing may follow [DONE]).
     private var terminalEmitted: Bool = false
+
+    /// Whether the upstream reported a failure (`response.failed` or a
+    /// top-level `error` event). Surfaced so the non-streaming fold can
+    /// answer with a true HTTP error instead of folding the error frame's
+    /// (choices-less) bytes into an empty-but-200 completion.
+    private(set) var failed: Bool = false
+
+    /// The upstream's failure message when `failed` — relayed by the
+    /// non-streaming fold's error response.
+    private(set) var failureMessage: String?
 
     init(model: String) {
         self.model = model
@@ -126,6 +137,9 @@ nonisolated struct OpencodeChatSSEAdapter {
 
     private mutating func handleEvent(_ event: [String: Any]) -> Data {
         guard let type = event["type"] as? String else { return Data() }
+        // One terminal per stream: everything after it (a second terminal,
+        // stray deltas) would emit chunks after [DONE] — drop them.
+        guard !terminalEmitted else { return Data() }
         switch type {
         case "response.created", "response.in_progress":
             stampIdentity(event["response"])
@@ -241,14 +255,17 @@ nonisolated struct OpencodeChatSSEAdapter {
     /// error object verbatim; fabricates a minimal envelope otherwise.
     private mutating func emitErrorFrame(errorObject: Any?) -> Data {
         terminalEmitted = true
+        failed = true
         let error: [String: Any]
         if let upstream = errorObject as? [String: Any], upstream["message"] != nil {
             error = upstream
+            failureMessage = upstream["message"] as? String
         } else {
             error = [
                 "message": "opencode responses stream failed.",
                 "type": "internal_server_error",
             ]
+            failureMessage = nil
         }
         guard let json = try? JSONSerialization.data(withJSONObject: ["error": error]) else {
             return doneSentinel()
