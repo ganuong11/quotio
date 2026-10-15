@@ -100,10 +100,13 @@ final class OpencodeProtocolMapperTests: XCTestCase {
 
     // MARK: - Token fields
 
-    func testMaxOutputTokensUsesModernSpellingOnly() throws {
+    func testMaxOutputTokensCarriesBothSpellings() throws {
+        // Both spellings ride the translated body — an openai-compatible
+        // upstream may honor only the legacy `max_tokens`, and dropping it
+        // would silently lose the cap.
         let chat = try translate(["model": "m", "input": "hi", "max_output_tokens": 512])
         XCTAssertEqual(chat["max_completion_tokens"] as? Int, 512)
-        XCTAssertNil(chat["max_tokens"], "legacy spelling is dropped for the opencode upstream")
+        XCTAssertEqual(chat["max_tokens"] as? Int, 512)
     }
 
     // MARK: - Overlays (fields the Qoder DTO does not carry)

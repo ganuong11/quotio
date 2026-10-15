@@ -89,7 +89,7 @@ This is also a **bug fix for today**: the current passthrough arm forces `stream
 
 **New file:** `Quotio/Services/Opencode/OpencodeProtocolMapper.swift` — `responsesRequestToChat(json:) throws -> Data`:
 
-- Reuse `QoderResponsesTranslator.parseResponses` + `synthesizeChatBody(from:)` for structure: `input` items → `messages` (system/developer/user/assistant/tool roles pass through losslessly, including interleaved system messages — no `instructions`-flattening in this direction), flat `tools` → nested chat shape, `max_output_tokens` → `max_completion_tokens`+`max_tokens`, `instructions` → prepended developer message, reasoning intent → `reasoning_effort`.
+- Reuse `QoderResponsesTranslator.parseResponses` + `synthesizeChatBody(from:)` for structure: `input` items → `messages` (system/developer/user/assistant/tool roles pass through losslessly, including interleaved system messages — no `instructions`-flattening in this direction), flat `tools` → nested chat shape, `max_output_tokens` → BOTH chat spellings (an openai-compatible upstream may honor only legacy `max_tokens` — dropping it silently loses the cap; verified live), `instructions` → prepended developer message, reasoning intent → `reasoning_effort`.
 - Overlay onto the synthesized body (fields the DTO does not carry):
   - `temperature`, `top_p` — passthrough.
   - `tool_choice`: string values passthrough; `{type:"function", name:X}` → `{type:"function", function:{name:X}}`.
@@ -98,7 +98,7 @@ This is also a **bug fix for today**: the current passthrough arm forces `stream
 - **Hard-fail carve-out (S2):** `previous_response_id` / `conversation` (server-side state) → 400 with a clear message — translating them to stateless chat by dropping would silently lose the entire conversation. All other unknown fields still drop silently; upstream validation is the arbiter.
 - Stream back: pump upstream chat SSE → `QoderResponsesAdapter` → Responses events (verified decoupled from Qoder envelope internals; skips `[DONE]`; `errorEvent`/`finish` provide the terminals). Mid-stream failure → `errorEvent` terminal frame (ADR 0010 precedent; the 200 head already shipped).
 
-**Error bodies (B2):** pre-stream non-2xx upstream statuses relay **verbatim** — OpenAI's `{"error":{…}}` envelope is shared across both surfaces, so a Responses client already receives a well-formed error. Mid-stream failures on the responses-surface get Responses-shaped terminal events (above); chat-surface mid-stream failures stay chat-shaped (`QoderOpenAIError.sseTerminalFrame`). Live probes (Verification) confirm the upstream error envelope really is shared.
+**Error bodies (B2):** pre-stream non-2xx upstream statuses relay **verbatim** — OpenAI's `{"error":{…}}` envelope is shared across both surfaces, so a Responses client already receives a well-formed error. Mid-stream failures on the TRANSLATED arm get Responses-shaped terminal `error` events (above); the same-surface passthrough arm truncates exactly like a real opencode client (ADR 0020 posture — no fabricated frames on a surface the client picked itself). Live probes (Verification) confirm the upstream error envelope really is shared.
 
 ## Phase 2b — responses→chat translation (DEFERRED — decision point)
 

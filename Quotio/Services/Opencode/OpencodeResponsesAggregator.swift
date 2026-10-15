@@ -120,6 +120,13 @@ nonisolated struct OpencodeResponsesAggregator {
     /// fallback mirrors `QoderCompletionAggregator.responsesObject`'s shape
     /// conventions so both responses-surface arms emit one schema.
     ///
+    /// Accepted posture (same as the chat aggregator's default
+    /// `finish_reason: stop`): a clean EOF with NO terminal event still
+    /// folds into `status:"completed"` — a truncated stream can present as
+    /// a short-but-successful response. The alternative (fabricate a
+    /// failure the client can't distinguish from a transport drop) is
+    /// worse; the passthrough arm's contract is truncation-faithful.
+    ///
     /// `requestModel` echoes the model the agent requested (with the
     /// `opencode/` prefix), as OpenAI echoes the request model.
     func responseObject(requestModel: String) -> [String: Any] {

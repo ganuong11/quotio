@@ -50,9 +50,13 @@ surface differs:
   precedent). This also fixes the passthrough arm, which previously pumped
   SSE verbatim to `stream:false` clients.
 - **Error bodies:** pre-stream non-2xx relays verbatim (OpenAI's
-  `{"error":{…}}` envelope is shared across both surfaces); mid-stream
-  failures get surface-correct terminal frames (Responses `response.failed`
-  event via the adapter; chat SSE error frame via `QoderOpenAIError`).
+  `{"error":{…}}` envelope is shared across both surfaces — verified live).
+  Mid-stream failure handling is arm-scoped: the translated streaming arm
+  emits a Responses-shaped terminal `error` event via the adapter (the
+  client's stream protocol is ours to author there); the same-surface
+  passthrough arm truncates exactly as a real opencode client sees (ADR
+  0020's posture — no fabricated frames on a surface the client picked
+  itself).
 - **Hard-fail carve-out in translation:** `previous_response_id` /
   `conversation` (Responses server-side state) → 400 rather than silent drop
   — dropping them would translate a stateful conversation into a stateless

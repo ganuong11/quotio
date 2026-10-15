@@ -673,12 +673,12 @@ final class ProxyBridge {
             }
 
             // OpenCode branch: route through the failover router like Qoder.
-            // Unlike Qoder there is NO translation — the body forwards
-            // verbatim (only the `opencode/` model prefix is stripped inside
-            // the router) and the upstream response (status, headers, SSE
-            // bytes) is forwarded verbatim too. `.notOpencode` skips the
-            // branch entirely; the `opencodeRouter == nil` fall-through to
-            // CPA mirrors the Qoder posture (CPA will 404).
+            // Same-surface requests forward byte-faithful (prefix strip and
+            // free-tier gate shaping inside the router); cross-surface
+            // requests translate at the seam (ADR 0021), and non-2xx
+            // upstream responses always relay verbatim. `.notOpencode`
+            // skips the branch entirely; the `opencodeRouter == nil`
+            // fall-through to CPA mirrors the Qoder posture (CPA will 404).
             if opencodeRoute != .notOpencode, let router = self.opencodeRouter {
                 // The gate's rejection classes map to true HTTP errors BEFORE
                 // any upstream contact — `opencode/` models never reach CPA,
@@ -2145,10 +2145,11 @@ final class ProxyBridge {
     }
 
     /// Forward an `opencode/<id>` request through `OpencodeRouter`, bypassing
-    /// CPA. Unlike Qoder there is NO envelope translation: the upstream
-    /// response status, headers, and SSE bytes are relayed verbatim — the
-    /// client's chosen surface (`/v1/chat/completions` vs `/v1/responses`)
-    /// and the upstream's wire shape are preserved end to end.
+    /// CPA. ADR 0021 surface dispatch: same-surface requests relay the
+    /// upstream status/headers/bytes verbatim; cross-surface requests
+    /// (Responses client × chat-native model) translate at the seam; a
+    /// `stream:false` client is aggregated into one JSON body on every arm
+    /// (the free-tier gate forces `stream:true` upstream).
     ///
     /// Lifecycle mirrors `forwardQoderRequest`:
     ///   1. Shared `accessValidator` authentication — identical to Qoder's;

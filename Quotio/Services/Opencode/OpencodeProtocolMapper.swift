@@ -72,10 +72,10 @@ nonisolated enum OpencodeProtocolMapper {
             return synthesized
         }
 
-        // The Qoder synthesizer emits both token spellings because its
-        // gateway accepts either; the opencode upstream gets only the
-        // modern one.
-        chat.removeValue(forKey: "max_tokens")
+        // The Qoder synthesizer emits BOTH token spellings deliberately —
+        // keep them: an openai-compatible upstream may honor only the
+        // legacy `max_tokens`, and dropping it would silently lose the
+        // cap (verified live: the opencode upstream accepts both).
 
         // Sampling / behavior fields the DTO does not carry: passthrough.
         for key in ["temperature", "top_p", "parallel_tool_calls", "user"] {
