@@ -11310,6 +11310,14 @@
         "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "Quotio" } }
       }
     },
+    "monitor.opencode.stale" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "The OpenCode session has expired. Re-authenticate in opencode to restore this account." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "La session OpenCode a expiré. Réauthentifiez-vous dans opencode pour restaurer ce compte." } },
+        "vi" : { "stringUnit" : { "state" : "translated", "value" : "Phiên OpenCode đã hết hạn. Xác thực lại trong opencode để khôi phục tài khoản này." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "OpenCode 会话已过期。请在 opencode 中重新认证以恢复此账号。" } }
+      }
+    },
     "monitor.refresh.failed" : {
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "The latest refresh failed. Showing the last successful quota." } },

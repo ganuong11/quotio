@@ -85,6 +85,10 @@ nonisolated struct OpencodeOpenedStream: Sendable {
     /// shape in case a peek is ever needed).
     let bufferedPrefix: Data
     let pump: @Sendable (OpencodeChunkReceiver) async throws -> Void
+    /// Tear down the upstream task when the consumer aborts BEFORE pumping
+    /// (e.g. the agent socket rejects the response head). `pump`'s defer
+    /// cancels on every exit once running; this covers never-pumped streams.
+    let cancel: @Sendable () -> Void
 }
 
 actor OpencodeRouter {
@@ -193,6 +197,19 @@ actor OpencodeRouter {
             }
         }
         throw await exhaustionError()
+    }
+
+    /// Proactively renew vault credentials inside the expiry margin (Task 8
+    /// periodic tick). Reuses the request-time freshness path so the same
+    /// refresh/persist/stale-marking semantics apply — a request arriving
+    /// after the tick then finds ready tokens instead of paying the refresh
+    /// latency mid-request.
+    func refreshExpiringVaultCredentials() async {
+        for candidate in await candidates() {
+            if case .vault = candidate.source {
+                _ = await resolveCredential(for: candidate)
+            }
+        }
     }
 
     private func candidates() async -> [Candidate] {
@@ -334,7 +351,8 @@ actor OpencodeRouter {
                     guard let buffer = try await streamRef.source() else { return }
                     if try await onChunk(buffer) == false { return }
                 }
-            }
+            },
+            cancel: { streamRef.cancel() }
         )
     }
 
@@ -418,5 +436,29 @@ private nonisolated enum OpencodeRequestIdentity {
         var bytes = [UInt8](repeating: 0, count: 14)
         _ = SecRandomCopyBytes(kSecRandomDefault, 14, &bytes)
         return "\(prefix)_\(hex)\(String(bytes.map { b62[Int($0) % 62] }))"
+    }
+}
+
+/// Lock-protected cache for the detected-credential snapshot the router
+/// reads per request (the `detectedSnapshot` closure must be synchronous —
+/// `OpencodeRouter.open` can't suspend to disk mid-candidate-enumeration).
+/// QuotaViewModel's periodic tick calls `refresh()`; `snapshot()` is the
+/// cheap synchronous read wired into the router.
+nonisolated final class OpencodeDetectedCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var credentials: [DetectedOpencodeCredential] = []
+
+    /// Re-run filesystem discovery and swap the snapshot.
+    func refresh() {
+        let found = OpencodeCredentialDetector.discover()
+        lock.lock()
+        credentials = found
+        lock.unlock()
+    }
+
+    func snapshot() -> [DetectedOpencodeCredential] {
+        lock.lock()
+        defer { lock.unlock() }
+        return credentials
     }
 }

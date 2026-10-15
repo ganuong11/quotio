@@ -173,6 +173,15 @@ final class QuotaViewModel {
     
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
     @ObservationIgnored private var warmupTask: Task<Void, Never>?
+    /// OpenCode provider lifecycle (Task 8): the periodic tick driving the
+    /// free-model catalog refresh, detected-credential snapshot refresh, and
+    /// vault proactive refresh; the detected-credential cache the router's
+    /// synchronous snapshot closure reads; and the stale/recovered
+    /// notification observers. All torn down in `stopProxy`.
+    @ObservationIgnored private var opencodeLifecycleTask: Task<Void, Never>?
+    @ObservationIgnored private let opencodeDetectedCache = OpencodeDetectedCache()
+    @ObservationIgnored private var opencodeStaleObserver: NSObjectProtocol?
+    @ObservationIgnored private var opencodeRecoveredObserver: NSObjectProtocol?
     @ObservationIgnored private var isStartingProxyFlow = false
     @ObservationIgnored private var lastLogTimestamp: Int?
     @ObservationIgnored private var isWarmupRunning = false
@@ -1571,6 +1580,14 @@ final class QuotaViewModel {
             // (CPA legacy open access).
             proxyManager.proxyBridge.accessValidator = QoderAccessValidator()
 
+            // Wire the OpenCode provider (Task 8): router + catalog +
+            // lifecycle ticks + stale-account observers. Runs before
+            // `proxyManager.start()` so the router is in place when the
+            // listener opens. Cold start is safe by construction — while
+            // the catalog is empty the route gate 503s `opencode/`
+            // requests rather than forwarding them to CPA.
+            startOpencodeLifecycle()
+
             try await proxyManager.start()
             setupAPIClient()
             startAutoRefresh()
@@ -1635,6 +1652,12 @@ final class QuotaViewModel {
         // any straggler request during shutdown.
         proxyManager.proxyBridge.accessValidator = nil
 
+        // Tear down the OpenCode provider (Task 8): lifecycle ticks,
+        // notification observers, and the router reference. A nil router
+        // makes ProxyBridge fall back to CPA for any straggler opencode/
+        // request — same nil-router posture as Qoder.
+        stopOpencodeLifecycle()
+
         proxyManager.stop()
         restartWarmupScheduler()
         
@@ -1657,7 +1680,128 @@ final class QuotaViewModel {
             await startProxy()
         }
     }
-    
+
+    // MARK: - OpenCode provider lifecycle (Task 8)
+
+    /// Wire the opencode router + lifecycle into ProxyBridge. Called from
+    /// `startProxy` before `proxyManager.start()` so the router is in place
+    /// when the listener opens.
+    ///
+    /// Cold-start posture: the catalog loads its persisted snapshot first
+    /// (local disk, fast, fire-and-forget) then kicks a network refresh on
+    /// the same path. While the catalog is still empty, `OpencodeRouteGate`
+    /// + `ProxyBridge.opencodeRejection` answer `opencode/` requests with a
+    /// 503 catalog-unavailable — never a 404 "unknown model" that would
+    /// misreport a refresh-pending state, and never a fall-through to CPA.
+    private func startOpencodeLifecycle() {
+        let detectedCache = opencodeDetectedCache
+        let router = OpencodeRouter(detectedSnapshot: { detectedCache.snapshot() })
+        proxyManager.proxyBridge.opencodeRouter = router
+
+        // Prime the detected-credential snapshot synchronously (local disk
+        // only) so requests served immediately after startup already see
+        // system opencode accounts.
+        detectedCache.refresh()
+
+        // Load the persisted catalog, then kick the first network refresh —
+        // both fire-and-forget so proxy startup isn't gated on the network.
+        Task { await OpencodeModelCatalog.shared.loadPersisted() }
+        Task { await OpencodeModelCatalog.shared.refresh() }
+
+        // Stale / recovered account transitions → monitor issue surface.
+        // The router posts these on MainActor already; the `.main` queue
+        // delivery keeps observer order on the actor.
+        opencodeStaleObserver = NotificationCenter.default.addObserver(
+            forName: OpencodeRouter.opencodeAccountStale, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let key = note.userInfo?["accountKey"] as? String else { return }
+            Task { @MainActor in self?.applyOpencodeIssue(accountKey: key, stale: true) }
+        }
+        opencodeRecoveredObserver = NotificationCenter.default.addObserver(
+            forName: OpencodeRouter.opencodeAccountRecovered, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let key = note.userInfo?["accountKey"] as? String else { return }
+            Task { @MainActor in self?.applyOpencodeIssue(accountKey: key, stale: false) }
+        }
+
+        // One lifecycle task, three independent intervals: catalog 1 h,
+        // detected-snapshot 5 min (picks up system re-auth quickly), vault
+        // proactive refresh 15 min.
+        opencodeLifecycleTask = Task { [weak self, detectedCache, router] in
+            var lastCatalog = Date()
+            var lastDetected = Date()
+            var lastVault = Date()
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 60 * 1_000_000_000)
+                guard !Task.isCancelled, self != nil else { return }
+                let now = Date()
+                if now.timeIntervalSince(lastCatalog) >= 3600 {
+                    lastCatalog = now
+                    await OpencodeModelCatalog.shared.refresh()
+                }
+                if now.timeIntervalSince(lastDetected) >= 300 {
+                    lastDetected = now
+                    detectedCache.refresh()
+                }
+                if now.timeIntervalSince(lastVault) >= 900 {
+                    lastVault = now
+                    await router.refreshExpiringVaultCredentials()
+                }
+            }
+        }
+    }
+
+    private func stopOpencodeLifecycle() {
+        opencodeLifecycleTask?.cancel()
+        opencodeLifecycleTask = nil
+        if let observer = opencodeStaleObserver {
+            NotificationCenter.default.removeObserver(observer)
+            opencodeStaleObserver = nil
+        }
+        if let observer = opencodeRecoveredObserver {
+            NotificationCenter.default.removeObserver(observer)
+            opencodeRecoveredObserver = nil
+        }
+        proxyManager.proxyBridge.opencodeRouter = nil
+    }
+
+    /// Surface an opencode stale/recovered transition on the monitor issue
+    /// map (the same surface quota-refresh failures use). `accountKey`
+    /// matches case-insensitively — console-identity and store-derived keys
+    /// can differ in case. Unknown keys are a no-op: a stale notification
+    /// can outrace the monitor's own re-discovery.
+    func applyOpencodeIssue(accountKey: String, stale: Bool) {
+        Self.applyOpencodeIssue(
+            accountKey: accountKey, stale: stale,
+            to: monitorAccounts, issues: &monitorAccountIssues)
+    }
+
+    /// The matching/mutation core of `applyOpencodeIssue(accountKey:stale:)`,
+    /// split out so tests can exercise it against a bare collection —
+    /// constructing a `QuotaViewModel` inside the test host aborts during
+    /// deinit (malloc fault in `swift_task_deinitOnExecutor`), so the VM
+    /// must not be instantiated there.
+    nonisolated static func applyOpencodeIssue(
+        accountKey: String,
+        stale: Bool,
+        to accounts: [MonitorAccount],
+        issues: inout [QuotaAccountID: MonitorRefreshIssue]
+    ) {
+        guard let account = accounts.first(where: {
+            $0.provider == .opencode
+                && $0.accountKey.caseInsensitiveCompare(accountKey) == .orderedSame
+        }) else { return }
+        let id = QuotaAccountID(provider: account.provider, accountKey: account.accountKey)
+        if stale {
+            issues[id] = MonitorRefreshIssue(
+                message: "monitor.opencode.stale".localizedStatic(),
+                occurredAt: Date()
+            )
+        } else {
+            issues.removeValue(forKey: id)
+        }
+    }
+
     private func setupAPIClient() {
         _apiClient = ManagementAPIClient(
             baseURL: proxyManager.managementURL,

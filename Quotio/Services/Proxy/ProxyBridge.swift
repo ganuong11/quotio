@@ -155,6 +155,16 @@ final class ProxyBridge {
     /// path (`forwardRequest`) is untouched regardless of this property.
     var qoderRouter: QoderFailoverRouter?
 
+    /// OpenCode upstream router (opencode provider). When non-nil, requests
+    /// whose body `model:` starts with `opencode/` AND passes
+    /// `OpencodeRouteGate` (right surface + current free-model catalog) are
+    /// routed here instead of the CPA forwarding path. Set by
+    /// `QuotaViewModel` at proxy start; nil in tests and when the opencode
+    /// branch is not configured. Requests the gate rejects while the router
+    /// is nil fall through to CPA (which will 404) — same nil-router posture
+    /// as the Qoder branch.
+    var opencodeRouter: OpencodeRouter?
+
     /// Qoder-path API-key validator (ADR 0008, issue #21). When non-nil,
     /// `forwardQoderRequest` authenticates every Qoder request against this
     /// validator's snapshot before forwarding — mirroring CPA's `config_access`
@@ -530,13 +540,25 @@ final class ProxyBridge {
         // `processRequest` is `nonisolated`.
         let route = QoderRouteGate.resolve(method: method, path: path, model: metadata.model)
 
+        // OpenCode route gate — resolved beside the Qoder gate. The
+        // `isFreeModel` predicate reads `OpencodeModelCatalog.shared`'s
+        // lock-protected synchronous view (nonisolated — designed for
+        // exactly this hot path, see the catalog's header docs), so it can
+        // run here without a MainActor hop. The catalog snapshot is taken
+        // per request, so a mid-flight catalog refresh flips `isFree`
+        // verdicts on the next request.
+        let opencodeRoute = OpencodeRouteGate.resolve(method: method, path: path, model: metadata.model) {
+            OpencodeModelCatalog.shared.isFree($0)
+        }
+
         // Check for virtual model and create fallback context
         Task { @MainActor [weak self] in
             guard let self = self else { return }
 
             // Issue #10 / ADR 0016: GET /v1/models is intercepted at the path
             // level and answered with CPA's list merged with the Qoder catalog
-            // under `qoder/<id>`. This intercept runs INDEPENDENTLY of the
+            // under `qoder/<id>` (and, when wired, the OpenCode catalog under
+            // `opencode/<id>`). This intercept runs INDEPENDENTLY of the
             // Qoder route gate (ADR 0009) — `GET /v1/models` carries no body
             // model and never matched the prefix test, so without this branch
             // it would fall through to CPA and `qoder/<id>` models would stay
@@ -545,18 +567,26 @@ final class ProxyBridge {
             // owns response-shaping for exactly this one endpoint. The gate
             // below is untouched; the Qoder branch is also untouched.
             //
-            // The intercept reads `qoderRouter` to decide whether to merge: if
-            // the Qoder branch is disabled (router nil), advertising Qoder
-            // models would be a lie (they couldn't be served), so we forward
-            // raw to CPA and let `serveModelsList` degrade to passthrough. That
-            // read is MainActor-safe — this block already runs on MainActor.
+            // The intercept reads `qoderRouter`/`opencodeRouter` to decide
+            // which namespaces to merge: if a branch is disabled (router
+            // nil), advertising its models would be a lie (they couldn't be
+            // served), so its merge is skipped. With both routers nil we
+            // forward raw to CPA and let `serveModelsList` degrade to
+            // passthrough. Those reads are MainActor-safe — this block
+            // already runs on MainActor.
             if method == "GET", QoderRouteGate.pathWithoutQuery(path) == "/v1/models" {
-                // Compute `shouldMerge` and capture MainActor-isolated state
-                // (`targetPort`, `targetHost`, `qoderRouter`) here so
+                // Capture the merge inputs and MainActor-isolated state
+                // (`targetPort`, `targetHost`, routers) here so
                 // `serveModelsList` can be `nonisolated` like `forwardRequest`
                 // — it never touches MainActor-isolated state itself, and all
                 // its callbacks (NWConnection state/receive) are nonisolated.
-                let shouldMerge = (self.qoderRouter != nil)
+                // The opencode model set is snapshotted here (the catalog's
+                // synchronous nonisolated view) so the merge uses one
+                // consistent list end to end.
+                let mergeQoder = (self.qoderRouter != nil)
+                let opencodeModels = (self.opencodeRouter != nil)
+                    ? OpencodeModelCatalog.shared.models
+                    : []
                 self.serveModelsList(
                     path: path,
                     headers: headers,
@@ -567,7 +597,8 @@ final class ProxyBridge {
                     metadata: metadata,
                     targetPort: self.targetPort,
                     targetHost: self.targetHost,
-                    shouldMerge: shouldMerge
+                    mergeQoder: mergeQoder,
+                    opencodeModels: opencodeModels
                 )
                 return
             }
@@ -635,6 +666,40 @@ final class ProxyBridge {
                     requestSize: requestSize,
                     requestModel: metadata.model ?? "",
                     responsesMode: responsesMode
+                )
+                return
+            }
+
+            // OpenCode branch: route through the failover router like Qoder.
+            // Unlike Qoder there is NO translation — the body forwards
+            // verbatim (only the `opencode/` model prefix is stripped inside
+            // the router) and the upstream response (status, headers, SSE
+            // bytes) is forwarded verbatim too. `.notOpencode` skips the
+            // branch entirely; the `opencodeRouter == nil` fall-through to
+            // CPA mirrors the Qoder posture (CPA will 404).
+            if opencodeRoute != .notOpencode, let router = self.opencodeRouter {
+                // The gate's rejection classes map to true HTTP errors BEFORE
+                // any upstream contact — `opencode/` models never reach CPA,
+                // protecting paid opencode models from accidental forwarding.
+                if let rejection = Self.opencodeRejection(
+                    for: opencodeRoute,
+                    catalogIsEmpty: OpencodeModelCatalog.shared.isEmpty
+                ) {
+                    self.sendError(to: connection, statusCode: rejection.status, message: rejection.message)
+                    return
+                }
+                await self.forwardOpencodeRequest(
+                    router: router,
+                    route: opencodeRoute,
+                    method: method,
+                    path: path,
+                    headers: headers,
+                    body: body,
+                    originalConnection: connection,
+                    connectionId: connectionId,
+                    startTime: startTime,
+                    requestSize: requestSize,
+                    requestModel: metadata.model ?? ""
                 )
                 return
             }
@@ -911,15 +976,17 @@ final class ProxyBridge {
         metadata: (provider: String?, model: String?, method: String, path: String),
         targetPort: UInt16,
         targetHost: String,
-        shouldMerge: Bool
+        mergeQoder: Bool,
+        opencodeModels: [OpencodeFreeModel]
     ) {
-        // Only merge when the Qoder branch is servable. Advertising qoder/<id>
-        // while the router is nil would mislead discovery clients. With a nil
-        // router we still proxy to CPA and forward raw (the merge attempt in
-        // step 4 below just no-ops when `shouldMerge` is false). `shouldMerge`
-        // is computed by the caller on MainActor (where `qoderRouter` lives)
-        // and passed in, so this method itself needs no MainActor hop to read
-        // router state — matching `forwardRequest`'s `nonisolated` shape.
+        // Only merge a namespace when its branch is servable. Advertising
+        // qoder/<id> or opencode/<id> while that router is nil would mislead
+        // discovery clients. With no routers wired we still proxy to CPA and
+        // forward raw (the merge attempt in step 4 below just no-ops when
+        // `mergeQoder` is false and `opencodeModels` is empty). Both inputs
+        // are computed by the caller on MainActor (where the routers live)
+        // and passed in, so this method itself needs no MainActor hop to
+        // read router state — matching `forwardRequest`'s `nonisolated` shape.
         guard let port = NWEndpoint.Port(rawValue: targetPort) else {
             sendError(to: originalConnection, statusCode: 500, message: "Invalid target port")
             return
@@ -1014,7 +1081,8 @@ final class ProxyBridge {
                             requestSize: requestSize,
                             metadata: metadata,
                             responseData: Data(),
-                            shouldMerge: shouldMerge,
+                            mergeQoder: mergeQoder,
+                            opencodeModels: opencodeModels,
                             maxAccumBytes: maxAccumBytes
                         )
                     }
@@ -1045,7 +1113,8 @@ final class ProxyBridge {
         requestSize: Int,
         metadata: (provider: String?, model: String?, method: String, path: String),
         responseData: Data,
-        shouldMerge: Bool,
+        mergeQoder: Bool,
+        opencodeModels: [OpencodeFreeModel],
         maxAccumBytes: Int
     ) {
         targetConnection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
@@ -1086,7 +1155,8 @@ final class ProxyBridge {
                     startTime: startTime,
                     requestSize: requestSize,
                     metadata: metadata,
-                    shouldMerge: shouldMerge
+                    mergeQoder: mergeQoder,
+                    opencodeModels: opencodeModels
                 )
             } else {
                 // More bytes may arrive — keep draining into the same buffer.
@@ -1099,7 +1169,8 @@ final class ProxyBridge {
                         requestSize: requestSize,
                         metadata: metadata,
                         responseData: accumulated,
-                        shouldMerge: shouldMerge,
+                        mergeQoder: mergeQoder,
+                        opencodeModels: opencodeModels,
                         maxAccumBytes: maxAccumBytes
                     )
                 }
@@ -1124,19 +1195,22 @@ final class ProxyBridge {
         startTime: Date,
         requestSize: Int,
         metadata: (provider: String?, model: String?, method: String, path: String),
-        shouldMerge: Bool
+        mergeQoder: Bool,
+        opencodeModels: [OpencodeFreeModel]
     ) {
-        // Try the merge. Every guard in this block falls through to raw
-        // passthrough — the only way to get the merged body is to pass ALL of:
-        // (a) `shouldMerge` (qoderRouter wired), (b) CPA returned 2xx, (c) body
-        // extraction succeeds, (d) merge succeeds.
+        // Try the merge chain (Qoder → opencode) via the pure helper. Every
+        // guard in this block falls through to raw passthrough — the only way
+        // to get the merged body is to pass ALL of: (a) at least one namespace
+        // wired, (b) CPA returned 2xx, (c) body extraction succeeds, (d) at
+        // least one merge produces a body.
         var mergedBody: Data? = nil
         var sentStatusCode: Int?
-        if shouldMerge,
+        if (mergeQoder || !opencodeModels.isEmpty),
            let status = Self.statusCode(from: accumulatedResponse),
            (200..<300).contains(status),
            let body = QoderModelsMerger.extractHTTPBody(from: accumulatedResponse),
-           let merged = QoderModelsMerger.mergeQoderModels(into: body) {
+           let merged = Self.mergeModelsBody(
+               into: body, mergeQoder: mergeQoder, opencodeModels: opencodeModels) {
             mergedBody = merged
             sentStatusCode = 200  // CPA returns 200 for models; emit 200 on success.
         } else {
@@ -1226,6 +1300,63 @@ final class ProxyBridge {
         let parts = statusLine.components(separatedBy: " ")
         guard parts.count >= 2, let code = Int(parts[1]) else { return nil }
         return code
+    }
+
+    /// Chain the per-namespace model mergers over CPA's `/v1/models` body:
+    /// Qoder first (existing ADR 0016 behavior), then opencode. Each merge is
+    /// independent — a failure in one doesn't cancel the other — and the
+    /// result is nil when NEITHER merge applies or any merge fails outright
+    /// (callers degrade to raw passthrough so discovery never breaks).
+    /// Internal + `nonisolated` so unit tests pin the chaining contract
+    /// without an NWConnection.
+    nonisolated static func mergeModelsBody(
+        into cpaBody: Data,
+        mergeQoder: Bool,
+        opencodeModels: [OpencodeFreeModel]
+    ) -> Data? {
+        var merged: Data? = nil
+        var anyMerged = false
+        if mergeQoder {
+            guard let q = QoderModelsMerger.mergeQoderModels(into: cpaBody) else {
+                return nil
+            }
+            merged = q
+            anyMerged = true
+        }
+        if !opencodeModels.isEmpty {
+            guard let o = OpencodeModelsMerger.mergeOpencodeModels(
+                into: merged ?? cpaBody, models: opencodeModels) else {
+                return nil
+            }
+            merged = o
+            anyMerged = true
+        }
+        return anyMerged ? merged : nil
+    }
+
+    /// Map a non-servable `OpencodeRoute` to its HTTP rejection. `.chat` and
+    /// `.responses` return nil (forward to the router). `.rejected` and a
+    /// populated-catalog `.notInFreeSet` → 404 (`model_not_found` via the
+    /// ADR 0010 envelope) — an unknown or paid opencode model must not fall
+    /// through to CPA. An empty-catalog `.notInFreeSet` → 503: the catalog
+    /// couldn't load, so "unknown" is provisional rather than "paid".
+    /// `.notOpencode` isn't reachable here (the caller guards it) → nil.
+    /// Internal + `nonisolated` for direct unit coverage.
+    nonisolated static func opencodeRejection(
+        for route: OpencodeRoute,
+        catalogIsEmpty: Bool
+    ) -> (status: Int, message: String)? {
+        switch route {
+        case .chat, .responses, .notOpencode:
+            return nil
+        case .rejected:
+            return (404, "OpenCode models are only supported on POST /v1/chat/completions and POST /v1/responses.")
+        case .notInFreeSet:
+            if catalogIsEmpty {
+                return (503, "opencode free-model catalog unavailable — refresh pending or failed.")
+            }
+            return (404, "model not found in the opencode free-model set.")
+        }
     }
 
     // MARK: - Request Forwarding
@@ -1405,6 +1536,72 @@ final class ProxyBridge {
     /// agent socket no longer leaks the upstream byte stream until the next
     /// `sendToAgent` happens to fail. The handle is removed from `pumpTasks` on
     /// every exit path of the pump body (success, error, cancellation).
+    /// Shared proxy API-key authentication for the direct-upstream branches
+    /// (Qoder, opencode). Both bypass CPA's `AuthMiddleware`, so ProxyBridge
+    /// owns API-key validation for them identically (ADR 0008 / issue #21).
+    /// Returns the validated principal on success — or nil after sending an
+    /// error response on the connection (503 not-primed / 401 missing /
+    /// 401 invalid). `.notConfigured` and a nil validator fall back to legacy
+    /// Bearer-suffix extraction (CPA's "no providers → allow all" open-access
+    /// behaviour). `notReadyMessage` lets each branch phrase its 503.
+    private func authenticateProxyRequest(
+        headers: [(String, String)],
+        path: String,
+        connection: NWConnection,
+        notReadyMessage: String
+    ) async -> String? {
+        // The legacy Bearer-suffix extraction is retained for the two
+        // fallback cases (`.notConfigured` and validator nil). It is
+        // intentionally not CPA-faithful — it is the pre-issue-#21 behaviour,
+        // kept only for the open-access fallback so an unconfigured
+        // validator behaves exactly as before.
+        func legacyBearerExtraction() -> String {
+            headers.first(where: { $0.0.lowercased() == "authorization" })?
+                .1
+                .components(separatedBy: " ")
+                .dropFirst()
+                .joined(separator: " ")
+                .trimmingCharacters(in: .whitespaces)
+            ?? ""
+        }
+
+        guard let validator = self.accessValidator else {
+            // Validator not wired (tests, or the branch disabled) → unchanged
+            // pre-issue-#21 behaviour.
+            return legacyBearerExtraction()
+        }
+        switch await validator.authenticate(path: path, headers: headers) {
+        case .allowed(let principal):
+            // CPA parity: userApiKey = result.Principal.
+            return principal
+        case .notConfigured:
+            // Primed but no api-keys configured → open-access legacy
+            // behaviour (CPA: provider unregistered → allow all).
+            return legacyBearerExtraction()
+        case .notPrimed:
+            // The validator has not yet received its first key snapshot
+            // (startProxy primes it with a dedicated fetch before serving
+            // begins — see QuotaViewModel). Fail CLOSED: the key set is
+            // unknown, not known-empty, so this must not degrade to open
+            // access. 503 signals "try again shortly".
+            self.sendError(to: connection, statusCode: 503, message: notReadyMessage)
+            return nil
+        case .missing:
+            // No candidate source present → CPA's `NewNoCredentialsError`
+            // ("Missing API key"). Issue #21 prescribes the ADR 0010 OpenAI
+            // envelope (which `sendError` applies) over CPA's plain-string
+            // body — deliberate divergence, recorded for auditors.
+            self.sendError(to: connection, statusCode: 401, message: "Missing API key")
+            return nil
+        case .invalid:
+            // Candidate(s) present, none matched → CPA's
+            // `NewInvalidCredentialError` ("Invalid API key"). Same
+            // envelope-vs-plain-string divergence as `.missing`.
+            self.sendError(to: connection, statusCode: 401, message: "Invalid API key")
+            return nil
+        }
+    }
+
     private func forwardQoderRequest(
         router: QoderFailoverRouter,
         method: String,
@@ -1418,83 +1615,18 @@ final class ProxyBridge {
         requestModel: String,
         responsesMode: Bool = false   // Issue #11
     ) async {
-        // ADR 0008 / issue #21: authenticate the Qoder request against a
-        // CPA-mirrored validator before forwarding. The Qoder branch bypasses
-        // CPA's `AuthMiddleware`, so ProxyBridge owns API-key validation for
-        // `qoder/*` traffic. The validator mirrors CPA's `config_access`
-        // provider (five candidate sources, presence-based missing check,
-        // primed-empty-set pass-through, constant-time compare). On
-        // `.allowed(principal:)` the matched candidate value becomes the proxy
-        // API key used downstream (CPA parity: `userApiKey = result.Principal`).
-        // On `.notConfigured` (primed, empty key set) we fall back to legacy
-        // Bearer-suffix extraction — CPA's "no providers → allow all" legacy
-        // behaviour. On `.notPrimed` / `.missing` / `.invalid` we short-circuit
-        // (503 / 401 / 401). When the validator is nil (tests, or Qoder not
-        // wired) we fall back to legacy extraction too, preserving
-        // pre-issue-#21 behaviour.
-        //
-        // The legacy Bearer-suffix extraction is retained as a small local
-        // helper for the two fallback cases (`.notConfigured` and validator
-        // nil). It is intentionally not CPA-faithful — it is the pre-issue-#21
-        // behaviour, kept only for the open-access fallback so an unconfigured
-        // validator behaves exactly as before.
-        func legacyBearerExtraction() -> String {
-            headers.first(where: { $0.0.lowercased() == "authorization" })?
-                .1
-                .components(separatedBy: " ")
-                .dropFirst()
-                .joined(separator: " ")
-                .trimmingCharacters(in: .whitespaces)
-            ?? ""
-        }
-
-        let proxyAPIKey: String
-        if let validator = self.accessValidator {
-            switch await validator.authenticate(path: path, headers: headers) {
-            case .allowed(let principal):
-                // CPA parity: userApiKey = result.Principal. The matched
-                // candidate value flows downstream for session-ID derivation
-                // and as the user-attribution key.
-                proxyAPIKey = principal
-            case .notConfigured:
-                // Primed but no api-keys configured → open-access legacy
-                // behaviour for requests carrying some Bearer value (CPA:
-                // provider unregistered → AuthMiddleware allows all requests).
-                proxyAPIKey = legacyBearerExtraction()
-            case .notPrimed:
-                // The validator has not yet received its first key snapshot
-                // (startProxy primes it with a dedicated fetch before serving
-                // begins — see QuotaViewModel). Fail CLOSED: the key set is
-                // unknown, not known-empty, so this must not degrade to open
-                // access. There is no CPA analogue (CPA loads its config keys
-                // before accepting requests); 503 signals "try again shortly".
-                self.sendError(
-                    to: originalConnection,
-                    statusCode: 503,
-                    message: "Qoder API-key validation is not ready yet — the proxy key snapshot has not loaded. Retry in a moment."
-                )
-                return
-            case .missing:
-                // No candidate source present → CPA's
-                // `NewNoCredentialsError` ("Missing API key"). NOTE: CPA
-                // itself sends `{"error":"Missing API key"}` (plain string);
-                // issue #21 prescribes the ADR 0010 OpenAI envelope instead,
-                // which `sendError` applies here — deliberate divergence from
-                // the literal CPA body shape, recorded for future auditors.
-                self.sendError(to: originalConnection, statusCode: 401, message: "Missing API key")
-                return
-            case .invalid:
-                // Candidate(s) present, none matched → CPA's
-                // `NewInvalidCredentialError` ("Invalid API key"). Same
-                // envelope-vs-plain-string divergence as `.missing` above
-                // (issue #21 / ADR 0010).
-                self.sendError(to: originalConnection, statusCode: 401, message: "Invalid API key")
-                return
-            }
-        } else {
-            // Validator not wired (tests, or Qoder branch disabled) → unchanged
-            // pre-issue-#21 behaviour.
-            proxyAPIKey = legacyBearerExtraction()
+        // ADR 0008 / issue #21: authenticate against the shared validator
+        // before forwarding (see `authenticateProxyRequest`). On
+        // `.allowed(principal:)` the matched value becomes the proxy API key
+        // used downstream for session-ID derivation and user attribution
+        // (CPA parity: `userApiKey = result.Principal`).
+        guard let proxyAPIKey = await authenticateProxyRequest(
+            headers: headers,
+            path: path,
+            connection: originalConnection,
+            notReadyMessage: "Qoder API-key validation is not ready yet — the proxy key snapshot has not loaded. Retry in a moment."
+        ) else {
+            return
         }
 
         // Issue #15: the body reaches here as `Data` straight from the parser
@@ -2008,6 +2140,177 @@ final class ProxyBridge {
         // stateUpdateHandler (which may fire `.cancelled` / `.failed` on a
         // fast disconnect) is guaranteed to find the handle in `pumpTasks`
         // from this point onward. The body's `defer` removes it on every exit.
+        pumpTasks[connectionId] = pumpTask
+    }
+
+    /// Forward an `opencode/<id>` request through `OpencodeRouter`, bypassing
+    /// CPA. Unlike Qoder there is NO envelope translation: the upstream
+    /// response status, headers, and SSE bytes are relayed verbatim — the
+    /// client's chosen surface (`/v1/chat/completions` vs `/v1/responses`)
+    /// and the upstream's wire shape are preserved end to end.
+    ///
+    /// Lifecycle mirrors `forwardQoderRequest`:
+    ///   1. Shared `accessValidator` authentication — identical to Qoder's;
+    ///      the validator is provider-agnostic (opencode traffic must
+    ///      present the same proxy API key as everything else).
+    ///   2. `router.open(...)` — rotation / 429-cooldown / stale-account
+    ///      handling decided BEFORE the first response byte; a thrown
+    ///      `OpencodeRouterError` becomes a true HTTP error (503 no-accounts
+    ///      or catalog-unavailable, 429 + Retry-After when all accounts
+    ///      cool down).
+    ///   3. On open: write the upstream status line + headers verbatim
+    ///      minus hop-by-hop (`Connection`, `Transfer-Encoding`,
+    ///      `Content-Length`, `Keep-Alive` — hop-scoped, and the relay is
+    ///      `Connection: close`), plus `Connection: close`.
+    ///   4. Pump upstream bytes raw to the agent socket — no SSE reparsing,
+    ///      no mid-stream error frames. A mid-stream transport failure
+    ///      truncates like a real opencode client sees (the response head
+    ///      already shipped; an error frame on the client's surface would
+    ///      be fabricated data, not forwarded data).
+    ///   5. Pump handle lives in `pumpTasks` for prompt cancel on agent
+    ///      disconnect — same ADR 0012 mechanics as the Qoder branch.
+    private func forwardOpencodeRequest(
+        router: OpencodeRouter,
+        route: OpencodeRoute,
+        method: String,
+        path: String,
+        headers: [(String, String)],
+        body: Data,
+        originalConnection: NWConnection,
+        connectionId: Int,
+        startTime: Date,
+        requestSize: Int,
+        requestModel: String
+    ) async {
+        guard await authenticateProxyRequest(
+            headers: headers,
+            path: path,
+            connection: originalConnection,
+            notReadyMessage: "API-key validation is not ready yet — the proxy key snapshot has not loaded. Retry in a moment."
+        ) != nil else {
+            return
+        }
+
+        // The pump runs in an unstructured Task so the upstream byte pull
+        // doesn't block the MainActor; the handle is stored in
+        // `pumpTasks[connectionId]` for the disconnect-cancel path
+        // (ADR 0012), removed on every exit via the body's defer.
+        let pumpTask = Task { [weak self] in
+            guard let self = self else { return }
+            defer { self.pumpTasks.removeValue(forKey: connectionId) }
+
+            let opened: OpencodeOpenedStream
+            do {
+                opened = try await router.open(requestBody: body, route: route)
+            } catch let error as OpencodeRouterError {
+                // Pre-stream failure → true HTTP error. Rotation decisions
+                // are already made inside the router; the status lives on
+                // the error (503 no-accounts / catalog-unavailable, 429 +
+                // Retry-After all-cooling-down).
+                self.sendError(
+                    to: originalConnection,
+                    statusCode: error.httpStatus,
+                    message: error.localizedDescription,
+                    retryAfter: error.retryAfterSeconds.map(TimeInterval.init)
+                )
+                return
+            } catch {
+                self.sendError(to: originalConnection, statusCode: 502, message: "opencode upstream error.")
+                return
+            }
+
+            // Relay the upstream status line + headers verbatim minus
+            // hop-by-hop fields, then force `Connection: close` — matching
+            // the one-request-per-connection contract the bridge already
+            // imposes everywhere else.
+            let reason = HTTPURLResponse.localizedString(forStatusCode: opened.status)
+            var head = "HTTP/1.1 \(opened.status) \(reason)\r\n"
+            let hopByHop: Set<String> = [
+                "connection", "transfer-encoding", "content-length", "keep-alive"
+            ]
+            for (name, value) in opened.headers where !hopByHop.contains(name.lowercased()) {
+                head += "\(name): \(value)\r\n"
+            }
+            head += "Connection: close\r\n\r\n"
+
+            let agentConn = originalConnection
+            var sentStatusCode: Int? = opened.status
+            do {
+                try await Self.sendToAgent(Data(head.utf8), on: agentConn)
+            } catch {
+                // Agent socket died before any byte shipped — tear down the
+                // still-open upstream task explicitly (pump's defer only
+                // runs once pumping begins).
+                opened.cancel()
+                return
+            }
+
+            // Sendable holder for pump-closure accounting (same final-class
+            // pattern as the Qoder branch).
+            final class StreamBox: @unchecked Sendable {
+                var totalBytes = 0
+                var failed = false
+            }
+            let box = StreamBox()
+
+            // Replay any router-buffered prefix, then pump the remaining
+            // upstream bytes RAW — no SSE reparsing. A failed send to the
+            // agent stops the pump; a failed upstream pull truncates the
+            // agent response like a real opencode client sees.
+            if !opened.bufferedPrefix.isEmpty {
+                box.totalBytes += opened.bufferedPrefix.count
+                do {
+                    try await Self.sendToAgent(opened.bufferedPrefix, on: agentConn)
+                } catch {
+                    opened.cancel()
+                    return
+                }
+            }
+            do {
+                try await opened.pump { chunk in
+                    box.totalBytes += chunk.count
+                    do {
+                        try await Self.sendToAgent(chunk, on: agentConn)
+                    } catch {
+                        return false  // agent went away — stop pumping cleanly
+                    }
+                    return true
+                }
+            } catch {
+                if !Task.isCancelled {
+                    // Mid-stream transport drop: record, don't fabricate.
+                    box.failed = true
+                    sentStatusCode = nil
+                    Log.proxy("opencode upstream stream ended: \(error.localizedDescription)")
+                }
+            }
+
+            // Close the agent socket (Connection: close).
+            originalConnection.send(content: nil, isComplete: true, completion: .contentProcessed { _ in
+                originalConnection.cancel()
+            })
+
+            let durationMs = Int(Date().timeIntervalSince(startTime) * 1000)
+            let finalMetadata = RequestMetadata(
+                timestamp: startTime,
+                method: method,
+                path: path,
+                provider: "opencode",
+                model: requestModel,
+                resolvedModel: requestModel,
+                resolvedProvider: "opencode",
+                statusCode: box.failed ? nil : sentStatusCode,
+                durationMs: durationMs,
+                requestSize: requestSize,
+                responseSize: box.totalBytes,
+                fallbackAttempts: [],
+                fallbackStartedFromCache: false,
+                responseSnippet: nil
+            )
+            self.onRequestCompleted?(finalMetadata)
+        }
+
+        // Same ADR 0012 store-before-start contract as the Qoder branch.
         pumpTasks[connectionId] = pumpTask
     }
 
