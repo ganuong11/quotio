@@ -441,6 +441,7 @@ actor MonitorAccountDiscovery {
         accounts.append(contentsOf: discoverFactoryDroidCredential())
         accounts.append(contentsOf: discoverDevinCredential())
         accounts.append(contentsOf: discoverGrokCredentials())
+        accounts.append(contentsOf: discoverOpencodeCredentials())
         let antigravityDatabase = MonitorIdentity.expand("~/Library/Application Support/Antigravity/User/globalStorage/state.vscdb")
         if let token = try? await AntigravityDatabaseService().getCurrentTokenInfo(),
            token.accessToken?.nilIfBlank != nil || token.refreshToken?.nilIfBlank != nil {
@@ -490,6 +491,18 @@ actor MonitorAccountDiscovery {
                 displayName: candidate.displayName,
                 source: .nativeCredential,
                 credentialReference: path + "#" + candidate.entryKey
+            )
+        }
+    }
+
+    private func discoverOpencodeCredentials() -> [MonitorAccount] {
+        OpencodeCredentialDetector.discover().map { credential in
+            .make(
+                provider: .opencode,
+                accountKey: credential.accountKey,
+                displayName: credential.email,
+                source: .nativeCredential,
+                credentialReference: credential.sourcePath
             )
         }
     }
@@ -842,7 +855,7 @@ nonisolated enum MonitorRuntimeError: LocalizedError {
     }
 }
 
-private extension String {
+extension String {
     nonisolated var nilIfBlank: String? {
         let value = trimmingCharacters(in: .whitespacesAndNewlines)
         return value.isEmpty ? nil : value
