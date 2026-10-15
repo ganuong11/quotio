@@ -2542,6 +2542,7 @@ private extension AIProvider {
         case .warp: return "Warp"
         case .clinePass: return "ClinePass"
         case .qoder: return "Qoder"
+        case .opencode: return "OpenCode"
         }
     }
 }

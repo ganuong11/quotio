@@ -28,6 +28,7 @@ nonisolated enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendab
     case warp = "warp"
     case clinePass = "clinepass"
     case qoder = "qoder"
+    case opencode = "opencode"
 
     var id: String { rawValue }
     
@@ -52,6 +53,7 @@ nonisolated enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendab
         case .warp: return "Warp"
         case .clinePass: return "ClinePass"
         case .qoder: return "Qoder"
+        case .opencode: return "OpenCode"
         }
     }
     
@@ -76,6 +78,7 @@ nonisolated enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendab
         case .warp: return "terminal.fill"
         case .clinePass: return "cpu"
         case .qoder: return "sparkles"
+        case .opencode: return "terminal"
         }
     }
     
@@ -101,6 +104,7 @@ nonisolated enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendab
         case .warp: return "warp"
         case .clinePass: return "clinepass"
         case .qoder: return "qoder"
+        case .opencode: return "opencode"
         }
     }
     
@@ -125,6 +129,7 @@ nonisolated enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendab
         case .warp: return Color(hex: "01E5FF") ?? .cyan
         case .clinePass: return Color(hex: "61A3FA") ?? .blue
         case .qoder: return Color(hex: "4CAF50") ?? .green
+        case .opencode: return .primary
         }
     }
     
@@ -147,6 +152,7 @@ nonisolated enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendab
         case .warp: return ""
         case .clinePass: return ""
         case .qoder: return ""  // No management-API OAuth; onboarding is PAT paste (ADR 0006)
+        case .opencode: return ""  // Console device-code flow via OpencodeConsoleClient, not a management-API endpoint
         }
     }
     
@@ -172,6 +178,7 @@ nonisolated enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendab
         case .warp: return "W"
         case .clinePass: return "CL"
         case .qoder: return "QD"
+        case .opencode: return "OC"
         }
     }
     
@@ -196,13 +203,14 @@ nonisolated enum AIProvider: String, CaseIterable, Codable, Identifiable, Sendab
         case .warp: return "warp-menubar"
         case .clinePass: return "clinepass-menubar"
         case .qoder: return "qoder-menubar"
+        case .opencode: return nil
         }
     }
     
     /// Whether this provider supports quota tracking in quota-only mode
     var supportsQuotaOnlyMode: Bool {
         switch self {
-        case .claude, .codex, .cursor, .factoryDroid, .gemini, .antigravity, .copilot, .devin, .grok, .openRouter, .trae, .glm, .warp, .kiro, .clinePass, .qoder:
+        case .claude, .codex, .cursor, .factoryDroid, .gemini, .antigravity, .copilot, .devin, .grok, .openRouter, .trae, .glm, .warp, .kiro, .clinePass, .qoder, .opencode:
             return true
         case .qwen, .iflow, .vertex:
             return false

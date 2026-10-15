@@ -86,7 +86,7 @@ final class QuotaViewModel {
             return provider == .gemini
         }
         switch provider {
-        case .qwen, .iflow, .vertex:
+        case .qwen, .iflow, .vertex, .opencode:
             return false
         default:
             return true
@@ -2126,7 +2126,7 @@ final class QuotaViewModel {
             quota = await openRouterFetcher.fetchQuota(accountKey: account.accountKey)
         case .qoder:
             quota = await qoderFetcher.fetchQuota(accountKey: account.accountKey)
-        case .qwen, .iflow, .vertex:
+        case .qwen, .iflow, .vertex, .opencode:
             return
         }
 
@@ -2268,7 +2268,7 @@ final class QuotaViewModel {
             fresh = await coordinatedRefresh {
                 await fetcher.fetchAsProviderQuota()
             }
-        case .qwen, .iflow, .vertex:
+        case .qwen, .iflow, .vertex, .opencode:
             return
         }
 
