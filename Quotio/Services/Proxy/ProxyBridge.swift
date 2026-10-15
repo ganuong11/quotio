@@ -2241,10 +2241,14 @@ final class ProxyBridge {
                 // yet (issue #9 precedent). passthrough-chat and the
                 // responsesToChat translation both fold chat chunks (via the
                 // Qoder aggregator, which consumes raw chat SSE); the
-                // responses-native passthrough folds Responses events.
+                // responses-native passthrough folds Responses events; the
+                // chatToResponses translation folds Responses events THROUGH
+                // `OpencodeChatSSEAdapter` into chat chunks first, then the
+                // same aggregator (one pipeline for both client modes).
                 final class AggregateBox: @unchecked Sendable {
                     var chat: QoderCompletionAggregator?
                     var responses: OpencodeResponsesAggregator?
+                    var chatAdapter: OpencodeChatSSEAdapter?
                     var totalBytes = 0
                 }
                 let box = AggregateBox()
@@ -2252,13 +2256,23 @@ final class ProxyBridge {
                     box.responses = OpencodeResponsesAggregator()
                 } else {
                     box.chat = QoderCompletionAggregator()
+                    if plan == .chatToResponses {
+                        box.chatAdapter = OpencodeChatSSEAdapter(model: requestModel)
+                    }
                 }
 
                 var aggregateFailed = false
                 if !opened.bufferedPrefix.isEmpty {
                     box.totalBytes += opened.bufferedPrefix.count
                     if box.chat != nil {
-                        try? box.chat?.ingest(opened.bufferedPrefix)
+                        if box.chatAdapter != nil {
+                            var adapter = box.chatAdapter!
+                            let chunks = (try? adapter.ingest(opened.bufferedPrefix)) ?? Data()
+                            box.chatAdapter = adapter
+                            try? box.chat?.ingest(chunks)
+                        } else {
+                            try? box.chat?.ingest(opened.bufferedPrefix)
+                        }
                     } else {
                         box.responses?.ingest(opened.bufferedPrefix)
                     }
@@ -2267,7 +2281,14 @@ final class ProxyBridge {
                     try await opened.pump { chunk in
                         box.totalBytes += chunk.count
                         if box.chat != nil {
-                            try? box.chat?.ingest(chunk)
+                            if box.chatAdapter != nil {
+                                var adapter = box.chatAdapter!
+                                let chunks = (try? adapter.ingest(chunk)) ?? Data()
+                                box.chatAdapter = adapter
+                                try? box.chat?.ingest(chunks)
+                            } else {
+                                try? box.chat?.ingest(chunk)
+                            }
                         } else {
                             box.responses?.ingest(chunk)
                         }
@@ -2278,6 +2299,16 @@ final class ProxyBridge {
                         Log.proxy("opencode (non-stream) upstream ended: \(error.localizedDescription)")
                     }
                     aggregateFailed = true
+                }
+
+                // Flush the adapter's synthesized terminal (clean EOF without
+                // a Responses terminal event — ADR 0018 posture) so the folded
+                // completion carries finish_reason and any terminal usage.
+                if !aggregateFailed, var adapter = box.chatAdapter {
+                    if let terminal = try? adapter.finish(), !terminal.isEmpty {
+                        try? box.chat?.ingest(terminal)
+                    }
+                    box.chatAdapter = adapter
                 }
 
                 relayBytes = box.totalBytes
@@ -2381,6 +2412,92 @@ final class ProxyBridge {
                         box.failed = true
                         statusCodeForMetadata = nil
                         Log.proxy("opencode (translated) upstream stream ended: \(error.localizedDescription)")
+                    }
+                }
+
+                if box.failed {
+                    var adapter = box.adapter
+                    let frame = adapter.errorEvent(
+                        message: "opencode upstream stream ended before completion.")
+                    box.adapter = adapter
+                    _ = try? await Self.sendToAgent(frame, on: originalConnection)
+                } else {
+                    var adapter = box.adapter
+                    let terminal = (try? adapter.finish()) ?? Data()
+                    box.adapter = adapter
+                    if !terminal.isEmpty {
+                        try? await Self.sendToAgent(terminal, on: originalConnection)
+                    }
+                }
+                relayBytes = box.totalBytes
+                relayFailed = box.failed
+
+                originalConnection.send(content: nil, isComplete: true, completion: .contentProcessed { _ in
+                    originalConnection.cancel()
+                })
+            } else if is2xx && plan == .chatToResponses {
+                // --- Reverse translated streaming (ADR 0021 Phase 2b): the
+                // upstream is Responses SSE, the client speaks Chat
+                // Completions. Translate through `OpencodeChatSSEAdapter`
+                // (Responses events → chat.completion.chunk frames, ends
+                // with [DONE]). A mid-stream failure after the 200 head
+                // can't change the status — emit a chat-shaped terminal
+                // error frame (ADR 0010; a Responses-shaped event would be
+                // malformed on this stream).
+                let responseHead = "HTTP/1.1 200 OK\r\n"
+                    + "Content-Type: text/event-stream\r\n"
+                    + "Cache-Control: no-cache\r\n"
+                    + "Connection: close\r\n\r\n"
+                do {
+                    try await Self.sendToAgent(Data(responseHead.utf8), on: originalConnection)
+                } catch {
+                    opened.cancel()
+                    return
+                }
+
+                final class ChatTranslateBox: @unchecked Sendable {
+                    // Value type behind a reference holder — copy out,
+                    // mutate, write back (same in/out mechanics as the
+                    // responsesToChat arm's TranslateBox).
+                    var adapter: OpencodeChatSSEAdapter
+                    var totalBytes = 0
+                    var failed = false
+                    init(_ adapter: OpencodeChatSSEAdapter) { self.adapter = adapter }
+                }
+                let box = ChatTranslateBox(OpencodeChatSSEAdapter(model: requestModel))
+
+                // bufferedPrefix (responses-surface bytes) flows through the
+                // adapter like any other chunk. Always empty today (no
+                // pre-handoff peek) — handled for parity.
+                if !opened.bufferedPrefix.isEmpty {
+                    box.totalBytes += opened.bufferedPrefix.count
+                    var adapter = box.adapter
+                    let chunks = (try? adapter.ingest(opened.bufferedPrefix)) ?? Data()
+                    box.adapter = adapter
+                    if !chunks.isEmpty {
+                        try? await Self.sendToAgent(chunks, on: originalConnection)
+                    }
+                }
+
+                do {
+                    try await opened.pump { chunk in
+                        box.totalBytes += chunk.count
+                        var adapter = box.adapter
+                        let chunks = (try? adapter.ingest(chunk)) ?? Data()
+                        box.adapter = adapter
+                        guard !chunks.isEmpty else { return true }
+                        do {
+                            try await Self.sendToAgent(chunks, on: originalConnection)
+                            return true
+                        } catch {
+                            return false   // agent went away — stop pumping
+                        }
+                    }
+                } catch {
+                    if !Task.isCancelled {
+                        box.failed = true
+                        statusCodeForMetadata = nil
+                        Log.proxy("opencode (reverse-translated) upstream stream ended: \(error.localizedDescription)")
                     }
                 }
 

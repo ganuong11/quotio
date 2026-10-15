@@ -17,7 +17,9 @@
 //  Same-surface requests pass through byte-faithful; a Responses-speaking
 //  client on a chat-native model gets its body translated via
 //  `OpencodeProtocolMapper` and its stream translated back in ProxyBridge
-//  (reusing the Qoder responses adapter). The reverse direction and the
+//  (reusing the Qoder responses adapter); a Chat client on a
+//  responses-native model gets the mirror translation
+//  (`chatRequestToResponses` + `OpencodeChatSSEAdapter`, Phase 2b). The
 //  non-OpenAI native surfaces are refused with 422 `unsupported_surface`
 //  before any account work — they cannot be served yet.
 //
@@ -49,8 +51,9 @@ nonisolated enum OpencodeRouterError: Error, LocalizedError, Equatable {
     /// reaching the router.
     case catalogUnavailable
     /// The model's native surface can't be served on the requested client
-    /// surface (ADR 0021) — chat client × responses-native model (reverse
-    /// translator pending), or a `messages`/`gemini`/`mistral`-native model.
+    /// surface (ADR 0021) — a `messages`/`gemini`/`mistral`-native model
+    /// (no client-facing surface). Defensive for `.responses`: Phase 2b
+    /// translates that pairing, so dispatch no longer produces it.
     case unsupportedSurface(model: String, surface: OpencodeSurface)
     /// The request itself can't be translated (e.g. Responses server-side
     /// conversation state) — 400, the client must resend differently.
@@ -110,6 +113,11 @@ nonisolated enum OpencodeDispatchPlan: Equatable, Sendable {
     /// `OpencodeProtocolMapper`, upstream is Chat Completions, the stream is
     /// translated back to Responses events in ProxyBridge.
     case responsesToChat
+    /// Client speaks Chat, model is responses-native (Phase 2b): request
+    /// translated by `OpencodeProtocolMapper.chatRequestToResponses`,
+    /// upstream is Responses, the stream is translated back to
+    /// chat.completion.chunk frames via `OpencodeChatSSEAdapter`.
+    case chatToResponses
 }
 
 /// Per-chunk callback handed to a stream `pump` — same contract as
@@ -234,8 +242,17 @@ actor OpencodeRouter {
                         ?? "request could not be translated to the chat completions surface.")
             }
         case (.chat, .responses):
-            // Reverse translator pending (plan Phase 2b decision point).
-            throw OpencodeRouterError.unsupportedSurface(model: strippedModel, surface: .responses)
+            // Phase 2b: translate the chat body to the responses surface.
+            plan = .chatToResponses
+            do {
+                bodyForShaping = try OpencodeProtocolMapper.chatRequestToResponses(requestBody)
+            } catch {
+                // The mapper's malformed-request diagnostics are the
+                // client's to fix — 400, not an upstream-flavored 502.
+                throw OpencodeRouterError.unsupportedRequest(
+                    (error as? LocalizedError)?.errorDescription
+                        ?? "request could not be translated to the responses surface.")
+            }
         default:
             // messages/gemini/mistral-native — no client-facing surface.
             throw OpencodeRouterError.unsupportedSurface(model: strippedModel, surface: nativeSurface)

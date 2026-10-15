@@ -220,22 +220,48 @@ final class OpencodeRouterTests: XCTestCase {
         XCTAssertNil(read["function"])
     }
 
-    /// Chat client × responses-native model: the reverse translator is a
-    /// pending decision point (plan Phase 2b) — explicit 422, no upstream
-    /// contact.
-    func testChatClientOnResponsesModelGets422() async throws {
+    /// Chat client × responses-native model (Phase 2b): the request is
+    /// translated to the Responses surface, posted there, and the opened
+    /// stream carries the reverse-translation plan for ProxyBridge.
+    func testChatClientOnResponsesModelTranslatesToResponsesSurface() async throws {
         await seedVaultAccount()
         await upstream.seed(.success(cannedStream(status: 200, body: "ok")))
         let router = makeRouter()
-        let body = Data(#"{"model":"opencode/muse-spark-1.3-contributor-free","messages":[]}"#.utf8)
+        let body = Data(#"{"model":"opencode/muse-spark-1.3-contributor-free","messages":[{"role":"user","content":"hi"}],"stream":true}"#.utf8)
+        let opened = try await router.open(requestBody: body, route: .chat)
+        XCTAssertEqual(opened.plan, .chatToResponses)
+
+        let calls = await upstream.calls
+        let call = try XCTUnwrap(calls.first)
+        XCTAssertEqual(call.url, "https://opencode.ai/inference/v1/responses")
+        // The upstream body is Responses-shaped: input items (not messages),
+        // forced stream:true, a flat responses-shape read tool, and NO
+        // stream_options (chat-surface-only knob — usage rides the terminal
+        // event on the responses surface).
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: call.body) as? [String: Any])
+        XCTAssertEqual(json["model"] as? String, "muse-spark-1.3-contributor-free")
+        XCTAssertEqual(json["stream"] as? Bool, true)
+        XCTAssertNotNil(json["input"] as? [[String: Any]])
+        XCTAssertNil(json["messages"])
+        XCTAssertNil(json["stream_options"])
+        let tools = try XCTUnwrap(json["tools"] as? [[String: Any]])
+        let read = try XCTUnwrap(tools.first { ($0["name"] as? String) == "read" })
+        XCTAssertNil(read["function"], "responses-shape read tool is flat")
+        XCTAssertNotNil(read["parameters"])
+    }
+
+    /// A chat body that cannot be translated (malformed JSON) is the client's
+    /// to fix — 400, not an upstream-flavored error.
+    func testMalformedChatBodyOnResponsesModelIs400() async throws {
+        await seedVaultAccount()
+        await upstream.seed(.success(cannedStream(status: 200, body: "ok")))
+        let router = makeRouter()
+        let body = Data(#"{"model":"opencode/muse-spark-1.3-contributor-free","messages":"not-an-array"}"#.utf8)
         await XCTAssertThrowsErrorAsync(try await router.open(requestBody: body, route: .chat)) { error in
-            XCTAssertEqual(
-                error as? OpencodeRouterError,
-                .unsupportedSurface(model: "muse-spark-1.3-contributor-free", surface: .responses))
-            XCTAssertEqual((error as? OpencodeRouterError)?.httpStatus, 422)
+            XCTAssertEqual((error as? OpencodeRouterError)?.httpStatus, 400)
         }
         let calls = await upstream.calls
-        XCTAssertTrue(calls.isEmpty, "unsupported surface must not contact upstream")
+        XCTAssertTrue(calls.isEmpty)
     }
 
     /// messages/gemini/mistral-native models have no client-facing surface

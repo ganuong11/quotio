@@ -200,4 +200,220 @@ final class OpencodeProtocolMapperTests: XCTestCase {
         _ = try translate(["model": "m", "input": "hi", "previous_response_id": ""])
         _ = try translate(["model": "m", "input": "hi"])
     }
+
+    // MARK: - Chat → Responses (Phase 2b — the reverse translator)
+
+    private func translateBack(_ dict: [String: Any]) throws -> [String: Any] {
+        let body = try JSONSerialization.data(withJSONObject: dict)
+        let out = try OpencodeProtocolMapper.chatRequestToResponses(body)
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: out) as? [String: Any])
+    }
+
+    func testLeadingSystemBecomesInstructions() throws {
+        // Only a LEADING system message feeds `instructions`; the rest of the
+        // conversation maps to input items in order (plan §2b).
+        let responses = try translateBack([
+            "model": "opencode/muse-spark-1.3-contributor-free",
+            "messages": [
+                ["role": "system", "content": "be terse"],
+                ["role": "user", "content": "hi"],
+            ],
+        ])
+        XCTAssertEqual(responses["instructions"] as? String, "be terse")
+        XCTAssertEqual(responses["model"] as? String, "opencode/muse-spark-1.3-contributor-free")
+        let input = try XCTUnwrap(responses["input"] as? [[String: Any]])
+        XCTAssertEqual(input.count, 1)
+        XCTAssertEqual(input[0]["role"] as? String, "user")
+    }
+
+    func testInterleavedSystemStaysInPlaceAsItem() throws {
+        let responses = try translateBack([
+            "model": "m",
+            "messages": [
+                ["role": "user", "content": "first"],
+                ["role": "system", "content": "mid-course correction"],
+                ["role": "user", "content": "second"],
+            ],
+        ])
+        XCTAssertNil(responses["instructions"], "no leading system → no instructions")
+        let input = try XCTUnwrap(responses["input"] as? [[String: Any]])
+        XCTAssertEqual(input.compactMap { $0["role"] as? String }, ["user", "system", "user"])
+    }
+
+    func testUserTextBecomesInputTextPart() throws {
+        let responses = try translateBack([
+            "model": "m",
+            "messages": [["role": "user", "content": "hi"]],
+        ])
+        let input = try XCTUnwrap(responses["input"] as? [[String: Any]])
+        let parts = try XCTUnwrap(input[0]["content"] as? [[String: Any]])
+        XCTAssertEqual(parts[0]["type"] as? String, "input_text")
+        XCTAssertEqual(parts[0]["text"] as? String, "hi")
+    }
+
+    func testAssistantTextHistoryBecomesOutputTextPart() throws {
+        let responses = try translateBack([
+            "model": "m",
+            "messages": [
+                ["role": "user", "content": "hi"],
+                ["role": "assistant", "content": "hello"],
+            ],
+        ])
+        let input = try XCTUnwrap(responses["input"] as? [[String: Any]])
+        let parts = try XCTUnwrap(input[1]["content"] as? [[String: Any]])
+        XCTAssertEqual(parts[0]["type"] as? String, "output_text")
+    }
+
+    func testContentPartsMapWithImages() throws {
+        let responses = try translateBack([
+            "model": "m",
+            "messages": [[
+                "role": "user",
+                "content": [
+                    ["type": "text", "text": "what is this"],
+                    ["type": "image_url", "image_url": ["url": "https://x.example/i.png"]],
+                ],
+            ]],
+        ])
+        let input = try XCTUnwrap(responses["input"] as? [[String: Any]])
+        let parts = try XCTUnwrap(input[0]["content"] as? [[String: Any]])
+        XCTAssertEqual(parts.count, 2)
+        XCTAssertEqual(parts[0]["type"] as? String, "input_text")
+        XCTAssertEqual(parts[1]["type"] as? String, "input_image")
+        XCTAssertEqual(parts[1]["image_url"] as? String, "https://x.example/i.png")
+    }
+
+    func testToolCallsBecomeFunctionCallItems() throws {
+        let responses = try translateBack([
+            "model": "m",
+            "messages": [
+                ["role": "user", "content": "read /x"],
+                [
+                    "role": "assistant", "content": NSNull(),
+                    "tool_calls": [[
+                        "id": "call_1", "type": "function",
+                        "function": ["name": "read", "arguments": #"{"filePath":"/x"}"#],
+                    ]],
+                ],
+                ["role": "tool", "tool_call_id": "call_1", "content": "file bytes"],
+                ["role": "user", "content": "thanks"],
+            ],
+        ])
+        let input = try XCTUnwrap(responses["input"] as? [[String: Any]])
+        XCTAssertEqual(input.compactMap { $0["type"] as? String ?? "message" },
+                       ["message", "function_call", "function_call_output", "message"])
+        let call = try XCTUnwrap(input[1])
+        XCTAssertEqual(call["call_id"] as? String, "call_1")
+        XCTAssertEqual(call["name"] as? String, "read")
+        XCTAssertEqual(call["arguments"] as? String, #"{"filePath":"/x"}"#)
+        let output = try XCTUnwrap(input[2])
+        XCTAssertEqual(output["call_id"] as? String, "call_1")
+        XCTAssertEqual(output["output"] as? String, "file bytes")
+    }
+
+    func testTokenSpellingsMapToMaxOutputTokens() throws {
+        let legacy = try translateBack([
+            "model": "m", "messages": [["role": "user", "content": "hi"]], "max_tokens": 128,
+        ])
+        XCTAssertEqual(legacy["max_output_tokens"] as? Int, 128)
+        let modern = try translateBack([
+            "model": "m", "messages": [["role": "user", "content": "hi"]],
+            "max_completion_tokens": 256,
+        ])
+        XCTAssertEqual(modern["max_output_tokens"] as? Int, 256)
+    }
+
+    func testReasoningEffortBecomesReasoningObject() throws {
+        let responses = try translateBack([
+            "model": "m", "messages": [["role": "user", "content": "hi"]],
+            "reasoning_effort": "low",
+        ])
+        XCTAssertEqual((responses["reasoning"] as? [String: Any])?["effort"] as? String, "low")
+    }
+
+    func testNestedToolsBecomeFlatResponsesShape() throws {
+        let responses = try translateBack([
+            "model": "m",
+            "messages": [["role": "user", "content": "hi"]],
+            "tools": [[
+                "type": "function",
+                "function": [
+                    "name": "lookup", "description": "look things up",
+                    "parameters": ["type": "object", "properties": ["q": ["type": "string"]]],
+                ],
+            ]],
+        ])
+        let tools = try XCTUnwrap(responses["tools"] as? [[String: Any]])
+        XCTAssertEqual(tools[0]["name"] as? String, "lookup")
+        XCTAssertEqual(tools[0]["description"] as? String, "look things up")
+        XCTAssertNotNil((tools[0]["parameters"] as? [String: Any])?["properties"],
+                        "responses tools are flat: name/description/parameters at top level")
+    }
+
+    func testToolChoiceObjectFlattens() throws {
+        let stringForm = try translateBack([
+            "model": "m", "messages": [["role": "user", "content": "hi"]], "tool_choice": "auto",
+        ])
+        XCTAssertEqual(stringForm["tool_choice"] as? String, "auto")
+
+        let objectForm = try translateBack([
+            "model": "m", "messages": [["role": "user", "content": "hi"]],
+            "tool_choice": ["type": "function", "function": ["name": "lookup"]],
+        ])
+        let choice = try XCTUnwrap(objectForm["tool_choice"] as? [String: Any])
+        XCTAssertEqual(choice["type"] as? String, "function")
+        XCTAssertEqual(choice["name"] as? String, "lookup")
+    }
+
+    func testResponseFormatMapsToTextFormat() throws {
+        let jsonObject = try translateBack([
+            "model": "m", "messages": [["role": "user", "content": "hi"]],
+            "response_format": ["type": "json_object"],
+        ])
+        XCTAssertEqual(
+            ((jsonObject["text"] as? [String: Any])?["format"] as? [String: Any])?["type"] as? String,
+            "json_object")
+
+        let jsonSchema = try translateBack([
+            "model": "m", "messages": [["role": "user", "content": "hi"]],
+            "response_format": [
+                "type": "json_schema",
+                "json_schema": ["name": "out", "schema": ["type": "object"], "strict": true],
+            ],
+        ])
+        let format = try XCTUnwrap((jsonSchema["text"] as? [String: Any])?["format"] as? [String: Any])
+        XCTAssertEqual(format["name"] as? String, "out")
+        XCTAssertEqual(format["strict"] as? Bool, true)
+        XCTAssertNotNil(format["schema"])
+    }
+
+    func testSamplingParametersPassThroughOnReverse() throws {
+        let responses = try translateBack([
+            "model": "m", "messages": [["role": "user", "content": "hi"]],
+            "temperature": 0.2, "top_p": 0.9, "parallel_tool_calls": false, "user": "u-1",
+        ])
+        XCTAssertEqual(responses["temperature"] as? Double, 0.2)
+        XCTAssertEqual(responses["top_p"] as? Double, 0.9)
+        XCTAssertEqual(responses["parallel_tool_calls"] as? Bool, false)
+        XCTAssertEqual(responses["user"] as? String, "u-1")
+    }
+
+    func testStopIsDropped() throws {
+        // `stop` has no Responses equivalent — documented drop (plan Risks).
+        let responses = try translateBack([
+            "model": "m", "messages": [["role": "user", "content": "hi"]],
+            "stop": ["\n"],
+        ])
+        XCTAssertNil(responses["stop"])
+    }
+
+    func testStreamOptionsDroppedOnReverse() throws {
+        // `stream_options` is a chat-surface knob; usage placement on the
+        // responses surface is the terminal event, always present.
+        let responses = try translateBack([
+            "model": "m", "messages": [["role": "user", "content": "hi"]],
+            "stream": false, "stream_options": ["include_usage": true],
+        ])
+        XCTAssertNil(responses["stream_options"])
+    }
 }

@@ -33,11 +33,18 @@ surface differs:
   (`QoderResponsesTranslator.parseResponses`/`synthesizeChatBody` for the
   request, `QoderResponsesAdapter` for the stream, `QoderCompletionAggregator`
   for non-streaming) and unlocks all served chat models for Responses clients.
-- **responses→chat arm is deferred** as an explicit decision point: it needs
-  two new components and unlocks exactly one model today. Until it lands,
-  chat-surface requests for responses-native models get a provider-owned
-  `422 unsupported_surface` naming the required surface — clearer than the
-  upstream 400 it replaces.
+- **responses→chat arm** (Chat-speaking client, responses-native model):
+  *amended same-day (Phase 2b)* — the deferral below was a sequencing
+  decision, and the decision point resolved to BUILD when the served-set
+  precondition still held (`muse-spark-1.3-contributor-free` free+live; the
+  1.2 sibling had gone deprecated, so the free responses-native set was
+  shrinking, not growing). Ships as `OpencodeProtocolMapper
+  .chatRequestToResponses` + `OpencodeChatSSEAdapter` (Responses events →
+  `chat.completion.chunk` frames; reasoning summaries →
+  `delta.reasoning_content` — the repo's established chat-dialect, per the
+  `QoderThinkingTagParser` mapping, not think tags; `response.incomplete`
+  max_output_tokens → `finish_reason:"length"`; clean EOF without a terminal
+  synthesizes `stop`, ADR 0018 precedent; ends with `data: [DONE]`).
 - Native surfaces `messages`/`gemini`/`mistral` (and `messages` until a
   mapper exists): `422 unsupported_surface`; excluded from `/v1/models`
   advertisement (filter, not annotation — never advertise what we can't
@@ -51,12 +58,13 @@ surface differs:
   SSE verbatim to `stream:false` clients.
 - **Error bodies:** pre-stream non-2xx relays verbatim (OpenAI's
   `{"error":{…}}` envelope is shared across both surfaces — verified live).
-  Mid-stream failure handling is arm-scoped: the translated streaming arm
-  emits a Responses-shaped terminal `error` event via the adapter (the
-  client's stream protocol is ours to author there); the same-surface
-  passthrough arm truncates exactly as a real opencode client sees (ADR
-  0020's posture — no fabricated frames on a surface the client picked
-  itself).
+  Mid-stream failure handling is arm-scoped: the translated streaming arms
+  emit a terminal error frame in the CLIENT's protocol (Responses-shaped
+  `error` event on the 2a arm; a chat `data:{"error":…}` frame + `[DONE]`
+  via `QoderOpenAIError.sseTerminalFrame` on the 2b arm) — the client's
+  stream protocol is ours to author there; the same-surface passthrough arm
+  truncates exactly as a real opencode client sees (ADR 0020's posture — no
+  fabricated frames on a surface the client picked itself).
 - **Hard-fail carve-out in translation:** `previous_response_id` /
   `conversation` (Responses server-side state) → 400 rather than silent drop
   — dropping them would translate a stateful conversation into a stateless
@@ -79,9 +87,11 @@ reuse, catalog hard-allowlist.
   Rejected: it would hide the newest free model (`muse-spark-1.3`) from
   chat-only clients forever and couple the advertisement to the client
   population's surface habits; translation is bounded work at proven seams.
-- **Translate both directions at once.** Rejected for now: the responses→chat
-  half is two new components for one model today; it stays a documented
-  decision point with a complete spec in the plan doc.
+- **Translate both directions at once.** Rejected at first: the responses→chat
+  half is two new components for one model today. It stayed a documented
+  decision point with a complete spec in the plan doc — and shipped as
+  Phase 2b the same day once the served-set precondition was re-checked
+  (see the amended decision bullet above).
 
 ## Consequences
 
