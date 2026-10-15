@@ -78,3 +78,17 @@ _Avoid_: "non-streaming mode" implying an upstream change — the upstream is al
 **Message trim (`QoderChatTranslator.trimmingMessages`)**:
 What happens to a Chat Completions request whose `messages` exceed `maxMessages` (9999): the translator keeps the leading system/developer preamble plus the newest turns, cutting at a boundary that never orphans a `tool` result — instead of rejecting with 400 (issue #14's original behavior, which permanently broke any session that crossed the cap, since client history only grows). Upstream's own message limit is unverified above 999; a request between 1000 and 9999 messages is forwarded untrimmed and could still hit it. See ADR 0019.
 _Avoid_: "context window" (that's token-based, client-side compaction), message cap rejection (the old behavior)
+
+### OpenCode-specific
+
+**OpenCode**:
+The OpenCode Console AI service (`opencode.ai/console` for auth, `opencode.ai/inference` for inference). Free inference models are served through a Quotio-native ProxyBridge branch (ADR 0020): account-aware failover over Quotio-managed device-code logins plus read-only detection of the system opencode install's credentials (`auth.json`, `opencode*.db` via temp copies — never written back).
+_Avoid_: opencode (ambiguous with the client app), OpenCode CLI (the client, not the service)
+
+**OpenCode free-tier gate**:
+The upstream fingerprint check on `opencode.ai/inference`: full released-client UA (`opencode/1.18.30 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14` — unrecognized versions 403), `x-opencode-*` metadata headers, `stream:true`, a `read` tool present, and an Apple TLS stack (URLSession passes, curl 403s — all upstream calls stay on URLSession). Tools named `read/bash/write/edit/glob/grep` with empty `parameters.properties` are 403'd; Quotio substitutes the real opencode schemas for degenerate definitions.
+_Avoid_: auth gate (that's the proxy API key surface)
+
+**OpenCode surface dispatch**:
+Each `opencode/<model>` request targets the model's **native** upstream surface (chat completions / responses), resolved per model from models.dev `provider.npm` (per-model override, else provider-level, else chat). Same-surface requests pass through byte-faithful; cross-surface requests translate at the seam — a Responses-speaking client on a chat-native model reuses the Qoder translator/adapter/aggregator; the reverse direction (chat client, responses-native model) is a 422 `unsupported_surface` decision point. Because the gate forces `stream:true` upstream, `stream:false` clients are aggregated into one JSON body on every arm (head written after aggregation; mid-aggregation failure is a true 502). ADR 0021 supersedes ADR 0020's surface-passthrough decision.
+_Avoid_: family mapping (the pre-0021 design keyed off model families, not surfaces)
