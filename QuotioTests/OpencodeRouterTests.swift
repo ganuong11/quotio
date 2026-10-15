@@ -326,6 +326,140 @@ final class OpencodeRouterTests: XCTestCase {
         _ = try await router.open(requestBody: chatBody, route: .chat)
         await fulfillment(of: [recovered], timeout: 5)
     }
+
+    // MARK: - Final review fixes
+
+    /// Free-tier gate (Task 0 spike): `stream:true` is required and the
+    /// tools array must contain a `read` tool — the released client always
+    /// sends both. A bare `{"model","messages"}` request must be shaped, not
+    /// forwarded verbatim.
+    func testInjectsReadToolAndStreamTrue() async throws {
+        await seedVaultAccount()
+        await upstream.seed(.success(cannedStream(status: 200, body: "ok")))
+        let router = makeRouter()
+        _ = try await router.open(requestBody: chatBody, route: .chat)
+
+        let calls = await upstream.calls
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try XCTUnwrap(calls.first).body) as? [String: Any])
+        XCTAssertEqual(json["stream"] as? Bool, true)
+        let tools = try XCTUnwrap(json["tools"] as? [[String: Any]])
+        XCTAssertTrue(tools.contains {
+            (($0["function"] as? [String: Any])?["name"] as? String) == "read"
+        }, "expected an injected OpenAI-function-shape `read` tool")
+    }
+
+    /// A client that already sends a `read` tool is not touched; sibling
+    /// client tools survive alongside.
+    func testPreservesExistingReadToolAndClientTools() async throws {
+        await seedVaultAccount()
+        await upstream.seed(.success(cannedStream(status: 200, body: "ok")))
+        let body = Data(#"{"model":"opencode/big-pickle","messages":[],"tools":[{"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{"custom":{"type":"string"}},"required":["custom"]}}},{"type":"function","function":{"name":"bash","parameters":{"type":"object"}}}]}"#.utf8)
+        let router = makeRouter()
+        _ = try await router.open(requestBody: body, route: .chat)
+
+        let calls = await upstream.calls
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try XCTUnwrap(calls.first).body) as? [String: Any])
+        let tools = try XCTUnwrap(json["tools"] as? [[String: Any]])
+        let names = tools.compactMap { ($0["function"] as? [String: Any])?["name"] as? String }
+        XCTAssertEqual(names.filter { $0 == "read" }.count, 1, "read tool must not be duplicated")
+        XCTAssertTrue(names.contains("bash"))
+        // the client's own read def is preserved, not replaced
+        let readTool = tools.first {
+            (($0["function"] as? [String: Any])?["name"] as? String) == "read"
+        }
+        let params = (readTool?["function"] as? [String: Any])?["parameters"] as? [String: Any]
+        XCTAssertNotNil((params?["properties"] as? [String: Any])?["custom"])
+    }
+
+    /// A detected account the user disabled in the monitor UI must not
+    /// serve — the disabled set applies to detected candidates too.
+    func testDisabledDetectedAccountIsSkipped() async throws {
+        let detected = DetectedOpencodeCredential(
+            accountKey: "usr_det", accessToken: "det-at", refreshToken: nil,
+            expiresAt: Date().addingTimeInterval(3600), orgID: nil,
+            server: OpencodeConsoleClient.defaultServer,
+            sourcePath: "/tmp/x#opencode", email: nil)
+        let metadata = MonitorMetadataStore(url: tempDir.appendingPathComponent("accounts-test.json"))
+        let detectedAccountID = MonitorAccount.make(
+            provider: .opencode, accountKey: detected.accountKey,
+            source: .nativeCredential, credentialReference: detected.sourcePath).id
+        try await metadata.setDisabled(true, accountID: detectedAccountID)
+        await upstream.seed(.success(cannedStream(status: 200, body: "ok")))
+        let router = OpencodeRouter(
+            catalog: catalog,
+            console: OpencodeConsoleClient(session: StubURLProtocol.makeSession()),
+            upstream: upstream,
+            vault: store,
+            metadata: metadata,
+            detectedSnapshot: { [detected] }
+        )
+        await XCTAssertThrowsErrorAsync(try await router.open(requestBody: chatBody, route: .chat)) { error in
+            XCTAssertEqual(error as? OpencodeRouterError, .noAccountsAvailable)
+        }
+        let calls = await upstream.calls
+        XCTAssertTrue(calls.isEmpty, "disabled detected account must not reach upstream")
+    }
+
+    /// Spec: a detected credential that 401s is re-read from its store —
+    /// a rotated token retries once upstream.
+    func testDetected401ReloadsStoreAndRetries() async throws {
+        // store carries the ROTATED token (user re-authed in opencode)
+        let authPath = tempDir.appendingPathComponent("auth.json").path
+        try #"{"opencode":{"type":"oauth","access":"rotated-at","refresh":"r","expires":4102444800000,"accountId":"usr_det"}}"#
+            .write(toFile: authPath, atomically: true, encoding: .utf8)
+        // snapshot still holds the old (revoked-but-unexpired) token
+        let detected = DetectedOpencodeCredential(
+            accountKey: "usr_det", accessToken: "revoked-at", refreshToken: "old",
+            expiresAt: Date().addingTimeInterval(3600), orgID: nil,
+            server: OpencodeConsoleClient.defaultServer,
+            sourcePath: authPath + "#opencode", email: nil)
+        await upstream.seed(.success(cannedStream(status: 401, body: "unauthorized")))
+        await upstream.seed(.success(cannedStream(status: 200, body: "ok")))
+        let router = makeRouter { [detected] }
+        let opened = try await router.open(requestBody: chatBody, route: .chat)
+        XCTAssertEqual(opened.status, 200)
+
+        let calls = await upstream.calls
+        XCTAssertEqual(calls.count, 2)
+        let second = calls[1]
+        let headers = Dictionary(uniqueKeysWithValues: second.headers.map { ($0.0.lowercased(), $0.1) })
+        XCTAssertEqual(headers["authorization"], "Bearer rotated-at")
+    }
+
+    /// A detected credential that 401s AND whose store still holds the
+    /// same token is revoked for real — stale-mark it. (Vault candidates
+    /// are enumerated before detected, so the vault's own 401 is consumed
+    /// first; both failing → exhaustion, not a served stream.)
+    func testDetected401SameTokenMarksStale() async throws {
+        let authPath = tempDir.appendingPathComponent("auth.json").path
+        // store still holds the same revoked token
+        try #"{"opencode":{"type":"oauth","access":"revoked-at","refresh":"r","expires":4102444800000,"accountId":"usr_det"}}"#
+            .write(toFile: authPath, atomically: true, encoding: .utf8)
+        let detected = DetectedOpencodeCredential(
+            accountKey: "usr_det", accessToken: "revoked-at", refreshToken: "r",
+            expiresAt: Date().addingTimeInterval(3600), orgID: nil,
+            server: OpencodeConsoleClient.defaultServer,
+            sourcePath: authPath + "#opencode", email: nil)
+        await upstream.seed(.success(cannedStream(status: 401, body: "unauthorized")))
+
+        let stale = expectation(description: "stale notification")
+        let observer = NotificationCenter.default.addObserver(
+            forName: OpencodeRouter.opencodeAccountStale, object: nil, queue: nil) { note in
+            if (note.userInfo?["accountKey"] as? String) == "usr_det" { stale.fulfill() }
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        let router = makeRouter { [detected] }
+        await XCTAssertThrowsErrorAsync(try await router.open(requestBody: chatBody, route: .chat)) { error in
+            XCTAssertEqual(error as? OpencodeRouterError, .noAccountsAvailable)
+        }
+        await fulfillment(of: [stale], timeout: 5)
+        // exactly one upstream attempt — no doomed retry with the same token
+        let calls = await upstream.calls
+        XCTAssertEqual(calls.count, 1)
+    }
 }
 
 /// XCTAssertThrowsError doesn't compose with async; small local helper.

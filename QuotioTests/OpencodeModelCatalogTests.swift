@@ -155,4 +155,29 @@ final class OpencodeModelCatalogTests: XCTestCase {
         XCTAssertTrue(catalog.isEmpty)
         XCTAssertFalse(catalog.isFree("a"))
     }
+
+    /// Review fix: `loadPersisted` and `refresh` used to run as two
+    /// independent tasks at startup, so a slow persisted load could land on
+    /// top of a faster network refresh. `prime()` serializes them inside
+    /// the actor — after it returns, the freshest data wins.
+    func testPrimeLoadsPersistedThenRefreshes() async {
+        // Persist a stale snapshot via a first catalog instance. Both ids
+        // must be in models.dev (loadPersisted restores that cache too,
+        // within its TTL); only the live list differs between runs.
+        let mdev = Self.modelsDev([
+            "stale": Self.mdevEntry(),
+            "fresh": Self.mdevEntry(),
+        ])
+        stub(live: Self.liveModels(["stale"]), mdev: mdev)
+        let first = makeCatalog()
+        await first.refresh()
+        XCTAssertEqual(first.models.map(\.id), ["stale"])
+
+        // Fresh catalog, same storage dir: prime() must end at the
+        // network result, not the persisted one.
+        stub(live: Self.liveModels(["fresh"]), mdev: mdev)
+        let second = makeCatalog()
+        await second.prime()
+        XCTAssertEqual(second.models.map(\.id), ["fresh"])
+    }
 }

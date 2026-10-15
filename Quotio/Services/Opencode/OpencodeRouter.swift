@@ -160,7 +160,7 @@ actor OpencodeRouter {
     func open(requestBody: Data, route: OpencodeRoute) async throws -> OpencodeOpenedStream {
         if catalog.isEmpty { throw OpencodeRouterError.catalogUnavailable }
 
-        let upstreamBody = Self.stripModelPrefix(from: requestBody)
+        let upstreamBody = Self.shapeUpstreamBody(from: requestBody)
         let candidates = await self.candidates()
         guard !candidates.isEmpty else { throw exhaustionError() }
 
@@ -188,6 +188,29 @@ actor OpencodeRouter {
             }
             switch stream.status {
             case 401:
+                // Spec: a detected credential that 401s is re-read from its
+                // store — a rotated token retries upstream once. Same-token
+                // (or still-dead) → the credential is revoked for real:
+                // stale-mark and move on.
+                if case .detected(let detected) = candidate.source {
+                    if let retry = try await retryDetectedAfter401(
+                        detected, url: url, body: upstreamBody) {
+                        switch retry.status {
+                        case 401:
+                            markStale(candidate.key, displayName: candidate.displayName)
+                            continue
+                        case 429:
+                            cooldowns[candidate.key] = Date().addingTimeInterval(Self.cooldownTTL)
+                            continue
+                        default:
+                            return openedStream(retry)
+                        }
+                    }
+                    // Store has nothing better to offer (same token,
+                    // expired, or unreadable) → the credential is revoked
+                    // for real; surface it.
+                    markStale(candidate.key, displayName: candidate.displayName)
+                }
                 continue   // bad credential on this account → next
             case 429:
                 cooldowns[candidate.key] = Date().addingTimeInterval(Self.cooldownTTL)
@@ -196,7 +219,7 @@ actor OpencodeRouter {
                 return openedStream(stream)
             }
         }
-        throw await exhaustionError()
+        throw exhaustionError()
     }
 
     /// Proactively renew vault credentials inside the expiry margin (Task 8
@@ -233,6 +256,13 @@ actor OpencodeRouter {
             // same priority ordering as MonitorAccountDiscovery.selectPreferred.
             guard !vaultKeys.contains(detected.accountKey.lowercased()),
                   !cooldowns.keys.contains(detected.accountKey) else { continue }
+            // The user's disabled set applies to detected accounts too —
+            // the monitor materializes them with the same id formula
+            // (MonitorAccountDiscovery.discoverOpencodeCredentials).
+            let detectedAccountID = MonitorAccount.make(
+                provider: .opencode, accountKey: detected.accountKey,
+                source: .nativeCredential, credentialReference: detected.sourcePath).id
+            guard !disabledIDs.contains(detectedAccountID) else { continue }
             result.append(Candidate(
                 key: detected.accountKey, displayName: detected.email ?? detected.accountKey,
                 source: .detected(detected)))
@@ -306,6 +336,24 @@ actor OpencodeRouter {
             return ResolvedCredential(
                 token: reloaded.accessToken, orgID: reloaded.orgID, server: reloaded.server)
         }
+    }
+
+    /// A detected credential 401'd — re-read its source store. A rotated,
+    /// still-fresh token retries upstream once (returns nil when the store
+    /// has nothing better to offer: same token, expired, or unreadable —
+    /// the caller then treats the credential as revoked). Transport errors
+    /// propagate: a flaky network is not evidence of revocation.
+    private func retryDetectedAfter401(
+        _ detected: DetectedOpencodeCredential,
+        url: URL,
+        body: Data
+    ) async throws -> OpencodeUpstreamStream? {
+        guard let reloaded = OpencodeCredentialDetector.reload(sourcePath: detected.sourcePath),
+              reloaded.accessToken != detected.accessToken,
+              reloaded.expiresAt.map({ $0 > Date().addingTimeInterval(Self.expiryMargin) }) ?? true
+        else { return nil }
+        let headers = Self.upstreamHeaders(token: reloaded.accessToken, orgID: reloaded.orgID)
+        return try await upstream.post(url: url, headers: headers, body: body)
     }
 
     // MARK: - Stale / recovered notifications
@@ -389,16 +437,52 @@ actor OpencodeRouter {
         return headers
     }
 
-    /// Strip the `opencode/` routing prefix from the body's `model` field —
-    /// everything else forwards verbatim. Falls back to the original body on
-    /// any parse failure (the route gate already required a parseable model).
-    private nonisolated static func stripModelPrefix(from body: Data) -> Data {
-        guard var json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
-              let model = json["model"] as? String,
-              model.hasPrefix(OpencodeRouteGate.opencodePrefix) else {
+    /// Official `read` tool definition in OpenAI function shape — verified
+    /// live (fix pass): this shape returns 200 from the free-tier gate, the
+    /// bare `{"name","parameters"}` shape returns a 400 param error, and a
+    /// body with no `read` tool returns a 403 FreeTierError. Rebuilt per
+    /// call — `[String: Any]` isn't Sendable, so a shared static let would
+    /// be a strict-concurrency violation.
+    private nonisolated static func readToolDefinition() -> [String: Any] {
+        [
+            "type": "function",
+            "function": [
+                "name": "read",
+                "description": "Reads a file from the local filesystem.",
+                "parameters": [
+                    "type": "object",
+                    "properties": ["filePath": ["type": "string"]],
+                    "required": ["filePath"]
+                ]
+            ]
+        ]
+    }
+
+    /// Shape the client body into what a real opencode client sends:
+    /// strip the `opencode/` routing prefix from `model`, force
+    /// `stream: true`, and ensure a `read` tool is present. The Task 0
+    /// spike proved the free-tier gate 403s `stream:false` and bodies
+    /// lacking a `read` tool — "indistinguishable from a real opencode
+    /// client" means sending both, since the released client always does.
+    /// Falls back to the original body on any parse failure (the route
+    /// gate already required a parseable model).
+    private nonisolated static func shapeUpstreamBody(from body: Data) -> Data {
+        guard var json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
             return body
         }
-        json["model"] = String(model.dropFirst(OpencodeRouteGate.opencodePrefix.count))
+        if let model = json["model"] as? String,
+           model.hasPrefix(OpencodeRouteGate.opencodePrefix) {
+            json["model"] = String(model.dropFirst(OpencodeRouteGate.opencodePrefix.count))
+        }
+        json["stream"] = true
+        var tools = (json["tools"] as? [Any]) ?? []
+        let hasRead = tools.contains { entry in
+            guard let tool = entry as? [String: Any] else { return false }
+            return (tool["name"] as? String) == "read"
+                || ((tool["function"] as? [String: Any])?["name"] as? String) == "read"
+        }
+        if !hasRead { tools.append(readToolDefinition()) }
+        json["tools"] = tools
         return (try? JSONSerialization.data(withJSONObject: json)) ?? body
     }
 }

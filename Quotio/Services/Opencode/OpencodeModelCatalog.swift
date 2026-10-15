@@ -193,6 +193,15 @@ actor OpencodeModelCatalog {
         return try? JSONDecoder().decode(ModelsDevSnapshot.self, from: data)
     }
 
+    /// Startup warmup: load the persisted snapshot, then refresh from the
+    /// network — serialized inside the actor so a slow persisted load can
+    /// never land on top of a faster refresh (the two used to run as
+    /// independent tasks at proxy start and could finish out of order).
+    func prime() async {
+        loadPersisted()
+        await refresh()
+    }
+
     /// Load the persisted snapshot (offline start). Called once at app/proxy start.
     func loadPersisted() {
         if modelsDevSnapshot == nil {

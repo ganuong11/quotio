@@ -1703,10 +1703,10 @@ final class QuotaViewModel {
         // system opencode accounts.
         detectedCache.refresh()
 
-        // Load the persisted catalog, then kick the first network refresh —
-        // both fire-and-forget so proxy startup isn't gated on the network.
-        Task { await OpencodeModelCatalog.shared.loadPersisted() }
-        Task { await OpencodeModelCatalog.shared.refresh() }
+        // Catalog warmup: persisted snapshot first, then network refresh —
+        // serialized inside the actor (prime) so ordering can't race.
+        // Fire-and-forget so proxy startup isn't gated on the network.
+        Task { await OpencodeModelCatalog.shared.prime() }
 
         // Stale / recovered account transitions → monitor issue surface.
         // The router posts these on MainActor already; the `.main` queue

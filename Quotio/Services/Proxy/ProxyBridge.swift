@@ -1303,12 +1303,11 @@ final class ProxyBridge {
     }
 
     /// Chain the per-namespace model mergers over CPA's `/v1/models` body:
-    /// Qoder first (existing ADR 0016 behavior), then opencode. Each merge is
-    /// independent — a failure in one doesn't cancel the other — and the
-    /// result is nil when NEITHER merge applies or any merge fails outright
-    /// (callers degrade to raw passthrough so discovery never breaks).
-    /// Internal + `nonisolated` so unit tests pin the chaining contract
-    /// without an NWConnection.
+    /// Qoder first (existing ADR 0016 behavior), then opencode. A failed
+    /// merge aborts the whole merge (nil) — the caller degrades to raw
+    /// passthrough so discovery never breaks; a half-merged list would be
+    /// worse than CPA's unmodified one. Internal + `nonisolated` so unit
+    /// tests pin the chaining contract without an NWConnection.
     nonisolated static func mergeModelsBody(
         into cpaBody: Data,
         mergeQoder: Bool,
