@@ -14,9 +14,11 @@
 //  upstream models from leaking through the proxy: the catalog knows the
 //  cost-zero set and the gate refuses everything outside it.
 //
-//  Both OpenAI surfaces are valid for every free model: the client picks
-//  `/v1/chat/completions` or `/v1/responses` and the requested surface is
-//  forwarded to the upstream verbatim (no family mapping — spec §Routing).
+//  Both OpenAI surfaces are valid request surfaces for every free model —
+//  the client picks `/v1/chat/completions` or `/v1/responses`. The upstream
+//  TARGET is the model's native surface, resolved separately from the
+//  catalog by the router (ADR 0021 surface dispatch); this gate only
+//  decides whether the request enters the opencode branch at all.
 //
 //  The catalog lookup is injected as a closure so the gate stays pure and
 //  synchronous — `ProxyBridge.processRequest` is nonisolated and cannot
@@ -34,12 +36,13 @@ import Foundation
 
 /// The opencode-branch routing decision for one parsed HTTP request.
 nonisolated enum OpencodeRoute: Equatable, Sendable {
-    /// `POST /v1/chat/completions` with a free `opencode/` model — forwarded
-    /// verbatim to `{origin}/inference/v1/chat/completions`.
+    /// `POST /v1/chat/completions` with a free `opencode/` model — the
+    /// client's surface; the upstream target is the model's native surface
+    /// (ADR 0021).
     case chat
 
-    /// `POST /v1/responses` with a free `opencode/` model — forwarded
-    /// verbatim to `{origin}/inference/v1/responses`.
+    /// `POST /v1/responses` with a free `opencode/` model — the client's
+    /// surface; same ADR 0021 note as `.chat`.
     case responses
 
     /// Prefix + POST + allowlisted path all matched, but the model is not in

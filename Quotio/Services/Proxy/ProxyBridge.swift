@@ -582,10 +582,12 @@ final class ProxyBridge {
                 // its callbacks (NWConnection state/receive) are nonisolated.
                 // The opencode model set is snapshotted here (the catalog's
                 // synchronous nonisolated view) so the merge uses one
-                // consistent list end to end.
+                // consistent list end to end. ADR 0021: only models servable
+                // on a client-facing surface are advertised — never list
+                // what a request would 422 on.
                 let mergeQoder = (self.qoderRouter != nil)
                 let opencodeModels = (self.opencodeRouter != nil)
-                    ? OpencodeModelCatalog.shared.models
+                    ? OpencodeModelCatalog.shared.advertisedModels
                     : []
                 self.serveModelsList(
                     path: path,
@@ -2218,76 +2220,263 @@ final class ProxyBridge {
                 return
             }
 
-            // Relay the upstream status line + headers verbatim minus
-            // hop-by-hop fields, then force `Connection: close` — matching
-            // the one-request-per-connection contract the bridge already
-            // imposes everywhere else.
-            let reason = HTTPURLResponse.localizedString(forStatusCode: opened.status)
-            var head = "HTTP/1.1 \(opened.status) \(reason)\r\n"
-            let hopByHop: Set<String> = [
-                "connection", "transfer-encoding", "content-length", "keep-alive"
-            ]
-            for (name, value) in opened.headers where !hopByHop.contains(name.lowercased()) {
-                head += "\(name): \(value)\r\n"
-            }
-            head += "Connection: close\r\n\r\n"
+            let plan = opened.plan
+            let is2xx = (200..<300).contains(opened.status)
+            // The upstream is ALWAYS streamed (the free-tier gate 403s
+            // `stream:false`); the client's own `stream` field only decides
+            // how the agent is served — SSE relay or one aggregated body.
+            let clientStreams = OpencodeRouter.streamRequested(in: body)
 
-            let agentConn = originalConnection
-            var sentStatusCode: Int? = opened.status
-            do {
-                try await Self.sendToAgent(Data(head.utf8), on: agentConn)
-            } catch {
-                // Agent socket died before any byte shipped — tear down the
-                // still-open upstream task explicitly (pump's defer only
-                // runs once pumping begins).
-                opened.cancel()
-                return
-            }
+            // Shared across the three relay arms by the completion tail.
+            var relayBytes = 0
+            var relayFailed = false
+            var statusCodeForMetadata: Int? = opened.status
 
-            // Sendable holder for pump-closure accounting (same final-class
-            // pattern as the Qoder branch).
-            final class StreamBox: @unchecked Sendable {
-                var totalBytes = 0
-                var failed = false
-            }
-            let box = StreamBox()
+            if is2xx && !clientStreams {
+                // --- Non-streaming client: fold the forced-SSE upstream into
+                // one JSON body (ADR 0021). The head is written only after
+                // aggregation (exact Content-Length); a failure before that
+                // point is a true HTTP 502 — nothing has reached the agent
+                // yet (issue #9 precedent). passthrough-chat and the
+                // responsesToChat translation both fold chat chunks (via the
+                // Qoder aggregator, which consumes raw chat SSE); the
+                // responses-native passthrough folds Responses events.
+                final class AggregateBox: @unchecked Sendable {
+                    var chat: QoderCompletionAggregator?
+                    var responses: OpencodeResponsesAggregator?
+                    var totalBytes = 0
+                }
+                let box = AggregateBox()
+                if plan == .passthrough(native: .responses) {
+                    box.responses = OpencodeResponsesAggregator()
+                } else {
+                    box.chat = QoderCompletionAggregator()
+                }
 
-            // Replay any router-buffered prefix, then pump the remaining
-            // upstream bytes RAW — no SSE reparsing. A failed send to the
-            // agent stops the pump; a failed upstream pull truncates the
-            // agent response like a real opencode client sees.
-            if !opened.bufferedPrefix.isEmpty {
-                box.totalBytes += opened.bufferedPrefix.count
+                var aggregateFailed = false
+                if !opened.bufferedPrefix.isEmpty {
+                    box.totalBytes += opened.bufferedPrefix.count
+                    if box.chat != nil {
+                        try? box.chat?.ingest(opened.bufferedPrefix)
+                    } else {
+                        box.responses?.ingest(opened.bufferedPrefix)
+                    }
+                }
                 do {
-                    try await Self.sendToAgent(opened.bufferedPrefix, on: agentConn)
+                    try await opened.pump { chunk in
+                        box.totalBytes += chunk.count
+                        if box.chat != nil {
+                            try? box.chat?.ingest(chunk)
+                        } else {
+                            box.responses?.ingest(chunk)
+                        }
+                        return true
+                    }
+                } catch {
+                    if !Task.isCancelled {
+                        Log.proxy("opencode (non-stream) upstream ended: \(error.localizedDescription)")
+                    }
+                    aggregateFailed = true
+                }
+
+                relayBytes = box.totalBytes
+                relayFailed = aggregateFailed
+
+                let json: [String: Any]?
+                if plan == .passthrough(native: .responses), let responsesAgg = box.responses {
+                    json = responsesAgg.responseObject(requestModel: requestModel)
+                } else if let chatAgg = box.chat {
+                    json = plan == .responsesToChat
+                        ? chatAgg.responsesObject(requestModel: requestModel)
+                        : chatAgg.completionJSON(requestModel: requestModel)
+                } else {
+                    json = nil
+                }
+
+                if aggregateFailed || json == nil {
+                    statusCodeForMetadata = nil
+                    self.sendError(
+                        to: originalConnection, statusCode: 502,
+                        message: "opencode upstream stream ended before completion.")
+                } else {
+                    let bodyBytes = (try? JSONSerialization.data(withJSONObject: json!))
+                        ?? Data("{\"error\":\"failed to serialize completion\"}".utf8)
+                    let head = "HTTP/1.1 200 OK\r\n"
+                        + "Content-Type: application/json\r\n"
+                        + "Content-Length: \(bodyBytes.count)\r\n"
+                        + "Cache-Control: no-cache\r\n"
+                        + "Connection: close\r\n\r\n"
+                    // Head then body, awaiting each so ordering holds
+                    // (NWConnection doesn't guarantee it across overlapping
+                    // sends).
+                    try? await Self.sendToAgent(Data(head.utf8), on: originalConnection)
+                    try? await Self.sendToAgent(bodyBytes, on: originalConnection)
+                    relayBytes += bodyBytes.count
+                }
+
+                originalConnection.send(content: nil, isComplete: true, completion: .contentProcessed { _ in
+                    originalConnection.cancel()
+                })
+            } else if is2xx && plan == .responsesToChat {
+                // --- Translated streaming (ADR 0021): the upstream is Chat
+                // Completions SSE, the client speaks Responses. Translate
+                // through `QoderResponsesAdapter` (verified decoupled from
+                // Qoder envelope internals; skips [DONE]; `finish()`
+                // synthesizes the Responses terminals). A mid-stream failure
+                // after the 200 head can't change the status — emit a
+                // Responses-shaped terminal error event (ADR 0010 precedent;
+                // a chat-shaped frame would be malformed on this stream).
+                let responseHead = "HTTP/1.1 200 OK\r\n"
+                    + "Content-Type: text/event-stream\r\n"
+                    + "Cache-Control: no-cache\r\n"
+                    + "Connection: close\r\n\r\n"
+                do {
+                    try await Self.sendToAgent(Data(responseHead.utf8), on: originalConnection)
                 } catch {
                     opened.cancel()
                     return
                 }
-            }
-            do {
-                try await opened.pump { chunk in
-                    box.totalBytes += chunk.count
-                    do {
-                        try await Self.sendToAgent(chunk, on: agentConn)
-                    } catch {
-                        return false  // agent went away — stop pumping cleanly
-                    }
-                    return true
-                }
-            } catch {
-                if !Task.isCancelled {
-                    // Mid-stream transport drop: record, don't fabricate.
-                    box.failed = true
-                    sentStatusCode = nil
-                    Log.proxy("opencode upstream stream ended: \(error.localizedDescription)")
-                }
-            }
 
-            // Close the agent socket (Connection: close).
-            originalConnection.send(content: nil, isComplete: true, completion: .contentProcessed { _ in
-                originalConnection.cancel()
-            })
+                final class TranslateBox: @unchecked Sendable {
+                    // Value type behind a reference holder — copy out,
+                    // mutate, write back (same in/out mechanics as the
+                    // Qoder ReparserBox).
+                    var adapter: QoderResponsesAdapter
+                    var totalBytes = 0
+                    var failed = false
+                    init(_ adapter: QoderResponsesAdapter) { self.adapter = adapter }
+                }
+                let box = TranslateBox(QoderResponsesAdapter(model: requestModel))
+
+                // bufferedPrefix (chat-surface bytes) flows through the
+                // adapter like any other chunk. Always empty today (no
+                // pre-handoff peek) — handled for parity.
+                if !opened.bufferedPrefix.isEmpty {
+                    box.totalBytes += opened.bufferedPrefix.count
+                    var adapter = box.adapter
+                    let events = (try? adapter.ingest(opened.bufferedPrefix)) ?? Data()
+                    box.adapter = adapter
+                    if !events.isEmpty {
+                        try? await Self.sendToAgent(events, on: originalConnection)
+                    }
+                }
+
+                do {
+                    try await opened.pump { chunk in
+                        box.totalBytes += chunk.count
+                        var adapter = box.adapter
+                        let events = (try? adapter.ingest(chunk)) ?? Data()
+                        box.adapter = adapter
+                        guard !events.isEmpty else { return true }
+                        do {
+                            try await Self.sendToAgent(events, on: originalConnection)
+                            return true
+                        } catch {
+                            return false   // agent went away — stop pumping
+                        }
+                    }
+                } catch {
+                    if !Task.isCancelled {
+                        box.failed = true
+                        statusCodeForMetadata = nil
+                        Log.proxy("opencode (translated) upstream stream ended: \(error.localizedDescription)")
+                    }
+                }
+
+                if box.failed {
+                    var adapter = box.adapter
+                    let frame = adapter.errorEvent(
+                        message: "opencode upstream stream ended before completion.")
+                    box.adapter = adapter
+                    _ = try? await Self.sendToAgent(frame, on: originalConnection)
+                } else {
+                    var adapter = box.adapter
+                    let terminal = (try? adapter.finish()) ?? Data()
+                    box.adapter = adapter
+                    if !terminal.isEmpty {
+                        try? await Self.sendToAgent(terminal, on: originalConnection)
+                    }
+                }
+                relayBytes = box.totalBytes
+                relayFailed = box.failed
+
+                originalConnection.send(content: nil, isComplete: true, completion: .contentProcessed { _ in
+                    originalConnection.cancel()
+                })
+            } else {
+                // --- Verbatim relay: same-surface streaming, and every
+                // non-2xx upstream status. The agent sees upstream's own
+                // status/headers/body exactly (ADR 0020/0021) — for the
+                // translated arm this includes error bodies, whose OpenAI
+                // `{"error":{…}}` envelope is shared across both surfaces.
+                let reason = HTTPURLResponse.localizedString(forStatusCode: opened.status)
+                var head = "HTTP/1.1 \(opened.status) \(reason)\r\n"
+                let hopByHop: Set<String> = [
+                    "connection", "transfer-encoding", "content-length", "keep-alive"
+                ]
+                for (name, value) in opened.headers where !hopByHop.contains(name.lowercased()) {
+                    head += "\(name): \(value)\r\n"
+                }
+                head += "Connection: close\r\n\r\n"
+
+                let agentConn = originalConnection
+                do {
+                    try await Self.sendToAgent(Data(head.utf8), on: agentConn)
+                } catch {
+                    // Agent socket died before any byte shipped — tear down the
+                    // still-open upstream task explicitly (pump's defer only
+                    // runs once pumping begins).
+                    opened.cancel()
+                    return
+                }
+
+                // Sendable holder for pump-closure accounting (same final-class
+                // pattern as the Qoder branch).
+                final class StreamBox: @unchecked Sendable {
+                    var totalBytes = 0
+                    var failed = false
+                }
+                let box = StreamBox()
+
+                // Replay any router-buffered prefix, then pump the remaining
+                // upstream bytes RAW — no SSE reparsing. A failed send to the
+                // agent stops the pump; a failed upstream pull truncates the
+                // agent response like a real opencode client sees.
+                if !opened.bufferedPrefix.isEmpty {
+                    box.totalBytes += opened.bufferedPrefix.count
+                    do {
+                        try await Self.sendToAgent(opened.bufferedPrefix, on: agentConn)
+                    } catch {
+                        opened.cancel()
+                        return
+                    }
+                }
+                do {
+                    try await opened.pump { chunk in
+                        box.totalBytes += chunk.count
+                        do {
+                            try await Self.sendToAgent(chunk, on: agentConn)
+                        } catch {
+                            return false  // agent went away — stop pumping cleanly
+                        }
+                        return true
+                    }
+                } catch {
+                    if !Task.isCancelled {
+                        // Mid-stream transport drop: record, don't fabricate.
+                        box.failed = true
+                        statusCodeForMetadata = nil
+                        Log.proxy("opencode upstream stream ended: \(error.localizedDescription)")
+                    }
+                }
+                relayBytes = box.totalBytes
+                relayFailed = box.failed
+
+                // Close the agent socket (Connection: close).
+                originalConnection.send(content: nil, isComplete: true, completion: .contentProcessed { _ in
+                    originalConnection.cancel()
+                })
+            }
 
             let durationMs = Int(Date().timeIntervalSince(startTime) * 1000)
             let finalMetadata = RequestMetadata(
@@ -2298,10 +2487,10 @@ final class ProxyBridge {
                 model: requestModel,
                 resolvedModel: requestModel,
                 resolvedProvider: "opencode",
-                statusCode: box.failed ? nil : sentStatusCode,
+                statusCode: relayFailed ? nil : statusCodeForMetadata,
                 durationMs: durationMs,
                 requestSize: requestSize,
-                responseSize: box.totalBytes,
+                responseSize: relayBytes,
                 fallbackAttempts: [],
                 fallbackStartedFromCache: false,
                 responseSnippet: nil

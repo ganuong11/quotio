@@ -3,13 +3,23 @@
 //  Quotio
 //
 //  Account-aware upstream router for the `opencode/` branch — the sibling
-//  of `QoderFailoverRouter`, simplified to a byte-faithful pass-through.
-//  Where the Qoder router returns only confirmed-2xx streams, this router
-//  returns whatever status upstream produced: 401 → rotate to the next
-//  account, 429 → cooldown + rotate, transport failure → next account, and
-//  every other HTTP status (2xx, 400, 403, 5xx) is handed back verbatim for
-//  ProxyBridge to forward — rotating can't fix a request-level rejection,
-//  and upstream's own error body is the most client-faithful answer.
+//  of `QoderFailoverRouter`, simplified to a byte-faithful pass-through on
+//  the same-surface arm. Where the Qoder router returns only confirmed-2xx
+//  streams, this router returns whatever status upstream produced: 401 →
+//  rotate to the next account, 429 → cooldown + rotate, transport failure →
+//  next account, and every other HTTP status (2xx, 400, 403, 5xx) is handed
+//  back verbatim for ProxyBridge to forward — rotating can't fix a
+//  request-level rejection, and upstream's own error body is the most
+//  client-faithful answer.
+//
+//  Surface dispatch (ADR 0021): each request targets the model's NATIVE
+//  upstream surface, resolved from the catalog's models.dev npm mapping.
+//  Same-surface requests pass through byte-faithful; a Responses-speaking
+//  client on a chat-native model gets its body translated via
+//  `OpencodeProtocolMapper` and its stream translated back in ProxyBridge
+//  (reusing the Qoder responses adapter). The reverse direction and the
+//  non-OpenAI native surfaces are refused with 422 `unsupported_surface`
+//  before any account work — they cannot be served yet.
 //
 //  Credential policy (spec §Credentials):
 //    - Quotio-managed (vault) credentials may be refreshed with the console
@@ -38,6 +48,13 @@ nonisolated enum OpencodeRouterError: Error, LocalizedError, Equatable {
     /// Defensive: `processRequest` normally 503s on an empty catalog before
     /// reaching the router.
     case catalogUnavailable
+    /// The model's native surface can't be served on the requested client
+    /// surface (ADR 0021) — chat client × responses-native model (reverse
+    /// translator pending), or a `messages`/`gemini`/`mistral`-native model.
+    case unsupportedSurface(model: String, surface: OpencodeSurface)
+    /// The request itself can't be translated (e.g. Responses server-side
+    /// conversation state) — 400, the client must resend differently.
+    case unsupportedRequest(String)
     /// Transport-level failure summary; status + short detail, never tokens.
     case upstream(Int, String)
 
@@ -45,6 +62,8 @@ nonisolated enum OpencodeRouterError: Error, LocalizedError, Equatable {
         switch self {
         case .noAccountsAvailable, .catalogUnavailable: return 503
         case .allAccountsCoolingDown: return 429
+        case .unsupportedSurface: return 422
+        case .unsupportedRequest: return 400
         case .upstream(let status, _): return status > 0 ? status : 503
         }
     }
@@ -52,7 +71,7 @@ nonisolated enum OpencodeRouterError: Error, LocalizedError, Equatable {
     var retryAfterSeconds: Int? {
         switch self {
         case .allAccountsCoolingDown(let seconds): return max(1, Int(ceil(seconds)))
-        case .noAccountsAvailable, .catalogUnavailable, .upstream: return nil
+        default: return nil
         }
     }
 
@@ -64,10 +83,33 @@ nonisolated enum OpencodeRouterError: Error, LocalizedError, Equatable {
             return "All opencode accounts are rate-limited; retry after \(Int(ceil(seconds)))s."
         case .catalogUnavailable:
             return "opencode free-model catalog unavailable."
+        case .unsupportedSurface(let model, let surface):
+            let required: String
+            switch surface {
+            case .responses: required = "/v1/responses"
+            case .messages: required = "/v1/messages (not served)"
+            case .gemini, .mistral: required = "a non-OpenAI surface (not served)"
+            case .chat: required = "/v1/chat/completions"
+            }
+            return "Model '\(model)' requires the \(required) surface, which this request cannot use."
+        case .unsupportedRequest(let detail):
+            return detail
         case .upstream(let status, let detail):
             return "opencode upstream error (\(status)): \(detail)"
         }
     }
+}
+
+/// How `open` decided to serve a request (ADR 0021). ProxyBridge reads the
+/// plan off the opened stream to pick its relay mode without re-deriving it.
+nonisolated enum OpencodeDispatchPlan: Equatable, Sendable {
+    /// Client surface == native surface — upstream bytes relay verbatim
+    /// (streaming) or fold into the client's own surface (non-streaming).
+    case passthrough(native: OpencodeSurface)
+    /// Client speaks Responses, model is chat-native: request translated by
+    /// `OpencodeProtocolMapper`, upstream is Chat Completions, the stream is
+    /// translated back to Responses events in ProxyBridge.
+    case responsesToChat
 }
 
 /// Per-chunk callback handed to a stream `pump` — same contract as
@@ -76,10 +118,12 @@ typealias OpencodeChunkReceiver = @Sendable (Data) async throws -> Bool
 
 /// The stream the router hands back. Unlike `QoderOpenedStream`, the
 /// response is NOT 2xx-by-construction: `status` and `headers` carry the
-/// verbatim upstream response for ProxyBridge to forward.
+/// verbatim upstream response for ProxyBridge to forward. `plan` tells the
+/// bridge which relay mode serves the request (ADR 0021).
 nonisolated struct OpencodeOpenedStream: Sendable {
     let status: Int
     let headers: [(String, String)]
+    let plan: OpencodeDispatchPlan
     /// Bytes the router already consumed before handing off — currently
     /// always empty (no pre-handoff peek; kept for parity with the Qoder
     /// shape in case a peek is ever needed).
@@ -160,11 +204,51 @@ actor OpencodeRouter {
     }
 
     /// Open an upstream stream for a gated request, rotating across
-    /// accounts per the policy in the header comment.
+    /// accounts per the policy in the header comment. Surface dispatch
+    /// (ADR 0021) happens before any account work: the model's native
+    /// surface decides the upstream URL and, when it differs from the
+    /// client's surface, the request body is translated first.
     func open(requestBody: Data, route: OpencodeRoute) async throws -> OpencodeOpenedStream {
         if catalog.isEmpty { throw OpencodeRouterError.catalogUnavailable }
 
-        let upstreamBody = Self.shapeUpstreamBody(from: requestBody)
+        let strippedModel = Self.strippedModel(in: requestBody)
+        let nativeSurface = catalog.surface(for: strippedModel)
+        let clientStreams = Self.streamRequested(in: requestBody)
+
+        let plan: OpencodeDispatchPlan
+        let bodyForShaping: Data
+        switch (route, nativeSurface) {
+        case (.chat, .chat), (.responses, .responses):
+            plan = .passthrough(native: nativeSurface)
+            bodyForShaping = requestBody
+        case (.responses, .chat):
+            plan = .responsesToChat
+            do {
+                bodyForShaping = try OpencodeProtocolMapper.responsesRequestToChat(requestBody)
+            } catch {
+                // Both mapper errors (stateful conversation) and the reused
+                // translator's malformed-request diagnostics are the
+                // client's to fix — 400, not an upstream-flavored 502.
+                throw OpencodeRouterError.unsupportedRequest(
+                    (error as? LocalizedError)?.errorDescription
+                        ?? "request could not be translated to the chat completions surface.")
+            }
+        case (.chat, .responses):
+            // Reverse translator pending (plan Phase 2b decision point).
+            throw OpencodeRouterError.unsupportedSurface(model: strippedModel, surface: .responses)
+        default:
+            // messages/gemini/mistral-native — no client-facing surface.
+            throw OpencodeRouterError.unsupportedSurface(model: strippedModel, surface: nativeSurface)
+        }
+
+        // Usage the upstream must emit: a Responses client always expects it
+        // on response.completed, and aggregation needs it for stream:false —
+        // the chat surface only streams usage when asked (issue #19 rule).
+        let upstreamBody = Self.shapeUpstreamBody(
+            from: bodyForShaping,
+            target: nativeSurface,
+            includeUsage: route == .responses || !clientStreams)
+
         let candidates = await self.candidates()
         guard !candidates.isEmpty else { throw exhaustionError() }
 
@@ -182,7 +266,7 @@ actor OpencodeRouter {
         guard !resolved.isEmpty else { throw exhaustionError() }
 
         for (candidate, credential) in resolved {
-            let url = Self.inferenceURL(route: route, server: credential.server)
+            let url = Self.inferenceURL(surface: nativeSurface, server: credential.server)
             let headers = Self.upstreamHeaders(token: credential.token, orgID: credential.orgID)
             let stream: OpencodeUpstreamStream
             do {
@@ -207,7 +291,7 @@ actor OpencodeRouter {
                             setCooldown(candidate)
                             continue
                         default:
-                            return openedStream(retry)
+                            return openedStream(retry, plan: plan)
                         }
                     }
                     // Store has nothing better to offer (same token,
@@ -220,7 +304,7 @@ actor OpencodeRouter {
                 setCooldown(candidate)
                 continue
             default:
-                return openedStream(stream)
+                return openedStream(stream, plan: plan)
             }
         }
         throw exhaustionError()
@@ -406,11 +490,14 @@ actor OpencodeRouter {
 
     // MARK: - Stream handoff
 
-    private func openedStream(_ stream: OpencodeUpstreamStream) -> OpencodeOpenedStream {
+    private func openedStream(
+        _ stream: OpencodeUpstreamStream, plan: OpencodeDispatchPlan
+    ) -> OpencodeOpenedStream {
         let streamRef = stream
         return OpencodeOpenedStream(
             status: stream.status,
             headers: stream.headers,
+            plan: plan,
             bufferedPrefix: Data(),
             pump: { onChunk in
                 defer { streamRef.cancel() }
@@ -426,9 +513,12 @@ actor OpencodeRouter {
 
     // MARK: - Request shaping (pure)
 
-    /// `<origin of credential.server>/inference` + the surface the client
-    /// requested — forwarded verbatim, per spec §Routing.
-    nonisolated static func inferenceURL(route: OpencodeRoute, server: String) -> URL {
+    /// `<origin of credential.server>/inference` + the model's NATIVE
+    /// surface path (ADR 0021 — the client's requested surface decides the
+    /// wire protocol we speak to the agent, not the upstream URL).
+    /// `messages` is the Phase 5 seam (unreachable today: dispatch 422s
+    /// messages-native models first); gemini/mistral share the chat path.
+    nonisolated static func inferenceURL(surface: OpencodeSurface, server: String) -> URL {
         let origin: String
         if let components = URLComponents(string: server), let scheme = components.scheme {
             var rebuilt = "\(scheme)://\(components.host ?? "opencode.ai")"
@@ -437,8 +527,13 @@ actor OpencodeRouter {
         } else {
             origin = "https://opencode.ai"
         }
-        let surface = route == .responses ? "/v1/responses" : "/v1/chat/completions"
-        return URL(string: origin + "/inference" + surface)!
+        let path: String
+        switch surface {
+        case .responses: path = "/v1/responses"
+        case .messages: path = "/v1/messages"
+        case .chat, .gemini, .mistral: path = "/v1/chat/completions"
+        }
+        return URL(string: origin + "/inference" + path)!
     }
 
     /// Header set proven by the Task 0 spike: the released client's UA and
@@ -457,36 +552,184 @@ actor OpencodeRouter {
         return headers
     }
 
-    /// Official `read` tool definition in OpenAI function shape — verified
-    /// live (fix pass): this shape returns 200 from the free-tier gate, the
-    /// bare `{"name","parameters"}` shape returns a 400 param error, and a
-    /// body with no `read` tool returns a 403 FreeTierError. Rebuilt per
-    /// call — `[String: Any]` isn't Sendable, so a shared static let would
-    /// be a strict-concurrency violation.
-    private nonisolated static func readToolDefinition() -> [String: Any] {
-        [
-            "type": "function",
-            "function": [
-                "name": "read",
-                "description": "Reads a file from the local filesystem.",
-                "parameters": [
-                    "type": "object",
-                    "properties": ["filePath": ["type": "string"]],
-                    "required": ["filePath"]
-                ]
-            ]
-        ]
+    /// The request's `model` with the `opencode/` routing prefix stripped —
+    /// the id the catalog knows. Empty when unparseable (the route gate has
+    /// already required a parseable model by this point).
+    nonisolated static func strippedModel(in body: Data) -> String {
+        guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let model = json["model"] as? String else { return "" }
+        return model.hasPrefix(OpencodeRouteGate.opencodePrefix)
+            ? String(model.dropFirst(OpencodeRouteGate.opencodePrefix.count)) : model
     }
 
-    /// Shape the client body into what a real opencode client sends:
-    /// strip the `opencode/` routing prefix from `model`, force
-    /// `stream: true`, and ensure a `read` tool is present. The Task 0
-    /// spike proved the free-tier gate 403s `stream:false` and bodies
-    /// lacking a `read` tool — "indistinguishable from a real opencode
-    /// client" means sending both, since the released client always does.
-    /// Falls back to the original body on any parse failure (the route
-    /// gate already required a parseable model).
-    private nonisolated static func shapeUpstreamBody(from body: Data) -> Data {
+    /// Whether the CLIENT asked to stream (`stream == true`; OpenAI's spec
+    /// default is false). The upstream is always streamed — the free-tier
+    /// gate 403s `stream:false` — so this only decides how ProxyBridge
+    /// serves the agent: relay SSE verbatim or aggregate into one body.
+    nonisolated static func streamRequested(in body: Data) -> Bool {
+        guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let stream = json["stream"] as? Bool else { return false }
+        return stream
+    }
+
+    /// Real opencode parameter schemas for the six tool names the free-tier
+    /// gate inspects — hand-derived from `sst/opencode` tag `v1.18.30`
+    /// (`packages/opencode/src/tool/{read,shell,write,edit,glob,grep}.ts`;
+    /// the shell tool's exposed ID stays "bash" until 2.0). The gate 403s
+    /// gated-named tools whose `parameters.properties` is missing/empty;
+    /// degenerate client definitions are substituted with these so the body
+    /// matches a real client's. Rebuilt per call — `[String: Any]` isn't
+    /// Sendable. Bump together with `clientUserAgent`.
+    private nonisolated static func gatedToolSchema(name: String) -> [String: Any]? {
+        switch name {
+        case "read":
+            return [
+                "type": "object",
+                "properties": [
+                    "filePath": [
+                        "type": "string",
+                        "description": "The absolute path to the file or directory to read",
+                    ],
+                    "offset": [
+                        "type": "integer",
+                        "description": "The line number to start reading from (1-indexed)",
+                    ],
+                    "limit": [
+                        "type": "integer",
+                        "description": "The maximum number of lines to read (defaults to 2000)",
+                    ],
+                ],
+                "required": ["filePath"],
+            ]
+        case "bash":
+            return [
+                "type": "object",
+                "properties": [
+                    "command": ["type": "string", "description": "The command to execute"],
+                    "timeout": ["type": "integer", "description": "Optional timeout in milliseconds"],
+                    "workdir": [
+                        "type": "string",
+                        "description": "The working directory to run the command in. "
+                            + "Defaults to the current directory. Use this instead of 'cd' commands.",
+                    ],
+                ],
+                "required": ["command"],
+            ]
+        case "write":
+            return [
+                "type": "object",
+                "properties": [
+                    "content": ["type": "string", "description": "The content to write to the file"],
+                    "filePath": [
+                        "type": "string",
+                        "description": "The absolute path to the file to write to "
+                            + "(must be absolute, not relative)",
+                    ],
+                ],
+                "required": ["content", "filePath"],
+            ]
+        case "edit":
+            return [
+                "type": "object",
+                "properties": [
+                    "filePath": [
+                        "type": "string",
+                        "description": "The absolute path to the file to modify",
+                    ],
+                    "oldString": ["type": "string", "description": "The text to replace"],
+                    "newString": [
+                        "type": "string",
+                        "description": "The text to replace it with (must be different from oldString)",
+                    ],
+                    "replaceAll": [
+                        "type": "boolean",
+                        "description": "Replace all occurrences of oldString (default false)",
+                    ],
+                ],
+                "required": ["filePath", "oldString", "newString"],
+            ]
+        case "glob":
+            return [
+                "type": "object",
+                "properties": [
+                    "pattern": [
+                        "type": "string",
+                        "description": "The glob pattern to match files against",
+                    ],
+                    "path": [
+                        "type": "string",
+                        "description": "The directory to search in. If not specified, "
+                            + "the current working directory will be used.",
+                    ],
+                ],
+                "required": ["pattern"],
+            ]
+        case "grep":
+            return [
+                "type": "object",
+                "properties": [
+                    "pattern": [
+                        "type": "string",
+                        "description": "The regex pattern to search for in file contents",
+                    ],
+                    "path": [
+                        "type": "string",
+                        "description": "The directory to search in. Defaults to the current "
+                            + "working directory.",
+                    ],
+                    "include": [
+                        "type": "string",
+                        "description": "File pattern to include in the search "
+                            + "(e.g. \"*.js\", \"*.{ts,tsx}\")",
+                    ],
+                ],
+                "required": ["pattern"],
+            ]
+        default:
+            return nil
+        }
+    }
+
+    /// Injected `read` tool in the TARGET surface's shape — verified live
+    /// (fix pass): the free-tier gate 403s bodies without a `read` tool and
+    /// 400s the wrong tool envelope for the surface (chat nests under
+    /// `function`, responses is flat). Rebuilt per call (Sendable, same as
+    /// the schemas).
+    private nonisolated static func readToolDefinition(target: OpencodeSurface) -> [String: Any] {
+        let parameters = gatedToolSchema(name: "read")!
+        let description = "Read a file or directory from the local filesystem."
+        switch target {
+        case .responses:
+            return [
+                "type": "function",
+                "name": "read",
+                "description": description,
+                "parameters": parameters,
+            ]
+        case .chat, .messages, .gemini, .mistral:
+            return [
+                "type": "function",
+                "function": [
+                    "name": "read",
+                    "description": description,
+                    "parameters": parameters,
+                ],
+            ]
+        }
+    }
+
+    /// Shape the (possibly translated) body into what a real opencode client
+    /// sends on the TARGET surface: strip the `opencode/` routing prefix
+    /// from `model`, force `stream: true` (the gate 403s `stream:false`),
+    /// optionally request upstream usage (a Responses client always expects
+    /// it and aggregation needs it — the chat surface only emits usage when
+    /// asked), normalize gated-named tools whose schema is degenerate, and
+    /// ensure a `read` tool is present in the surface's shape. Falls back
+    /// to the given body on any parse failure (the route gate already
+    /// required a parseable model).
+    private nonisolated static func shapeUpstreamBody(
+        from body: Data, target: OpencodeSurface, includeUsage: Bool
+    ) -> Data {
         guard var json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
             return body
         }
@@ -495,15 +738,52 @@ actor OpencodeRouter {
             json["model"] = String(model.dropFirst(OpencodeRouteGate.opencodePrefix.count))
         }
         json["stream"] = true
+        if includeUsage, target == .chat {
+            var options = (json["stream_options"] as? [String: Any]) ?? [:]
+            options["include_usage"] = true
+            json["stream_options"] = options
+        }
         var tools = (json["tools"] as? [Any]) ?? []
+        normalizeGatedToolSchemas(&tools)
         let hasRead = tools.contains { entry in
             guard let tool = entry as? [String: Any] else { return false }
             return (tool["name"] as? String) == "read"
                 || ((tool["function"] as? [String: Any])?["name"] as? String) == "read"
         }
-        if !hasRead { tools.append(readToolDefinition()) }
+        if !hasRead { tools.append(readToolDefinition(target: target)) }
         json["tools"] = tools
         return (try? JSONSerialization.data(withJSONObject: json)) ?? body
+    }
+
+    /// Free-tier gate conformance (ADR 0021 plan, Phase 3): a tool whose
+    /// resolved name is one of the six gated names and whose parameters are
+    /// missing or empty gets the real opencode schema substituted — the
+    /// gate 403s such definitions from non-opencode clients. Client tools
+    /// with real schemas (and unknown names) pass untouched. Both wire
+    /// shapes are handled: chat (`function` nesting) and responses (flat).
+    private nonisolated static func normalizeGatedToolSchemas(_ tools: inout [Any]) {
+        for index in tools.indices {
+            guard var tool = tools[index] as? [String: Any] else { continue }
+            if var function = tool["function"] as? [String: Any],
+               let name = function["name"] as? String,
+               let schema = gatedToolSchema(name: name),
+               schemaIsDegenerate(function["parameters"]) {
+                function["parameters"] = schema
+                tool["function"] = function
+                tools[index] = tool
+            } else if let name = tool["name"] as? String,
+                      let schema = gatedToolSchema(name: name),
+                      schemaIsDegenerate(tool["parameters"]) {
+                tool["parameters"] = schema
+                tools[index] = tool
+            }
+        }
+    }
+
+    /// Missing parameters or an empty `properties` map — what the gate 403s.
+    private nonisolated static func schemaIsDegenerate(_ raw: Any?) -> Bool {
+        guard let parameters = raw as? [String: Any] else { return true }
+        return (parameters["properties"] as? [String: Any] ?? [:]).isEmpty
     }
 }
 

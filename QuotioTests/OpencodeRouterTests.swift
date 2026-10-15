@@ -79,9 +79,20 @@ final class OpencodeRouterTests: XCTestCase {
         tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         catalog = OpencodeModelCatalog(session: StubURLProtocol.makeSession(), storageDirectory: tempDir)
-        // populate the free set so the defensive catalog check passes
-        let snapshot = Data(#"{"fetchedAt":756000000,"models":[{"id":"big-pickle","displayName":"Big Pickle"}]}"#.utf8)
-        try snapshot.write(to: tempDir.appendingPathComponent("catalog-v1.json"))
+        // Populate the free set with one model per surface kind so the
+        // defensive catalog check passes and dispatch has real surfaces:
+        // big-pickle = chat-native (the default/legacy fixture model),
+        // muse-spark = responses-native, the rest = unservable-native.
+        let snapshot = try JSONSerialization.data(withJSONObject: [
+            "fetchedAt": 756_000_000,
+            "models": [
+                ["id": "big-pickle", "displayName": "Big Pickle", "surface": "chat"],
+                ["id": "muse-spark-1.3-contributor-free", "displayName": "Muse Spark", "surface": "responses"],
+                ["id": "anthropic-free-x", "displayName": "Anthropic X", "surface": "messages"],
+                ["id": "gemini-free-x", "displayName": "Gemini X", "surface": "gemini"],
+            ],
+        ])
+        try snapshot.write(to: tempDir.appendingPathComponent("catalog-v2.json"))
         await catalog.loadPersisted()
         store = InMemoryCredentialStore()
         upstream = MockUpstream()
@@ -157,13 +168,236 @@ final class OpencodeRouterTests: XCTestCase {
         XCTAssertEqual(json["model"] as? String, "big-pickle")
     }
 
-    func testResponsesRouteURL() async throws {
+    // MARK: - Surface dispatch (ADR 0021)
+
+    /// A Responses-speaking client on a chat-native model (2a): the request
+    /// is translated to Chat Completions, posted to the chat surface, and
+    /// the opened stream carries the translation plan for ProxyBridge.
+    func testResponsesClientOnChatModelTranslatesToChatSurface() async throws {
         await seedVaultAccount()
-                await upstream.seed(.success(cannedStream(status: 200, body: "ok")))
+        await upstream.seed(.success(cannedStream(status: 200, body: "ok")))
         let router = makeRouter()
-        _ = try await router.open(requestBody: chatBody, route: .responses)
-        let responseCalls = await upstream.calls
-        XCTAssertEqual(responseCalls.first?.url, "https://opencode.ai/inference/v1/responses")
+        let responsesBody = Data(#"{"model":"opencode/big-pickle","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"stream":true}"#.utf8)
+        let opened = try await router.open(requestBody: responsesBody, route: .responses)
+        XCTAssertEqual(opened.plan, .responsesToChat)
+
+        let calls = await upstream.calls
+        let call = try XCTUnwrap(calls.first)
+        XCTAssertEqual(call.url, "https://opencode.ai/inference/v1/chat/completions")
+        // The upstream body is Chat-shaped: messages (not input), forced
+        // stream:true, a chat-shape read tool, and include_usage (Responses
+        // clients always expect usage on response.completed).
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: call.body) as? [String: Any])
+        XCTAssertEqual(json["stream"] as? Bool, true)
+        XCTAssertNotNil(json["messages"] as? [[String: Any]])
+        XCTAssertNil(json["input"])
+        XCTAssertEqual((json["stream_options"] as? [String: Any])?["include_usage"] as? Bool, true)
+        let tools = try XCTUnwrap(json["tools"] as? [[String: Any]])
+        XCTAssertTrue(tools.contains {
+            (($0["function"] as? [String: Any])?["name"] as? String) == "read"
+        }, "injected read tool must use the chat (nested) shape on the chat surface")
+    }
+
+    /// Responses-native passthrough: the URL keeps the responses surface and
+    /// the injected read tool uses the flat responses shape. `stream_options`
+    /// is NOT injected (that is a chat-surface-only knob).
+    func testResponsesNativeModelPassthroughUsesFlatReadTool() async throws {
+        await seedVaultAccount()
+        await upstream.seed(.success(cannedStream(status: 200, body: "ok")))
+        let router = makeRouter()
+        let body = Data(#"{"model":"opencode/muse-spark-1.3-contributor-free","input":"hi","stream":true}"#.utf8)
+        let opened = try await router.open(requestBody: body, route: .responses)
+        XCTAssertEqual(opened.plan, .passthrough(native: .responses))
+
+        let calls = await upstream.calls
+        let call = try XCTUnwrap(calls.first)
+        XCTAssertEqual(call.url, "https://opencode.ai/inference/v1/responses")
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: call.body) as? [String: Any])
+        XCTAssertNil(json["stream_options"])
+        let tools = try XCTUnwrap(json["tools"] as? [[String: Any]])
+        let read = try XCTUnwrap(tools.first { ($0["name"] as? String) == "read" })
+        XCTAssertNotNil(read["parameters"], "responses-shape read tool is flat: name/parameters at top level")
+        XCTAssertNil(read["function"])
+    }
+
+    /// Chat client × responses-native model: the reverse translator is a
+    /// pending decision point (plan Phase 2b) — explicit 422, no upstream
+    /// contact.
+    func testChatClientOnResponsesModelGets422() async throws {
+        await seedVaultAccount()
+        await upstream.seed(.success(cannedStream(status: 200, body: "ok")))
+        let router = makeRouter()
+        let body = Data(#"{"model":"opencode/muse-spark-1.3-contributor-free","messages":[]}"#.utf8)
+        await XCTAssertThrowsErrorAsync(try await router.open(requestBody: body, route: .chat)) { error in
+            XCTAssertEqual(
+                error as? OpencodeRouterError,
+                .unsupportedSurface(model: "muse-spark-1.3-contributor-free", surface: .responses))
+            XCTAssertEqual((error as? OpencodeRouterError)?.httpStatus, 422)
+        }
+        let calls = await upstream.calls
+        XCTAssertTrue(calls.isEmpty, "unsupported surface must not contact upstream")
+    }
+
+    /// messages/gemini/mistral-native models have no client-facing surface
+    /// at all — 422 before any account work.
+    func testUnservableNativeSurfacesGet422() async throws {
+        await seedVaultAccount()
+        await upstream.seed(.success(cannedStream(status: 200, body: "ok")))
+        let router = makeRouter()
+        for (model, surface) in [
+            ("anthropic-free-x", OpencodeSurface.messages),
+            ("gemini-free-x", OpencodeSurface.gemini),
+        ] {
+            let body = Data(#"{"model":"opencode/\#(model)","messages":[]}"#.utf8)
+            await XCTAssertThrowsErrorAsync(try await router.open(requestBody: body, route: .chat)) { error in
+                XCTAssertEqual(
+                    error as? OpencodeRouterError,
+                    .unsupportedSurface(model: model, surface: surface))
+            }
+        }
+        let calls = await upstream.calls
+        XCTAssertTrue(calls.isEmpty)
+    }
+
+    /// Responses server-side conversation state cannot cross to the
+    /// stateless chat surface — 400 with a clear message (ADR 0021), never
+    /// a silent drop of the whole conversation.
+    func testStatefulResponsesRequestIsRejected400() async throws {
+        await seedVaultAccount()
+        await upstream.seed(.success(cannedStream(status: 200, body: "ok")))
+        let router = makeRouter()
+        let body = Data(#"{"model":"opencode/big-pickle","previous_response_id":"resp_123","input":"hi"}"#.utf8)
+        await XCTAssertThrowsErrorAsync(try await router.open(requestBody: body, route: .responses)) { error in
+            let routerError = error as? OpencodeRouterError
+            XCTAssertEqual(routerError?.httpStatus, 400)
+            XCTAssertTrue(routerError?.errorDescription?.contains("previous_response_id") ?? false)
+        }
+        let calls = await upstream.calls
+        XCTAssertTrue(calls.isEmpty)
+    }
+
+    /// A malformed Responses body surfaces as 400 (the reused translator's
+    /// diagnostics), not an upstream-flavored 502.
+    func testMalformedResponsesBodyIs400() async throws {
+        await seedVaultAccount()
+        await upstream.seed(.success(cannedStream(status: 200, body: "ok")))
+        let router = makeRouter()
+        let body = Data(#"{"model":"opencode/big-pickle","input":42}"#.utf8)
+        await XCTAssertThrowsErrorAsync(try await router.open(requestBody: body, route: .responses)) { error in
+            XCTAssertEqual((error as? OpencodeRouterError)?.httpStatus, 400)
+        }
+        let calls = await upstream.calls
+        XCTAssertTrue(calls.isEmpty)
+    }
+
+    /// Non-streaming chat clients get `stream_options.include_usage`
+    /// injected — the aggregator needs the usage chunk (issue #19 rule).
+    /// Streaming chat clients are left alone (spec default: no usage chunk).
+    func testIncludeUsageInjectedOnlyWhenNeeded() async throws {
+        await seedVaultAccount()
+        await upstream.seed(.success(cannedStream(status: 200, body: "ok")))
+        await upstream.seed(.success(cannedStream(status: 200, body: "ok")))
+        let router = makeRouter()
+
+        // stream:false (and missing stream) → inject
+        let nonStream = Data(#"{"model":"opencode/big-pickle","messages":[],"stream":false}"#.utf8)
+        _ = try await router.open(requestBody: nonStream, route: .chat)
+        // stream:true → do not inject
+        let stream = Data(#"{"model":"opencode/big-pickle","messages":[],"stream":true}"#.utf8)
+        _ = try await router.open(requestBody: stream, route: .chat)
+
+        let calls = await upstream.calls
+        let first = try XCTUnwrap(JSONSerialization.jsonObject(with: calls[0].body) as? [String: Any])
+        XCTAssertEqual((first["stream_options"] as? [String: Any])?["include_usage"] as? Bool, true)
+        let second = try XCTUnwrap(JSONSerialization.jsonObject(with: calls[1].body) as? [String: Any])
+        XCTAssertNil(second["stream_options"])
+    }
+
+    /// Free-tier gate conformance (ADR 0021 Phase 3): gated tool names with
+    /// missing/empty `parameters.properties` get the real opencode schema
+    /// substituted; a client tool with real schema and unknown names pass
+    /// untouched.
+    func testGatedToolSchemasSubstitutedOnlyWhenDegenerate() async throws {
+        await seedVaultAccount()
+        await upstream.seed(.success(cannedStream(status: 200, body: "ok")))
+        let router = makeRouter()
+        let body = try JSONSerialization.data(withJSONObject: [
+            "model": "opencode/big-pickle",
+            "messages": [],
+            "stream": true,
+            "tools": [
+                // gated, empty properties → substitute
+                ["type": "function", "function": ["name": "bash", "parameters": ["type": "object"]]],
+                // gated, missing parameters → substitute
+                ["type": "function", "function": ["name": "write"]],
+                // gated, real schema → untouched
+                ["type": "function", "function": [
+                    "name": "read",
+                    "parameters": ["type": "object", "properties": ["custom": ["type": "string"]]],
+                ]],
+                // ungated → untouched
+                ["type": "function", "function": ["name": "my-tool", "parameters": ["type": "object"]]],
+            ],
+        ])
+        _ = try await router.open(requestBody: body, route: .chat)
+
+        let calls = await upstream.calls
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: calls[0].body) as? [String: Any])
+        let tools = try XCTUnwrap(json["tools"] as? [[String: Any]])
+        func tool(_ name: String) -> [String: Any]? {
+            tools.first { (($0["function"] as? [String: Any])?["name"] as? String) == name }
+        }
+        func properties(_ t: [String: Any]) -> [String: Any]? {
+            ((t["function"] as? [String: Any])?["parameters"] as? [String: Any])?["properties"] as? [String: Any]
+        }
+        // bash: substituted with the real schema (command required)
+        let bash = try XCTUnwrap(tool("bash"))
+        let bashProps = try XCTUnwrap(properties(bash))
+        XCTAssertNotNil(bashProps["command"])
+        XCTAssertEqual(
+            (((bash["function"] as? [String: Any])?["parameters"] as? [String: Any])?["required"] as? [String]),
+            ["command"])
+        // write: substituted (content + filePath required)
+        let write = try XCTUnwrap(tool("write"))
+        XCTAssertEqual(
+            (((write["function"] as? [String: Any])?["parameters"] as? [String: Any])?["required"] as? [String]),
+            ["content", "filePath"])
+        // read: client's own schema preserved
+        let read = try XCTUnwrap(tool("read"))
+        XCTAssertEqual(Array((properties(read) ?? [:]).keys), ["custom"])
+        // my-tool: untouched (still empty properties — the gate doesn't inspect it)
+        let mine = try XCTUnwrap(tool("my-tool"))
+        XCTAssertEqual(Array((properties(mine) ?? [:]).keys), [])
+        // exactly one read (the client's — no duplicate injection)
+        XCTAssertEqual(tools.filter { (($0["function"] as? [String: Any])?["name"] as? String) == "read" }.count, 1)
+    }
+
+    /// A pre-surface (v1) persisted snapshot decodes with surface nil and
+    /// resolves to `.chat` at lookup — the legacy-default window (ADR 0021).
+    func testLegacyV1SnapshotResolvesToChatSurface() async throws {
+        // Replace the v2 fixture with a surface-less v1 snapshot.
+        try FileManager.default.removeItem(at: tempDir.appendingPathComponent("catalog-v2.json"))
+        let legacy = Data(#"{"fetchedAt":756000000,"models":[{"id":"legacy-model","displayName":"Legacy"}]}"#.utf8)
+        try legacy.write(to: tempDir.appendingPathComponent("catalog-v1.json"))
+        let catalog2 = OpencodeModelCatalog(
+            session: StubURLProtocol.makeSession(), storageDirectory: tempDir)
+        await catalog2.loadPersisted()
+        XCTAssertEqual(catalog2.surface(for: "legacy-model"), .chat)
+
+        await seedVaultAccount()
+        await upstream.seed(.success(cannedStream(status: 200, body: "ok")))
+        let router = OpencodeRouter(
+            catalog: catalog2,
+            console: OpencodeConsoleClient(session: StubURLProtocol.makeSession()),
+            upstream: upstream,
+            vault: store,
+            metadata: MonitorMetadataStore(url: tempDir.appendingPathComponent("accounts-test.json")),
+            detectedSnapshot: { [] })
+        let body = Data(#"{"model":"opencode/legacy-model","messages":[],"stream":true}"#.utf8)
+        let opened = try await router.open(requestBody: body, route: .chat)
+        XCTAssertEqual(opened.plan, .passthrough(native: .chat))
+        let calls = await upstream.calls
+        XCTAssertEqual(calls.first?.url, "https://opencode.ai/inference/v1/chat/completions")
     }
 
     func testExpiredVaultCredentialRefreshedBeforeSend() async throws {

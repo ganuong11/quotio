@@ -8,17 +8,61 @@
 //      && status != "deprecated"
 //    − internal models that must never pass the route gate.
 //
+//  Each resolved model also carries its NATIVE upstream surface (ADR 0021),
+//  derived from models.dev npm metadata: per-model `provider.npm` override,
+//  else the provider-level `npm`, else chat. The router dispatches on it;
+//  `/v1/models` advertises only models servable on a client-facing surface.
+//
 //  The resolved set is readable synchronously off-actor (ProxyBridge's route
 //  gate is nonisolated) via an NSLock-protected box. Persisted snapshots let
 //  the gate work offline and through refresh failures: once populated, the
-//  list never empties.
+//  list never empties. v1 snapshots (pre-surface) decode with surface nil and
+//  resolve to `.chat` at lookup — a legacy-default window that the startup
+//  refresh closes in seconds.
 //
 
 import Foundation
 
+/// The upstream protocol surface a model is native to (ADR 0021). Only
+/// `chat` and `responses` have client-facing surfaces today; the others are
+/// refused with 422 `unsupported_surface` and never advertised.
+nonisolated enum OpencodeSurface: String, Sendable, Codable, Equatable {
+    case chat
+    case responses
+    case messages
+    case gemini
+    case mistral
+
+    /// models.dev `provider.npm` → surface. Unknown/missing → `chat`: the
+    /// provider-level default is `@ai-sdk/openai-compatible`, which is the
+    /// chat surface.
+    init(npm: String?) {
+        switch npm {
+        case "@ai-sdk/openai": self = .responses
+        case "@ai-sdk/anthropic": self = .messages
+        case "@ai-sdk/google": self = .gemini
+        case "@ai-sdk/mistral": self = .mistral
+        default: self = .chat
+        }
+    }
+
+    /// Whether Quotio can serve requests for a model with this native
+    /// surface (passthrough or translation). Drives `/v1/models` filtering.
+    var isServable: Bool { self == .chat || self == .responses }
+}
+
 nonisolated struct OpencodeFreeModel: Sendable, Equatable, Codable {
     let id: String
     let displayName: String?
+    /// Native upstream surface. Nil only for pre-ADR-0021 persisted snapshots
+    /// (resolved to `.chat` at lookup until the next refresh re-derives it).
+    let surface: OpencodeSurface?
+
+    init(id: String, displayName: String?, surface: OpencodeSurface? = nil) {
+        self.id = id
+        self.displayName = displayName
+        self.surface = surface
+    }
 }
 
 actor OpencodeModelCatalog {
@@ -41,18 +85,32 @@ actor OpencodeModelCatalog {
         private let lock = NSLock()
         private var _models: [OpencodeFreeModel] = []
         private var _ids: Set<String> = []
+        private var _surfaces: [String: OpencodeSurface] = [:]
 
         var models: [OpencodeFreeModel] { lock.withLock { _models } }
         var isEmpty: Bool { lock.withLock { _models.isEmpty } }
+        /// Models servable on a client-facing surface — the `/v1/models`
+        /// advertisement set (ADR 0021: never advertise what we can't serve).
+        var advertisedModels: [OpencodeFreeModel] {
+            lock.withLock { _models.filter { ($0.surface ?? .chat).isServable } }
+        }
 
         func set(_ models: [OpencodeFreeModel]) {
             lock.withLock {
                 _models = models
                 _ids = Set(models.map(\.id))
+                _surfaces = Dictionary(uniqueKeysWithValues: models.map {
+                    ($0.id, $0.surface ?? .chat)
+                })
             }
         }
 
         func contains(_ id: String) -> Bool { lock.withLock { _ids.contains(id) } }
+        /// Native surface for a model id; `.chat` when unknown or when the
+        /// entry predates surface capture (legacy snapshot default).
+        func surface(_ id: String) -> OpencodeSurface {
+            lock.withLock { _surfaces[id] ?? .chat }
+        }
     }
 
     struct ModelsDevSnapshot: Codable {
@@ -61,7 +119,13 @@ actor OpencodeModelCatalog {
             let status: String?
             let costInput: Double?
             let costOutput: Double?
+            /// Per-model `provider.npm` override (ADR 0021 surface source).
+            /// Nil on pre-surface caches and on models without an override.
+            let npm: String?
         }
+        /// Provider-level `npm` fallback. Optional so pre-surface caches
+        /// (which lack the field) still decode.
+        var providerNpm: String?
         var fetchedAt: Date
         var entries: [String: Entry]
     }
@@ -90,12 +154,18 @@ actor OpencodeModelCatalog {
     // MARK: - synchronous route-gate surface
 
     nonisolated var models: [OpencodeFreeModel] { box.models }
+    nonisolated var advertisedModels: [OpencodeFreeModel] { box.advertisedModels }
     nonisolated var isEmpty: Bool { box.isEmpty }
     nonisolated func isFree(_ modelID: String) -> Bool { box.contains(modelID) }
+    nonisolated func surface(for modelID: String) -> OpencodeSurface { box.surface(modelID) }
 
     // MARK: - refresh
 
-    private var catalogURL: URL { storageDirectory.appendingPathComponent("catalog-v1.json") }
+    /// v2 carries per-model surfaces (ADR 0021). v1 files are still read as
+    /// an upgrade fallback — their entries decode surface-less and resolve
+    /// to `.chat` until the first refresh.
+    private var catalogURL: URL { storageDirectory.appendingPathComponent("catalog-v2.json") }
+    private var legacyCatalogURL: URL { storageDirectory.appendingPathComponent("catalog-v1.json") }
     private var modelsDevCacheURL: URL { storageDirectory.appendingPathComponent("modelsdev-cache-v1.json") }
 
     func refresh() async {
@@ -118,7 +188,10 @@ actor OpencodeModelCatalog {
                   entry.status != "deprecated",
                   entry.costInput == 0, entry.costOutput == 0,
                   !Self.isExcluded(id) else { return nil }
-            return OpencodeFreeModel(id: id, displayName: entry.name)
+            return OpencodeFreeModel(
+                id: id,
+                displayName: entry.name,
+                surface: OpencodeSurface(npm: entry.npm ?? snapshot.providerNpm))
         }.sorted { $0.id < $1.id }
     }
 
@@ -166,10 +239,14 @@ actor OpencodeModelCatalog {
                     name: model["name"] as? String,
                     status: model["status"] as? String,
                     costInput: (cost?["input"] as? NSNumber)?.doubleValue,
-                    costOutput: (cost?["output"] as? NSNumber)?.doubleValue
+                    costOutput: (cost?["output"] as? NSNumber)?.doubleValue,
+                    npm: (model["provider"] as? [String: Any])?["npm"] as? String
                 )
             }
-            return ModelsDevSnapshot(fetchedAt: Date(), entries: entries)
+            return ModelsDevSnapshot(
+                providerNpm: provider["npm"] as? String,
+                fetchedAt: Date(),
+                entries: entries)
         } catch {
             return nil
         }
@@ -202,13 +279,18 @@ actor OpencodeModelCatalog {
         await refresh()
     }
 
-    /// Load the persisted snapshot (offline start). Called once at app/proxy start.
+    /// Load the persisted snapshot (offline start). Called once at app/proxy
+    /// start. v2 first; a lingering v1 file is the pre-surface upgrade
+    /// fallback (its entries resolve to `.chat` until the next refresh).
     func loadPersisted() {
         if modelsDevSnapshot == nil {
             modelsDevSnapshot = loadPersistedModelsDev()
         }
-        guard let data = FileManager.default.contents(atPath: catalogURL.path),
-              let snapshot = try? JSONDecoder().decode(CatalogSnapshot.self, from: data) else { return }
+        let data = FileManager.default.contents(atPath: catalogURL.path)
+            ?? FileManager.default.contents(atPath: legacyCatalogURL.path)
+        guard let data, let snapshot = try? JSONDecoder().decode(CatalogSnapshot.self, from: data) else {
+            return
+        }
         box.set(snapshot.models)
     }
 }
