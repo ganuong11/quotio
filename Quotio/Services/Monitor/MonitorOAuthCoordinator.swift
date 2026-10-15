@@ -19,6 +19,8 @@ actor MonitorOAuthCoordinator {
             task = Task { try await kiroDeviceFlow() }
         case .grok:
             task = Task { try await browserPKCEFlow(provider: .grok) }
+        case .opencode:
+            task = Task { try await opencodeDeviceFlow() }
         case .codex, .gemini, .antigravity:
             task = Task { try await browserPKCEFlow(provider: provider) }
         default:
@@ -447,6 +449,85 @@ actor MonitorOAuthCoordinator {
             return account
         }
         throw MonitorOAuthError.expired
+    }
+
+    /// OpenCode Console device-code flow (mirrors kiroDeviceFlow shape):
+    /// request code → open verification_uri_complete + post .monitorOAuthDeviceCode
+    /// → poll until authorized → fetch identity → persist to the vault.
+    private func opencodeDeviceFlow(
+        console: OpencodeConsoleClient = OpencodeConsoleClient()
+    ) async throws -> MonitorAccount {
+        let device = try await console.requestDeviceCode()
+        guard let verificationURL = URL(string: device.verificationURIComplete) else {
+            throw MonitorOAuthError.invalidResponse
+        }
+        _ = await MainActor.run { NSWorkspace.shared.open(verificationURL) }
+        await MainActor.run {
+            NotificationCenter.default.post(
+                name: .monitorOAuthDeviceCode,
+                object: nil,
+                userInfo: ["code": device.userCode, "url": device.verificationURIComplete]
+            )
+        }
+        var interval = max(5, device.interval)
+        let deadline = Date().addingTimeInterval(TimeInterval(device.expiresIn))
+        while Date() < deadline {
+            try Task.checkCancellation()
+            try await Task.sleep(for: .seconds(interval))
+            switch try await console.pollDeviceToken(deviceCode: device.deviceCode) {
+            case .pending:
+                continue
+            case .slowDown:
+                interval += 5
+                continue
+            case .denied:
+                throw MonitorOAuthError.expired
+            case .authorized(let accessToken, let refreshToken, let expiresIn, let orgID):
+                let identity = try await console.fetchIdentity(accessToken: accessToken, orgID: orgID)
+                let (account, credential) = Self.makeOpencodeAccount(
+                    identity: identity,
+                    accessToken: accessToken,
+                    refreshToken: refreshToken,
+                    expiresIn: expiresIn
+                )
+                try await MonitorCredentialVault.shared.save(credential, metadata: account)
+                return account
+            }
+        }
+        throw MonitorOAuthError.expired
+    }
+
+    /// Maps a console identity + token set to the canonical Quotio account:
+    /// accountKey = console userID (stable across email changes), displayName
+    /// = email, org/server stashed in credential extras for the router.
+    nonisolated static func makeOpencodeAccount(
+        identity: OpencodeIdentity,
+        accessToken: String,
+        refreshToken: String,
+        expiresIn: Int,
+        server: String = OpencodeConsoleClient.defaultServer
+    ) -> (MonitorAccount, MonitorOAuthCredential) {
+        let account = MonitorAccount.make(
+            provider: .opencode,
+            accountKey: identity.userID,
+            displayName: identity.email,
+            source: .quotioKeychain,
+            credentialReference: "keychain",
+            canDelete: true,
+            email: identity.email
+        )
+        var extra: [String: String] = ["server": server]
+        if let orgID = identity.orgID { extra["orgID"] = orgID }
+        if let orgName = identity.orgName { extra["orgName"] = orgName }
+        let credential = MonitorOAuthCredential(
+            accessToken: accessToken,
+            refreshToken: refreshToken,
+            idToken: nil,
+            accountID: identity.userID,
+            expiresAt: Date().addingTimeInterval(TimeInterval(expiresIn)),
+            extra: extra
+        )
+        return (account, credential)
     }
 
     nonisolated static func kiroAccountKey(identity: String?, clientID: String) -> String {

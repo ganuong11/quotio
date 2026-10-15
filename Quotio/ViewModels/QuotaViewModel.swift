@@ -2324,6 +2324,11 @@ final class QuotaViewModel {
             return
         }
 
+        if provider == .opencode {
+            await startOpencodeDeviceOAuth()
+            return
+        }
+
         if modeManager.isMonitorMode {
             await startMonitorOAuth(for: provider)
             return
@@ -2396,6 +2401,42 @@ final class QuotaViewModel {
             oauthState = nil
         } catch {
             oauthState = OAuthState(provider: .grok, status: .error, error: error.localizedDescription)
+        }
+    }
+
+    /// OpenCode device-code login. Mirrors startGrokLoopbackOAuth minus the
+    /// CLIProxy auth-file write (CPA never learns these creds — the opencode
+    /// branch is served natively by ProxyBridge), plus the device-code observer
+    /// so code/URL reach oauthState. Runs in both modes.
+    private func startOpencodeDeviceOAuth() async {
+        oauthState = OAuthState(provider: .opencode, status: .waiting)
+        let observer = NotificationCenter.default.addObserver(
+            forName: .monitorOAuthDeviceCode,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            let code = notification.userInfo?["code"] as? String
+            let url = notification.userInfo?["url"] as? String
+            Task { @MainActor [weak self] in
+                self?.oauthState = OAuthState(
+                    provider: .opencode,
+                    status: .polling,
+                    state: code,
+                    error: code.map { String(format: "oauth.enterDeviceCode".localized(), $0) },
+                    authURL: url
+                )
+            }
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        do {
+            _ = try await MonitorOAuthCoordinator.shared.login(provider: .opencode)
+            oauthState = OAuthState(provider: .opencode, status: .success)
+            await refreshQuotasDirectly(force: true)
+        } catch is CancellationError {
+            oauthState = nil
+        } catch {
+            oauthState = OAuthState(provider: .opencode, status: .error, error: error.localizedDescription)
         }
     }
 
