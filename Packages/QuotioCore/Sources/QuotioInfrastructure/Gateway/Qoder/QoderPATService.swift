@@ -328,3 +328,5 @@ public actor QoderPATService: QoderPATRefreshing {
         GatewayTokenRedaction.redactTokens(in: text)
     }
 }
+
+extension QoderPATService: QoderPATOnboarding {}

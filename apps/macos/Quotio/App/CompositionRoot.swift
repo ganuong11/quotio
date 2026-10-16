@@ -141,6 +141,29 @@ enum CompositionRoot {
         let menuBarSettings = MenuBarSettingsManager(
             repository: UserDefaultsMenuBarPreferencesRepository()
         )
+        let gatewayAccountStore = GatewayAccountStore(identity: identity)
+        let gatewayCredentialVault = GatewayCredentialVault(
+            dataStore: KeychainCredentialDataStore(
+                service: AppIdentity.keychainService(suffix: "gateway-credentials"),
+                canMigrateLegacy: false
+            ),
+            accounts: gatewayAccountStore
+        )
+        let gatewayLegacyImport = GatewayLegacyImport(
+            legacyAccountsURL: FileManager.default
+                .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("Quotio/Monitor/accounts-v1.json"),
+            legacyServices: [AppIdentity.keychainService(suffix: "monitor-auth")]
+                + AppIdentity.legacyKeychainServices(suffix: "monitor-auth"),
+            reader: ExternalKeychainCredentialReader()
+        )
+        Task {
+            await gatewayLegacyImport.run(into: gatewayCredentialVault)
+        }
+        let qoderOnboardingController = QoderOnboardingController(
+            onboarding: QoderPATService(),
+            credentials: gatewayCredentialVault
+        )
         let quotaController = QuotaFeatureController(
             quota: quotaScreenModel,
             accounts: accountsScreenModel,
@@ -148,7 +171,8 @@ enum CompositionRoot {
             modeManager: modeManager,
             monitoringSettings: quotioBackend,
             menuBarSettings: menuBarSettings,
-            notifications: notificationController
+            notifications: notificationController,
+            qoderOnboarding: qoderOnboardingController
         )
         oauthScreenModel.setSuccessHandler { [weak quotaController] in
             await quotaController?.refreshAll(force: true)
@@ -183,25 +207,6 @@ enum CompositionRoot {
             let result = await legacyMigration.migrate()
             await accountsScreenModel.reloadAccounts()
             return result
-        }
-        let gatewayAccountStore = GatewayAccountStore(identity: identity)
-        let gatewayCredentialVault = GatewayCredentialVault(
-            dataStore: KeychainCredentialDataStore(
-                service: AppIdentity.keychainService(suffix: "gateway-credentials"),
-                canMigrateLegacy: false
-            ),
-            accounts: gatewayAccountStore
-        )
-        let gatewayLegacyImport = GatewayLegacyImport(
-            legacyAccountsURL: FileManager.default
-                .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-                .appendingPathComponent("Quotio/Monitor/accounts-v1.json"),
-            legacyServices: [AppIdentity.keychainService(suffix: "monitor-auth")]
-                + AppIdentity.legacyKeychainServices(suffix: "monitor-auth"),
-            reader: ExternalKeychainCredentialReader()
-        )
-        Task {
-            await gatewayLegacyImport.run(into: gatewayCredentialVault)
         }
         let qoderRouter = QoderFailoverRouter(
             vault: gatewayCredentialVault,

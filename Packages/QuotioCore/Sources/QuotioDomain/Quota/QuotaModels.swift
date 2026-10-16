@@ -20,7 +20,9 @@ public struct QuotaProvider: RawRepresentable, CaseIterable, Codable, Hashable, 
     public static let glm = Self(rawValue: "zai")!
     public static let warp = Self(rawValue: "warp")!
     public static let clinePass = Self(rawValue: "clinepass")!
-    public static let allCases: [Self] = [.claude, .codex, .qwen, .iflow, .antigravity, .vertex, .kiro, .copilot, .cursor, .factoryDroid, .devin, .grok, .openRouter, .amp, .trae, .glm, .warp, .clinePass]
+    public static let qoder = Self(rawValue: "qoder")!
+    public static let opencode = Self(rawValue: "opencode")!
+    public static let allCases: [Self] = [.claude, .codex, .qwen, .iflow, .antigravity, .vertex, .kiro, .copilot, .cursor, .factoryDroid, .devin, .grok, .openRouter, .amp, .trae, .glm, .warp, .clinePass, .qoder, .opencode]
 
     public init?(rawValue: String) {
         guard !rawValue.isEmpty, rawValue.utf8.count <= 128,
@@ -103,6 +105,10 @@ public struct QuotaProvider: RawRepresentable, CaseIterable, Codable, Hashable, 
         default: nil
         }
     }
+
+    /// Providers served natively by the Swift gateway — their accounts live in
+    /// the gateway vault, never in CPA auth files.
+    public static let gatewayNativeProviders: Set<QuotaProvider> = [.qoder, .opencode]
 }
 
 public struct QuotaAccountID: Hashable, Sendable {

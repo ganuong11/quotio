@@ -22,6 +22,8 @@ public extension QuotaProvider {
         case .glm: "Z.ai"
         case .warp: "Warp"
         case .clinePass: "ClinePass"
+        case .qoder: "Qoder"
+        case .opencode: "OpenCode"
         default: rawValue
         }
     }
@@ -46,6 +48,8 @@ public extension QuotaProvider {
         case .glm: "brain"
         case .warp: "terminal.fill"
         case .clinePass: "cpu"
+        case .qoder: "sparkles"
+        case .opencode: "terminal"
         default: "square.stack"
         }
     }
@@ -85,6 +89,8 @@ public extension QuotaProvider {
         case .glm: Color(hex: "3B82F6") ?? .blue
         case .warp: Color(hex: "01E5FF") ?? .cyan
         case .clinePass: Color(hex: "61A3FA") ?? .blue
+        case .qoder: Color(hex: "4CAF50") ?? .green
+        case .opencode: .primary
         default: .secondary
         }
     }
@@ -120,6 +126,8 @@ public extension QuotaProvider {
         case .glm: "G"
         case .warp: "W"
         case .clinePass: "CL"
+        case .qoder: "QD"
+        case .opencode: "OC"
         default: String(rawValue.prefix(2)).uppercased()
         }
     }
@@ -141,6 +149,7 @@ public extension QuotaProvider {
         case .glm: "glm-menubar"
         case .warp: "warp-menubar"
         case .clinePass: "clinepass-menubar"
+        case .qoder: "qoder-menubar"
         default: nil
         }
     }

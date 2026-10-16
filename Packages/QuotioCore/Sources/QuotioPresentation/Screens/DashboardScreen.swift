@@ -83,14 +83,34 @@ struct DashboardScreen: View {
             }
         }
         .sheet(item: $selectedProvider) { provider in
-            OAuthSheet(provider: provider) {
-                selectedProvider = nil
-                quotaController.cancelOAuth()
-                Task {
-                    if modeManager.isMonitorMode {
-                        await quotaController.refreshAll(force: true)
-                    } else {
-                        await proxyManagement.refreshData()
+            if provider == .qoder {
+                // PAT-paste onboarding, not an OAuth flow.
+                if let onboarding = quotaController.qoderOnboarding {
+                    QoderPATOnboardingSheet(onboarding: onboarding) {
+                        selectedProvider = nil
+                        Task {
+                            if modeManager.isMonitorMode {
+                                await quotaController.refreshAll(force: true)
+                            } else {
+                                await proxyManagement.refreshData()
+                            }
+                        }
+                    }
+                } else {
+                    Text("qoder.onboarding.unavailable".localized())
+                        .padding(24)
+                        .frame(width: 450)
+                }
+            } else {
+                OAuthSheet(provider: provider) {
+                    selectedProvider = nil
+                    quotaController.cancelOAuth()
+                    Task {
+                        if modeManager.isMonitorMode {
+                            await quotaController.refreshAll(force: true)
+                        } else {
+                            await proxyManagement.refreshData()
+                        }
                     }
                 }
             }

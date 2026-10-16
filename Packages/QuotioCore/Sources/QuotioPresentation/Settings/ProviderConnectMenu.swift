@@ -12,6 +12,7 @@ struct ProviderConnectMenu: View {
     static func isConnectable(_ provider: MonitoringProvider) -> Bool {
         !provider.actions.isDisjoint(with: ["start_oauth", "add_api_key", "discover_native"])
             || provider.configDirectorySource != nil
+            || provider.id == .qoder
     }
 
     var body: some View {
@@ -23,6 +24,12 @@ struct ProviderConnectMenu: View {
         if provider.actions.contains("add_api_key") {
             Button("settings.addAPIKey".localized()) {
                 connect { model.sheet = .apiKey(provider.id, nil) }
+            }
+        }
+        if provider.id == .qoder {
+            // PAT-paste onboarding, not OAuth or API key.
+            Button("qoder.onboarding.title".localized() + "…") {
+                connect { model.sheet = .qoderPAT }
             }
         }
         if provider.configDirectorySource != nil {

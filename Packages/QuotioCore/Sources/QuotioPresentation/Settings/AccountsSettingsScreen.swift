@@ -101,6 +101,17 @@ struct AccountsSettingsScreen: View {
                         await controller.refresh(provider: provider)
                     }
                 }
+            case .qoderPAT:
+                if let onboarding = controller.qoderOnboarding {
+                    QoderPATOnboardingSheet(onboarding: onboarding) {
+                        model.sheet = nil
+                        Task { await controller.refresh(provider: .qoder) }
+                    }
+                } else {
+                    Text("qoder.onboarding.unavailable".localized())
+                        .padding(24)
+                        .frame(width: 450)
+                }
             case .history(let provider, let account, let screen):
                 QuotaHistorySheet(model: screen, accountName: account.displayName, provider: provider,
                                   displayMode: menuBar.quotaDisplayMode, hideSensitiveInfo: menuBar.hideSensitiveInfo)

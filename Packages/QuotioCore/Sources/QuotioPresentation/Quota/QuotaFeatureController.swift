@@ -32,6 +32,10 @@ public final class QuotaFeatureController {
     let accounts: AccountsScreenModel
     let oauth: OAuthScreenModel
 
+    /// Qoder PAT onboarding use case (exchange + persist). Optional: nil keeps
+    /// pre-gateway configurations compiling and renders the "unavailable" copy.
+    @ObservationIgnored public let qoderOnboarding: QoderOnboardingController?
+
     @ObservationIgnored private let modeManager: OperatingModeManager
     @ObservationIgnored private let menuBarSettings: MenuBarSettingsManager
     @ObservationIgnored private let notifications: any NotificationRequesting
@@ -45,7 +49,8 @@ public final class QuotaFeatureController {
         modeManager: OperatingModeManager,
         monitoringSettings: any MonitoringSettingsManaging,
         menuBarSettings: MenuBarSettingsManager,
-        notifications: any NotificationRequesting
+        notifications: any NotificationRequesting,
+        qoderOnboarding: QoderOnboardingController? = nil
     ) {
         self.settingsService = monitoringSettings
         self.quota = quota
@@ -54,6 +59,7 @@ public final class QuotaFeatureController {
         self.modeManager = modeManager
         self.menuBarSettings = menuBarSettings
         self.notifications = notifications
+        self.qoderOnboarding = qoderOnboarding
     }
 
     deinit {
