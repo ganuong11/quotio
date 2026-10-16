@@ -1,15 +1,24 @@
-//
-//  QoderTranslatorLimits.swift
-//  QuotioDomain
-//
-//  Ported from the qoder branch (QoderChatTranslator.swift) — extracted early
-//  because HTTP1RequestParser's Tier-1 body cap test pins the byte-cap
-//  relationship against these values. Task 9's translator port references
-//  this type rather than re-declaring it.
-//
-
 import Foundation
 
+/// Tier 2 semantic caps for the Chat translator (issue #14, defense-in-depth
+/// on top of the upstream Qoder gateway's own limits). These run BEFORE the
+/// envelope is built, so an over-limit request never reaches the gateway or
+/// the COSY/WAF signing path — fail-fast at the cheapest point.
+///
+/// Pure value type, `Sendable`, no I/O. Defaults are sized to never reject a
+/// legitimate CLI-agent request while still bounding the translator's working
+/// set. They're `let`s on a struct (not a global) so tests can inject tighter
+/// values; the production call site uses `.default`.
+///
+/// The byte-size caps (image, tool schema) map to HTTP **413 Payload Too
+/// Large**; the count caps (messages, tools) map to HTTP **400
+/// invalid_request_error**. Rationale: a count overage is a structural misuse
+/// of the API (the request shape is fine, the agent just sent too many), while
+/// a byte overage is a payload that's literally too large to forward — the
+/// same semantics Tier 1's body cap (ADR 0013) uses for 413. The status-code
+/// split is realized via `QoderTranslatorError.httpStatus` and surfaced through
+/// the failover router's `requestRejected` error → the listener's error
+/// envelope path.
 public nonisolated struct QoderTranslatorLimits: Sendable, Equatable {
     /// Maximum number of messages forwarded in one request. Over-cap
     /// conversations are trimmed to the system preamble + newest turns
@@ -32,12 +41,7 @@ public nonisolated struct QoderTranslatorLimits: Sendable, Equatable {
     /// schema and bounds the per-tool memory cost. Above this, reject as 413.
     public let maxToolSchemaBytes: Int
 
-    public init(
-        maxMessages: Int,
-        maxImageBytes: Int,
-        maxTools: Int,
-        maxToolSchemaBytes: Int
-    ) {
+    public init(maxMessages: Int, maxImageBytes: Int, maxTools: Int, maxToolSchemaBytes: Int) {
         self.maxMessages = maxMessages
         self.maxImageBytes = maxImageBytes
         self.maxTools = maxTools
@@ -63,4 +67,3 @@ public nonisolated struct QoderTranslatorLimits: Sendable, Equatable {
         maxToolSchemaBytes: 5 * 1024 * 1024
     )
 }
-
