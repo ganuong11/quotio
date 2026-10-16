@@ -1,6 +1,8 @@
 import Foundation
 import Network
 import XCTest
+import QuotioApplication
+import QuotioDomain
 @testable import QuotioInfrastructure
 
 /// Loopback-socket tests for `GatewayListener`: a stub TCP responder stands in
@@ -15,7 +17,7 @@ final class GatewayListenerTests: XCTestCase {
         try await listener.start(port: frontPort, bindHost: "127.0.0.1", upstreamPort: upstream.port)
         defer { Task { await listener.stop() } }
 
-        let request = Data("GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1:\(frontPort)\r\nAccept-Encoding: gzip\r\n\r\n".utf8)
+        let request = Data("GET /v1/usage HTTP/1.1\r\nHost: 127.0.0.1:\(frontPort)\r\nAccept-Encoding: gzip\r\n\r\n".utf8)
         let response = try await roundTrip(port: frontPort, request: request)
 
         XCTAssertEqual(response, expected)
@@ -76,9 +78,204 @@ final class GatewayListenerTests: XCTestCase {
         let running = await listener.isRunning
         XCTAssertFalse(running)
 
-        // A rebinder can immediately take the port — proves the listener let go.
-        let rebind = try await StubTCPServer.start(response: Data(), boundPort: frontPort)
-        _ = rebind
+        // A rebinder can take the port — proves the listener let go. The
+        // NWListener socket closes asynchronously after cancel(), so poll the
+        // rebind rather than asserting it's instant.
+        var rebind: StubTCPServer?
+        let deadline = Date().addingTimeInterval(5)
+        while rebind == nil, Date() < deadline {
+            rebind = try? await StubTCPServer.start(response: Data(), boundPort: frontPort)
+            if rebind == nil { try await Task.sleep(nanoseconds: 100_000_000) }
+        }
+        XCTAssertNotNil(rebind, "listener must release the port within 5s of stop()")
+
+    }
+
+
+    // MARK: - Qoder interception wiring (Task 15)
+
+    /// Empty-vault Qoder request: the gate intercepts, the failover router
+    /// finds zero accounts, and the agent gets an OpenAI-shaped error
+    /// envelope — NOT silent passthrough to CPA.
+    func testQoderRequestWithEmptyVaultReturns503ErrorEnvelope() async throws {
+        let router = QoderFailoverRouter(
+            vault: ListenerStubVault(),
+            metadata: ListenerStubAccounts(),
+            patService: ListenerStubPAT(),
+            gateway: ListenerStubGateway(streamFactory: {
+                XCTFail("empty vault must never reach the gateway")
+                return QoderGatewayStream(
+                    response: HTTPURLResponse(url: qoderChatGatewayURL, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+                ) { nil }
+            })
+        )
+        let listener = GatewayListener()
+        await listener.configureRouting(qoderRouter: router)
+        let frontPort = try reserveFreePort()
+        try await listener.start(port: frontPort, bindHost: "127.0.0.1", upstreamPort: 1)
+        defer { Task { await listener.stop() } }
+
+        let body = Data(#"{"model":"qoder/auto","messages":[{"role":"user","content":"hi"}],"stream":false}"#.utf8)
+        var request = "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:\(frontPort)\r\n"
+        request += "Authorization: Bearer test-key\r\nContent-Length: \(body.count)\r\n\r\n"
+        let response = try await roundTrip(
+            port: frontPort,
+            request: Data(request.utf8) + body
+        )
+        let head = String(decoding: response.prefix(400), as: UTF8.self)
+        XCTAssertTrue(head.hasPrefix("HTTP/1.1 503"), head)
+        XCTAssertTrue(head.contains("Content-Type: application/json"), head)
+        XCTAssertTrue(String(decoding: response, as: UTF8.self).contains("\"error\""), String(decoding: response, as: UTF8.self))
+    }
+
+    /// A primed validator rejects an unauthenticated qoder request before it
+    /// reaches the router — same 401 envelope CPA's auth middleware emits.
+    func testQoderRequestWithoutConfiguredAPIKeyReturns401() async throws {
+        let validator = QoderAccessValidator()
+        await validator.reload(keys: ["expected-key"])
+        let router = QoderFailoverRouter(
+            vault: ListenerStubVault(),
+            metadata: ListenerStubAccounts(),
+            patService: ListenerStubPAT(),
+            gateway: ListenerStubGateway(streamFactory: {
+                XCTFail("rejected auth must never reach the gateway")
+                return QoderGatewayStream(
+                    response: HTTPURLResponse(url: qoderChatGatewayURL, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+                ) { nil }
+            })
+        )
+        let listener = GatewayListener()
+        await listener.configureRouting(qoderRouter: router, accessValidator: validator)
+        let frontPort = try reserveFreePort()
+        try await listener.start(port: frontPort, bindHost: "127.0.0.1", upstreamPort: 1)
+        defer { Task { await listener.stop() } }
+
+        let body = Data(#"{"model":"qoder/auto","messages":[{"role":"user","content":"hi"}],"stream":false}"#.utf8)
+        var request = "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:\(frontPort)\r\n"
+        request += "Content-Length: \(body.count)\r\n\r\n"
+        let response = try await roundTrip(port: frontPort, request: Data(request.utf8) + body)
+        XCTAssertTrue(
+            String(decoding: response, as: UTF8.self).hasPrefix("HTTP/1.1 401"),
+            String(decoding: response.prefix(200), as: UTF8.self)
+        )
+    }
+
+    /// GET /v1/models is intercepted when a router is wired: CPA's body plus
+    /// the Qoder catalog entries, with a recomputed Content-Length.
+    func testModelsListMergesQoderCatalog() async throws {
+        let cpaBody = Data(#"{"object":"list","data":[{"id":"claude-sonnet-4"}]}"#.utf8)
+        let cpaResponse = Data(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(cpaBody.count)\r\nConnection: close\r\n\r\n".utf8
+        ) + cpaBody
+        let upstream = try await StubTCPServer.start(response: cpaResponse)
+        let router = QoderFailoverRouter(
+            vault: ListenerStubVault(),
+            metadata: ListenerStubAccounts(),
+            patService: ListenerStubPAT(),
+            gateway: ListenerStubGateway(streamFactory: {
+                QoderGatewayStream(
+                    response: HTTPURLResponse(url: qoderChatGatewayURL, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)!
+                ) { nil }
+            })
+        )
+        let listener = GatewayListener()
+        await listener.configureRouting(qoderRouter: router)
+        let frontPort = try reserveFreePort()
+        try await listener.start(port: frontPort, bindHost: "127.0.0.1", upstreamPort: upstream.port)
+        defer { Task { await listener.stop() } }
+
+        let response = try await roundTrip(
+            port: frontPort,
+            request: Data("GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1:\(frontPort)\r\n\r\n".utf8)
+        )
+        let text = String(decoding: response, as: UTF8.self)
+        XCTAssertTrue(text.hasPrefix("HTTP/1.1 200"), text)
+        XCTAssertTrue(text.contains("claude-sonnet-4"), text)
+        XCTAssertTrue(text.contains("qoder"), text)
+    }
+
+    /// Listener stop while a Qoder pump is in flight cancels the pump task,
+    /// which tears down the upstream stream (Review Focus #2).
+    func testListenerStopCancelsInFlightPump() async throws {
+        let account = GatewayAccount.make(
+            provider: .qoder,
+            accountKey: "acct-1",
+            displayName: "Account One",
+            source: .onboarded
+        )
+        let credential = GatewayCredential(
+            accessToken: "job-token",
+            accountID: "user-1",
+            extra: ["machineID": "machine-1"]
+        )
+        let vault = ListenerStubVault()
+        await vault.seed(account, credential)
+
+        let spy = PumpSpy()
+        let gateway = ListenerStubGateway {
+            QoderGatewayStream(
+                response: HTTPURLResponse(
+                    url: qoderChatGatewayURL,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": "text/event-stream"]
+                )!,
+                onCancel: { Task { await spy.markCancelled() } },
+                source: {
+                    if await spy.claimFirstPull() {
+                        return Data("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n".utf8)
+                    }
+                    // Model a slow upstream: sleep in chunks until the pump
+                    // task is cancelled, then end the stream so the pump's
+                    // deferred cancel() fires.
+                    while !Task.isCancelled {
+                        try? await Task.sleep(nanoseconds: 50_000_000)
+                    }
+                    return nil
+                }
+            )
+        }
+        let router = QoderFailoverRouter(
+            vault: vault,
+            metadata: ListenerStubAccounts(),
+            patService: ListenerStubPAT(),
+            gateway: gateway
+        )
+        let listener = GatewayListener()
+        await listener.configureRouting(qoderRouter: router)
+        let frontPort = try reserveFreePort()
+        try await listener.start(port: frontPort, bindHost: "127.0.0.1", upstreamPort: 1)
+
+        let body = Data(#"{"model":"qoder/auto","messages":[{"role":"user","content":"hi"}],"stream":true}"#.utf8)
+        var head = "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:\(frontPort)\r\n"
+        head += "Authorization: Bearer test-key\r\nContent-Length: \(body.count)\r\n\r\n"
+        let connection = NWConnection(
+            host: "127.0.0.1",
+            port: NWEndpoint.Port(rawValue: frontPort)!,
+            using: .tcp
+        )
+        try await waitForReady(connection)
+        try await send(Data(head.utf8) + body, on: connection)
+
+        async let receivedBytes = receiveBytesUntilClose(connection)
+
+        // Wait until the pump is genuinely in its blocked pull.
+        do {
+            try await spy.waitForPumpStart()
+        } catch {
+            connection.cancel()
+            let response = try? await receivedBytes
+            XCTFail("pump never started; agent received: \(String(decoding: response ?? Data(), as: UTF8.self))")
+            await listener.stop()
+            return
+        }
+
+        await listener.stop()
+
+        // The pump task is cancelled → its blocked source returns nil →
+        // pump() exits → deferred stream.cancel() fires the spy.
+        try await spy.waitForCancellation()
+        connection.cancel()
     }
 
     // MARK: - Helpers
@@ -222,6 +419,37 @@ private final class ResumeBox: @unchecked Sendable {
 
 private struct TestTimeoutError: Error {}
 
+/// File-scope copy of `receiveUntilClose` for call sites that can't capture
+/// `self` in an `async let` (XCTestCase is not Sendable).
+private func receiveBytesUntilClose(_ connection: NWConnection) async throws -> Data {
+    let box = ResumeBox()
+    final class Accumulator: @unchecked Sendable {
+        var data = Data()
+    }
+    let accumulated = Accumulator()
+    return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Data, Error>) in
+        @Sendable func receive() {
+            connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, isComplete, error in
+                if let error {
+                    box.tryResume(cont, with: .failure(error))
+                    return
+                }
+                if let data { accumulated.data.append(data) }
+                if isComplete {
+                    box.tryResume(cont, with: .success(accumulated.data))
+                } else {
+                    receive()
+                }
+            }
+        }
+        receive()
+        Task {
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            box.tryResume(cont, with: .failure(TestTimeoutError()))
+        }
+    }
+}
+
 /// Minimal TCP responder: accepts one connection, records the request bytes
 /// until the declared Content-Length is satisfied, replies with the canned
 /// response, then closes.
@@ -361,5 +589,98 @@ private final class StubTCPServer: @unchecked Sendable {
         let data = receivedData
         lock.unlock()
         cont?.resume(returning: data)
+    }
+}
+
+
+// MARK: - Qoder wiring test doubles
+
+/// Minimal in-memory credential store for listener-level tests (the router's
+/// `GatewayCredentialStoring` seam).
+private actor ListenerStubVault: GatewayCredentialStoring {
+    private var accountsList: [GatewayAccount] = []
+    private var credentials: [String: GatewayCredential] = [:]
+
+    func seed(_ account: GatewayAccount, _ credential: GatewayCredential) {
+        accountsList.append(account)
+        credentials[account.id] = credential
+    }
+
+    func accounts() async -> [GatewayAccount] { accountsList }
+    func credential(for accountID: String) async -> GatewayCredential? { credentials[accountID] }
+    func store(_ credential: GatewayCredential, account: GatewayAccount) async throws {
+        credentials[account.id] = credential
+    }
+}
+
+private actor ListenerStubAccounts: GatewayAccountStoring {
+    private var disabled: Set<String> = []
+    func disabledAccountIDs() async -> Set<String> { disabled }
+    func setDisabled(_ disabled: Bool, accountID: String) async throws {
+        if disabled { self.disabled.insert(accountID) } else { self.disabled.remove(accountID) }
+    }
+}
+
+private actor ListenerStubPAT: QoderPATRefreshing {
+    func refreshCredential(
+        _ credential: GatewayCredential,
+        account: GatewayAccount
+    ) async throws -> GatewayCredential { credential }
+}
+
+private actor ListenerStubGateway: QoderGatewayClientProtocol {
+    private let streamFactory: @Sendable () -> QoderGatewayStream
+    init(streamFactory: @escaping @Sendable () -> QoderGatewayStream) {
+        self.streamFactory = streamFactory
+    }
+    func openStream(
+        body: Data,
+        credentials: QoderCOSYCredentials,
+        signerOptions: QoderCOSYSignerOptions
+    ) async throws -> QoderGatewayStream {
+        streamFactory()
+    }
+}
+
+/// Tiny box letting a background reader hand the received bytes to the test.
+private actor ReceiveBox {
+    private var bytes = Data()
+    func store(_ data: Data) { bytes = data }
+    func snapshot() -> Data { bytes }
+}
+
+/// Tracks the mock stream's lifecycle: the router peeks the first pull, the
+/// pump blocks in the second pull, and `cancel()` must eventually fire.
+/// Actor because the pull source is `async` and the cancel hook is `sync` —
+/// `markCancelled` is reached via `Task { await spy.markCancelled() }`.
+private actor PumpSpy {
+    private var pulls = 0
+    private var cancelledFlag = false
+
+    /// Returns true for the first pull (the router's peek); the pump's own
+    /// pulls get false.
+    func claimFirstPull() -> Bool {
+        pulls += 1
+        return pulls == 1
+    }
+
+    func markCancelled() { cancelledFlag = true }
+
+    /// Resolves once the second pull is entered — the point at which the pump
+    /// is genuinely in-flight (the first pull is the router's peek).
+    func waitForPumpStart() async throws {
+        try await poll { pulls >= 2 }
+    }
+
+    func waitForCancellation() async throws {
+        try await poll { cancelledFlag }
+    }
+
+    private func poll(_ ready: () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(10)
+        while !ready() {
+            if Date() > deadline { throw TestTimeoutError() }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
     }
 }

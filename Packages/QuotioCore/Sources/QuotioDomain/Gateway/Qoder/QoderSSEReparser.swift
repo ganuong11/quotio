@@ -197,7 +197,7 @@ public nonisolated struct QoderSSEReparser {
     /// initializer to assert byte-exact OpenAI chunk output. `includeUsage`
     /// defaults to false (issue #19: spec default — no trailing usage chunk
     /// unless the client opted in via `stream_options.include_usage: true`).
-    init(includeUsage: Bool = false, maxLineBytes: Int = QoderSSEReparser.maxSSELineBytes) {
+    public init(includeUsage: Bool = false, maxLineBytes: Int = QoderSSEReparser.maxSSELineBytes) {
         self.created = Int(Date().timeIntervalSince1970.rounded(.down))
         self.includeUsage = includeUsage
         self.maxLineBytes = maxLineBytes
@@ -206,7 +206,7 @@ public nonisolated struct QoderSSEReparser {
     /// Test initializer pinning the `created` timestamp. `includeUsage` defaults
     /// to false to keep the existing test fixtures (which were written before
     /// the gate) asserting the no-usage-chunk shape unless they opt in.
-    init(created: Int, includeUsage: Bool = false, maxLineBytes: Int = QoderSSEReparser.maxSSELineBytes) {
+    public init(created: Int, includeUsage: Bool = false, maxLineBytes: Int = QoderSSEReparser.maxSSELineBytes) {
         self.created = created
         self.includeUsage = includeUsage
         self.maxLineBytes = maxLineBytes
@@ -230,7 +230,7 @@ public nonisolated struct QoderSSEReparser {
     /// Throws on `statusCodeValue != 200` and malformed JSON lines. A thrown
     /// error does NOT corrupt the reparser state — the caller may continue
     /// feeding if it chooses to swallow `.malformedSSELine` (pi's behavior).
-    mutating func feed(_ data: Data) throws -> Data {
+    public mutating func feed(_ data: Data) throws -> Data {
         // Stitch any dangling UTF-8 continuation bytes from the previous feed
         // before decoding (see `pendingUTF8`).
         var raw = data
@@ -306,7 +306,7 @@ public nonisolated struct QoderSSEReparser {
     /// Known mid-stream failures (reparser gates, transport drops) never reach
     /// `finish` — ProxyBridge emits the ADR 0010 error frame on that path and
     /// a real failure is not masked with a success terminal.
-    mutating func finish() throws -> Data {
+    public mutating func finish() throws -> Data {
         guard !finished else { return Data() }
         finished = true
         var out = try drainLines(terminal: true)

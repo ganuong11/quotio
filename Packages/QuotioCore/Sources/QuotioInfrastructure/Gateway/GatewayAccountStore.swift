@@ -1,4 +1,5 @@
 import Foundation
+import QuotioApplication
 import QuotioDomain
 
 /// Persists gateway account metadata to `gateway-accounts-v1.json` in the
@@ -58,3 +59,5 @@ public actor GatewayAccountStore {
         try SecureAtomicFileWriter.write(try JSONEncoder().encode(payload), to: url)
     }
 }
+
+extension GatewayAccountStore: GatewayAccountStoring {}

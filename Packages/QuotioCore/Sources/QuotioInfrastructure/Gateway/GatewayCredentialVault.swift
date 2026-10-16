@@ -62,3 +62,5 @@ public actor GatewayCredentialVault {
         try? await metadata.deleteAccount(accountID: accountID)
     }
 }
+
+extension GatewayCredentialVault: GatewayCredentialStoring {}

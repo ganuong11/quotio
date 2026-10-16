@@ -158,6 +158,39 @@ public actor FileProxyConfigurationRepository: ProxyConfigurationRepository {
         write(lines.joined(separator: "\n"))
     }
 
+    /// Read the configured `api-keys` list for gateway-side request
+    /// authentication. Returns an empty list when the file or section is
+    /// absent — callers treat that as "keys unconfigured" (open access),
+    /// matching upstream semantics.
+    public func loadAPIKeys() -> [String] {
+        guard let content = try? String(contentsOfFile: resolvedPaths.configPath, encoding: .utf8) else {
+            return []
+        }
+        let lines = content.components(separatedBy: "\n")
+        guard let index = lines.firstIndex(where: {
+            $0.trimmingCharacters(in: .whitespaces) == "api-keys:"
+        }) else { return [] }
+        var keys: [String] = []
+        var scanIndex = index + 1
+        while scanIndex < lines.count {
+            let line = lines[scanIndex]
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty {
+                scanIndex += 1
+                continue
+            }
+            if !line.hasPrefix(" ") && !line.hasPrefix("\t") { break }
+            if trimmed.hasPrefix("-") {
+                let value = trimmed.dropFirst()
+                    .trimmingCharacters(in: .whitespaces)
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+                if !value.isEmpty { keys.append(value) }
+            }
+            scanIndex += 1
+        }
+        return keys
+    }
+
     public func setAllowRemote(_ enabled: Bool) {
         updateValue(
             pattern: #"allow-remote:\s*(true|false)"#,

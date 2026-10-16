@@ -66,14 +66,14 @@ public nonisolated struct QoderCompletionAggregator {
 
     /// Captured top-level `usage` block. Surfaced on the completion and via
     /// `capturedUsage` for ProxyBridge's accounting.
-    private(set) var capturedUsage: [String: Any]?
+    public private(set) var capturedUsage: [String: Any]?
 
     /// Stable response id / created, stamped from the first chunk carrying
     /// them (OpenAI clients expect a stable `id` for a completion).
     private var responseID: String?
     private var createdStamp: Int?
 
-    init() {}
+    public init() {}
 
     // MARK: - Ingest
 
@@ -84,7 +84,7 @@ public nonisolated struct QoderCompletionAggregator {
     /// as the reparser's `drainLines` (skip malformed), but surfaced here so a
     /// strict caller can choose. Today ProxyBridge treats the aggregator as
     /// best-effort and lets the streaming reparser's gate own hard failures.
-    mutating func ingest(_ data: Data) throws {
+    public mutating func ingest(_ data: Data) throws {
         guard !data.isEmpty else { return }
         guard let text = String(data: data, encoding: .utf8) else { return }
         buffer.append(text)

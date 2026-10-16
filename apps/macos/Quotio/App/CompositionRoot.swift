@@ -44,6 +44,7 @@ enum CompositionRoot {
         )
         let paths = FileProxyConfigurationRepository.defaultPaths(identity: identity)
         let configurationRepository = FileProxyConfigurationRepository(paths: paths)
+        let gatewayListener = GatewayListener()
         let proxyController = ProxyLifecycleController(
             paths: paths,
             processController: ProxyProcessController(allowsPortCleanup: identity.isProduction),
@@ -70,7 +71,7 @@ enum CompositionRoot {
             notificationDelivery: ProxyNotificationRelay(notifications: notificationController),
             sleeper: ContinuousSleeper(),
             dateProvider: SystemDateProvider(),
-            frontDoor: GatewayListener(),
+            frontDoor: gatewayListener,
             installedVersionLimit: AppConstants.maxInstalledVersions
         )
         let proxyScreenModel = ProxyScreenModel(
@@ -201,6 +202,24 @@ enum CompositionRoot {
         )
         Task {
             await gatewayLegacyImport.run(into: gatewayCredentialVault)
+        }
+        let qoderRouter = QoderFailoverRouter(
+            vault: gatewayCredentialVault,
+            metadata: gatewayAccountStore,
+            patService: QoderPATService(),
+            gateway: QoderGatewayClient()
+        )
+        let qoderAccessValidator = QoderAccessValidator()
+        Task {
+            await gatewayListener.configureRouting(
+                qoderRouter: qoderRouter,
+                accessValidator: qoderAccessValidator,
+                apiKeySource: { await configurationRepository.loadAPIKeys() },
+                logger: OSApplicationLogger(
+                    subsystem: AppIdentity.bundleIdentifier,
+                    category: "GatewayListener"
+                )
+            )
         }
         let launchAtLoginController = LaunchAtLoginController(
             registration: ServiceManagementLaunchAtLoginAdapter(),

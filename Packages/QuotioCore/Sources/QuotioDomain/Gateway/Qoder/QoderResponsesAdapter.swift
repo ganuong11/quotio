@@ -109,7 +109,7 @@ public nonisolated struct QoderResponsesAdapter {
     /// `completion_tokens`→`output_tokens` (Responses vocabulary).
     private var capturedUsage: [String: Any]?
 
-    init(responseID: String? = nil, model: String? = nil) {
+    public init(responseID: String? = nil, model: String? = nil) {
         let now = Int(Date().timeIntervalSince1970.rounded(.down))
         let id = responseID ?? ""
         self.responseID = id
@@ -129,7 +129,7 @@ public nonisolated struct QoderResponsesAdapter {
     /// Throws on malformed JSON inside a `data:` frame — same tolerance policy
     /// as the aggregator's `processFrame`. Today Task B treats the adapter as
     /// best-effort and lets the streaming reparser's gate own hard failures.
-    mutating func ingest(_ data: Data) throws -> Data {
+    public mutating func ingest(_ data: Data) throws -> Data {
         guard !data.isEmpty else { return Data() }
         guard let text = String(data: data, encoding: .utf8) else { return Data() }
         buffer.append(text)
@@ -287,7 +287,7 @@ public nonisolated struct QoderResponsesAdapter {
     ///   3. response.completed carrying the full Response object.
     ///
     /// Idempotent — a second call returns empty.
-    mutating func finish() throws -> Data {
+    public mutating func finish() throws -> Data {
         var out = Data()
 
         // 1. Message-item terminals (only if content actually streamed).
@@ -320,7 +320,7 @@ public nonisolated struct QoderResponsesAdapter {
     /// Responses has no `[DONE]` sentinel (unlike Chat), so none is appended.
     /// The Chat-shape streaming path uses `QoderOpenAIError.sseTerminalFrame`
     /// instead.
-    mutating func errorEvent(message: String, code: String = "internal_server_error") -> Data {
+    public mutating func errorEvent(message: String, code: String = "internal_server_error") -> Data {
         // OpenAI Responses `error` event shape: {type, code, message,
         // sequence_number}. No `param` field — the Responses error event does
         // not carry one (verified against the streaming-events spec; unlike the

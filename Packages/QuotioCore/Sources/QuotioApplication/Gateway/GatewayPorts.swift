@@ -18,3 +18,18 @@ public protocol QoderPATRefreshing: Sendable {
 public protocol QoderPATOnboarding: Sendable {
     func credentials(fromPat pat: String) async throws -> QoderPATResult
 }
+
+/// Credential-vault surface the failover router needs. Conformed to by
+/// `GatewayCredentialVault`; tests inject in-memory stores.
+public protocol GatewayCredentialStoring: Sendable {
+    func accounts() async -> [GatewayAccount]
+    func credential(for accountID: String) async -> GatewayCredential?
+    func store(_ credential: GatewayCredential, account: GatewayAccount) async throws
+}
+
+/// Account-metadata surface the failover router needs (disabled set +
+/// revocation marking). Conformed to by `GatewayAccountStore`.
+public protocol GatewayAccountStoring: Sendable {
+    func disabledAccountIDs() async -> Set<String>
+    func setDisabled(_ disabled: Bool, accountID: String) async throws
+}
