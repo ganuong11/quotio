@@ -35,6 +35,7 @@ extension QuotaRefreshIssue {
         case .unavailable: key = "connections.failure.unavailable"
         case .quotaUnavailable: key = "connections.failure.quota"
         case .invalidData: key = "connections.failure.invalidData"
+        case .stale: key = "monitor.opencode.stale"
         case nil: key = "connections.failure.unknown"
         }
         return key.localized()

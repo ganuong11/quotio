@@ -145,11 +145,23 @@ enum CompositionRoot {
             metadata: gatewayAccountStore,
             patService: qoderPATService
         )
+        let opencodeCatalog = OpencodeModelCatalog(identity: identity)
+        let opencodeDetectedCache = OpencodeDetectedCache()
+        let opencodeConsoleClient = OpencodeConsoleClient()
+        let opencodeRouter = OpencodeRouter(
+            catalog: opencodeCatalog,
+            console: opencodeConsoleClient,
+            upstream: OpencodeUpstreamClient(),
+            vault: gatewayCredentialVault,
+            metadata: gatewayAccountStore,
+            detectedSnapshot: { opencodeDetectedCache.snapshot() }
+        )
         let gatewayOverlay = GatewayQuotaOverlay(
             wrapping: quotioBackend,
             quotaService: gatewayQuotaService,
             directory: gatewayAccountStore,
-            credentials: gatewayCredentialVault
+            credentials: gatewayCredentialVault,
+            detectedOpencode: { opencodeDetectedCache.snapshot() }
         )
 
         let accountsScreenModel = AccountsScreenModel(
@@ -160,11 +172,22 @@ enum CompositionRoot {
             backend: quotioBackend,
             urlOpener: urlOpener
         )
+        // Gateway-native providers own their auth flows — OpenCode runs the
+        // console device-code grant through `OpencodeConsoleClient`, writing
+        // the onboarded credential straight into the gateway vault.
+        let gatewayAuthorizer = GatewayOAuthAuthorizer(
+            opencode: OpencodeDeviceAuthorizer(
+                console: opencodeConsoleClient,
+                urlOpener: urlOpener,
+                credentials: gatewayCredentialVault
+            ),
+            fallback: monitorAuthorizer
+        )
         let modeManager = OperatingModeManager(
             repository: UserDefaultsOperatingModePreferencesRepository()
         )
         let oauthScreenModel = OAuthScreenModel(
-            controller: OAuthFlowController(authorizer: monitorAuthorizer)
+            controller: OAuthFlowController(authorizer: gatewayAuthorizer)
         )
 
         let quotaScreenModel = QuotaScreenModel(
@@ -226,17 +249,6 @@ enum CompositionRoot {
             metadata: gatewayAccountStore,
             patService: QoderPATService(),
             gateway: QoderGatewayClient()
-        )
-        let opencodeCatalog = OpencodeModelCatalog(identity: identity)
-        let opencodeDetectedCache = OpencodeDetectedCache()
-        let opencodeConsoleClient = OpencodeConsoleClient()
-        let opencodeRouter = OpencodeRouter(
-            catalog: opencodeCatalog,
-            console: opencodeConsoleClient,
-            upstream: OpencodeUpstreamClient(),
-            vault: gatewayCredentialVault,
-            metadata: gatewayAccountStore,
-            detectedSnapshot: { opencodeDetectedCache.snapshot() }
         )
         let qoderAccessValidator = QoderAccessValidator()
         Task {

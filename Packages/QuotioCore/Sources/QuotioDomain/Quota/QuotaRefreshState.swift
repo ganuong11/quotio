@@ -10,6 +10,8 @@ public enum QuotaRefreshFailureReason: String, Sendable {
     case localCredentialStorage = "local_credential_storage"
     case quotaUnavailable = "quota_unavailable"
     case invalidData = "invalid_data"
+    /// A detected/expired credential awaiting re-auth in the owning CLI.
+    case stale
 }
 
 public enum QuotaRefreshState: Equatable, Sendable {

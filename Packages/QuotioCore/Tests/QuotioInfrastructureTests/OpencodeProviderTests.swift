@@ -121,7 +121,7 @@ final class OpencodeProviderTests: XCTestCase {
         GatewayQuotaOverlay.applyOpencodeIssue(
             accountKey: "usr_det", stale: true, to: [account], issues: &issues)
         XCTAssertNotNil(issues[id])
-        XCTAssertEqual(issues[id]?.reason, .authentication)
+        XCTAssertEqual(issues[id]?.reason, .stale)
 
         GatewayQuotaOverlay.applyOpencodeIssue(
             accountKey: "USR_DET", stale: false, to: [account], issues: &issues)

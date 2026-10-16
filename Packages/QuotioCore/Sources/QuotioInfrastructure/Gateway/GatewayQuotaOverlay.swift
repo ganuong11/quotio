@@ -42,6 +42,10 @@ public actor GatewayQuotaOverlay {
     private let quotaService: any QoderQuotaFetching
     private let directory: any GatewayAccountDirectory
     private let credentials: any GatewayCredentialRemoving
+    /// Synchronous snapshot of OpenCode credentials detected in the native
+    /// install (fed by `OpencodeDetectedCache`). Detected accounts surface
+    /// read-only — the owning CLI still holds the credential.
+    private let detectedOpencode: @Sendable () -> [DetectedOpencodeCredential]
 
     private var quotaCache: [QuotaProvider: [String: ProviderQuota]] = [:]
     private var refreshing: Set<QuotaProvider> = []
@@ -65,12 +69,14 @@ public actor GatewayQuotaOverlay {
         wrapping host: any Host,
         quotaService: any QoderQuotaFetching,
         directory: any GatewayAccountDirectory,
-        credentials: any GatewayCredentialRemoving
+        credentials: any GatewayCredentialRemoving,
+        detectedOpencode: @escaping @Sendable () -> [DetectedOpencodeCredential] = { [] }
     ) {
         self.host = host
         self.quotaService = quotaService
         self.directory = directory
         self.credentials = credentials
+        self.detectedOpencode = detectedOpencode
         notificationObservers.tokens = [
             NotificationCenter.default.addObserver(
                 forName: OpencodeRouter.opencodeAccountStale, object: nil, queue: nil
@@ -134,7 +140,7 @@ public actor GatewayQuotaOverlay {
         let id = QuotaAccountID(provider: .opencode, accountKey: account.accountKey)
         if stale {
             issues[id] = QuotaRefreshIssue(
-                kind: .failed, occurredAt: now, reason: .authentication)
+                kind: .failed, occurredAt: now, reason: .stale)
         } else {
             issues.removeValue(forKey: id)
         }
@@ -167,6 +173,24 @@ public actor GatewayQuotaOverlay {
         QuotaProvider(rawValue: provider.rawValue) ?? .qoder
     }
 
+    /// Detected OpenCode credentials materialized as gateway accounts, minus
+    /// those already stored (the managed account wins — same priority as the
+    /// router's candidate list).
+    private func detectedAccounts(stored: [GatewayAccount]) -> [GatewayAccount] {
+        let storedKeys = Set(stored.map { $0.accountKey.lowercased() })
+        return detectedOpencode()
+            .filter { !storedKeys.contains($0.accountKey.lowercased()) }
+            .map {
+                GatewayAccount.make(
+                    provider: .opencode,
+                    accountKey: $0.accountKey,
+                    displayName: $0.email ?? $0.suggestedDisplayName,
+                    source: .detected,
+                    email: $0.email
+                )
+            }
+    }
+
     /// The `Account.id` a gateway account surfaces as — `monitor-`-prefixed,
     /// matching `AccountIdentity.make(providerID:accountKey:)` so rows rendered
     /// from `accounts()` line up with `accountIDs`/`accountIssues` maps.
@@ -195,7 +219,8 @@ public actor GatewayQuotaOverlay {
 
     private func merged(_ host: QuotaSnapshot) async -> QuotaSnapshot {
         var snapshot = host
-        let accounts = await directory.accounts()
+        let stored = await directory.accounts()
+        let accounts = stored + detectedAccounts(stored: stored)
         let disabledIDs = await directory.disabledAccountIDs()
 
         for account in accounts {
@@ -371,7 +396,8 @@ public actor GatewayQuotaOverlay {
     /// Resolve an incoming account ID — either the vault's `GatewayAccount.id`
     /// or the surfaced `Account.id` — to its gateway record.
     private func gatewayAccount(for accountID: String) async -> GatewayAccount? {
-        await directory.accounts().first { account in
+        let stored = await directory.accounts()
+        return (stored + detectedAccounts(stored: stored)).first { account in
             account.id == accountID
                 || Self.surfaceAccountID(
                     for: account,
@@ -424,7 +450,8 @@ public actor GatewayQuotaOverlay {
     public func accounts() async -> [Account] {
         var accounts = await host.accounts()
         let disabledIDs = await directory.disabledAccountIDs()
-        for account in await directory.accounts()
+        let stored = await directory.accounts()
+        for account in stored + detectedAccounts(stored: stored)
         where QuotaProvider.gatewayNativeProviders.contains(Self.quotaProvider(for: account.provider)) {
             accounts.append(Self.surfaceAccount(
                 for: account,
