@@ -376,3 +376,35 @@ public actor LocalProxyManagementClient: ProxyManagementChecking {
         return request
     }
 }
+
+public actor URLSessionProxyModelCatalog: ProxyModelCatalogFetching {
+    private let session: URLSession
+
+    public init(
+        session: URLSession = URLSession(
+            configuration: ProxyURLSessionFactory.makeConfiguration(timeout: 10)
+        )
+    ) {
+        self.session = session
+    }
+
+    public func fetchModels(
+        endpoint: ProxyEndpoint,
+        apiKey: String?
+    ) async throws -> [ModelCatalogEntry] {
+        guard let url = URL(string: "\(endpoint.baseURL)/v1/models") else {
+            throw URLError(.badURL)
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.addValue("application/json", forHTTPHeaderField: "Accept")
+        if let apiKey, !apiKey.isEmpty {
+            request.addValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        }
+        let (data, response) = try await session.data(for: request)
+        guard let response = response as? HTTPURLResponse, response.statusCode == 200 else {
+            throw URLError(.badServerResponse)
+        }
+        return try ModelCatalog.parse(data)
+    }
+}

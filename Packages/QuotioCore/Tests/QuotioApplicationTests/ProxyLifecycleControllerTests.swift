@@ -425,6 +425,61 @@ final class ProxyLifecycleControllerTests: XCTestCase {
         XCTAssertTrue(cleanedAfterStop.filter { $0 == 8317 }.count >= 2)
     }
 
+    func testAvailableModelsFailsWhileProxyStopped() async {
+        let harness = makeHarness()
+
+        await XCTAssertThrowsErrorAsync(
+            try await harness.controller.availableModels()
+        ) { error in
+            XCTAssertEqual(error as? ModelCatalogError, .proxyUnavailable)
+        }
+        let calls = await harness.modelCatalog.calls
+        XCTAssertTrue(calls.isEmpty)
+    }
+
+    func testAvailableModelsFetchViaFrontDoorWithFirstAPIKey() async throws {
+        let catalog = TestModelCatalog()
+        await catalog.setResult(.success([
+            ModelCatalogEntry(id: "gpt-6.1-sol", owner: "openai"),
+            ModelCatalogEntry(id: "qoder/ultimate", owner: "qoder"),
+        ]))
+        let harness = makeHarness(modelCatalog: catalog, apiKeys: ["key-one", "key-two"])
+
+        try await harness.controller.start()
+        let models = try await harness.controller.availableModels()
+
+        XCTAssertEqual(models.map(\.id), ["gpt-6.1-sol", "qoder/ultimate"])
+        let calls = await catalog.calls
+        XCTAssertEqual(calls, [TestModelCatalog.Call(port: 8317, apiKey: "key-one")])
+        await harness.controller.shutdown()
+    }
+
+    func testAvailableModelsFallsBackToInternalPortWithoutFrontDoor() async throws {
+        let catalog = TestModelCatalog()
+        let harness = makeHarness(installsFrontDoor: false, modelCatalog: catalog)
+
+        try await harness.controller.start()
+        _ = try await harness.controller.availableModels()
+
+        let calls = await catalog.calls
+        XCTAssertEqual(calls, [TestModelCatalog.Call(port: 18317, apiKey: nil)])
+        await harness.controller.shutdown()
+    }
+
+    func testAvailableModelsPropagatesFetchFailure() async throws {
+        let catalog = TestModelCatalog()
+        await catalog.setResult(.failure(URLError(.badServerResponse)))
+        let harness = makeHarness(modelCatalog: catalog)
+
+        try await harness.controller.start()
+        await XCTAssertThrowsErrorAsync(
+            try await harness.controller.availableModels()
+        ) { error in
+            XCTAssertEqual((error as? URLError)?.code, .badServerResponse)
+        }
+        await harness.controller.shutdown()
+    }
+
     private func makeHarness(
         process: TestProcessController = TestProcessController(),
         versions: TestVersionRepository = TestVersionRepository(),
@@ -433,6 +488,9 @@ final class ProxyLifecycleControllerTests: XCTestCase {
         management: TestManagementChecker = TestManagementChecker(),
         preferences: TestProxyPreferences = TestProxyPreferences(),
         frontDoor: TestFrontDoor = TestFrontDoor(),
+        installsFrontDoor: Bool = true,
+        modelCatalog: TestModelCatalog = TestModelCatalog(),
+        apiKeys: [String] = [],
         keyLoadDelay: Duration? = nil
     ) -> ProxyHarness {
         let paths = ProxyPaths(
@@ -442,7 +500,7 @@ final class ProxyLifecycleControllerTests: XCTestCase {
             expectedBinaryPath: "/tmp/proxy/current/CLIProxyAPI",
             internalProxyPort: 18317
         )
-        let configuration = TestConfigurationRepository(paths: paths)
+        let configuration = TestConfigurationRepository(paths: paths, apiKeys: apiKeys)
         let metadata = TestMetadataRepository()
         let keyVault = TestKeyVault(loadDelay: keyLoadDelay)
         let notifications = TestNotificationDelivery()
@@ -463,7 +521,8 @@ final class ProxyLifecycleControllerTests: XCTestCase {
             notificationDelivery: notifications,
             sleeper: sleeper,
             dateProvider: TestDateProvider(),
-            frontDoor: frontDoor
+            frontDoor: installsFrontDoor ? frontDoor : nil,
+            modelCatalog: modelCatalog
         )
         return ProxyHarness(
             controller: controller,
@@ -473,7 +532,8 @@ final class ProxyLifecycleControllerTests: XCTestCase {
             metadata: metadata,
             keyVault: keyVault,
             notifications: notifications,
-            frontDoor: frontDoor
+            frontDoor: frontDoor,
+            modelCatalog: modelCatalog
         )
     }
 
@@ -506,6 +566,26 @@ private struct ProxyHarness {
     let keyVault: TestKeyVault
     let notifications: TestNotificationDelivery
     let frontDoor: TestFrontDoor
+    let modelCatalog: TestModelCatalog
+}
+
+private actor TestModelCatalog: ProxyModelCatalogFetching {
+    struct Call: Equatable {
+        let port: UInt16
+        let apiKey: String?
+    }
+
+    private(set) var calls: [Call] = []
+    private var result: Result<[ModelCatalogEntry], Error> = .success([])
+
+    func setResult(_ result: Result<[ModelCatalogEntry], Error>) {
+        self.result = result
+    }
+
+    func fetchModels(endpoint: ProxyEndpoint, apiKey: String?) throws -> [ModelCatalogEntry] {
+        calls.append(Call(port: endpoint.port, apiKey: apiKey))
+        return try result.get()
+    }
 }
 
 private actor TestFrontDoor: ProxyFrontDoorListening {
@@ -698,9 +778,11 @@ private actor TestConfigurationRepository: ProxyConfigurationRepository {
     private(set) var calls: [String] = []
     private(set) var proxyURLValues: [String?] = []
     private(set) var removedTestConfigurationCount = 0
+    private let apiKeys: [String]
 
-    init(paths: ProxyPaths) {
+    init(paths: ProxyPaths, apiKeys: [String] = []) {
         self.storedPaths = paths
+        self.apiKeys = apiKeys
     }
 
     func paths() -> ProxyPaths { storedPaths }
@@ -722,6 +804,8 @@ private actor TestConfigurationRepository: ProxyConfigurationRepository {
     }
 
     func setManagementKey(_ key: String) {}
+
+    func loadAPIKeys() -> [String] { apiKeys }
 
     func makeTestConfiguration(port: UInt16, managementKey: String) -> String {
         "/tmp/test-\(port).yaml"
@@ -888,4 +972,18 @@ private actor TestSleeper: Sleeping {
 
 private struct TestDateProvider: DateProviding {
     func now() -> Date { Date(timeIntervalSince1970: 1_700_000_000) }
+}
+
+/// XCTAssertThrowsError doesn't compose with async; small local helper.
+private func XCTAssertThrowsErrorAsync<T>(
+    _ expression: @autoclosure () async throws -> T,
+    file: StaticString = #filePath, line: UInt = #line,
+    _ errorHandler: (Error) -> Void
+) async {
+    do {
+        _ = try await expression()
+        XCTFail("expected error", file: file, line: line)
+    } catch {
+        errorHandler(error)
+    }
 }

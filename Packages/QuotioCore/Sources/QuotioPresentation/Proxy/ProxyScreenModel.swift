@@ -220,6 +220,14 @@ public final class ProxyScreenModel {
         await refreshState()
     }
 
+    public func clientAPIKeys() async -> [String] {
+        await controller.clientAPIKeys()
+    }
+
+    public func availableModels() async throws -> [ModelCatalogEntry] {
+        try await controller.availableModels()
+    }
+
     private func observeIfNeeded() {
         guard observationTask == nil else { return }
         observationTask = Task { [weak self, controller] in

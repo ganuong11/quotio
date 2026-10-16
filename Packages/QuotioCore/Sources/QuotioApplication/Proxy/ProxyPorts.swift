@@ -41,6 +41,7 @@ public protocol ProxyConfigurationRepository: Sendable {
     func setRoutingStrategy(_ strategy: String) async
     func setProxyURL(_ url: String?) async
     func setManagementKey(_ key: String) async
+    func loadAPIKeys() async -> [String]
     func makeTestConfiguration(port: UInt16, managementKey: String) async throws -> String
     func removeTestConfiguration(at path: String) async
 }
@@ -82,6 +83,13 @@ public protocol ProxyNotificationDelivering: Sendable {
     func deliver(_ notification: ProxyNotification) async
 }
 
+public protocol ProxyModelCatalogFetching: Sendable {
+    /// Fetches the agent-facing `/v1/models` catalog at `endpoint`. `apiKey` is
+    /// one of the configured client API keys; pass `nil` when none exist to send
+    /// the request unauthenticated.
+    func fetchModels(endpoint: ProxyEndpoint, apiKey: String?) async throws -> [ModelCatalogEntry]
+}
+
 public protocol ProxyFrontDoorListening: Sendable {
     /// Binds the agent-facing listener. Throws when the bind fails so the
     /// lifecycle controller can surface the failure instead of leaving the
@@ -114,4 +122,6 @@ public protocol ProxyControlling: Sendable {
     func setRoutingStrategy(_ strategy: String) async
     func setProxyURL(_ url: String?) async
     func regenerateManagementKey() async throws
+    func clientAPIKeys() async -> [String]
+    func availableModels() async throws -> [ModelCatalogEntry]
 }

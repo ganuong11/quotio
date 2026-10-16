@@ -532,7 +532,9 @@
     "settings.proxy.version" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "Version"}}, "vi": {"stringUnit": {"state": "translated", "value": "Phiên bản"}}, "fr": {"stringUnit": {"state": "translated", "value": "Version"}}, "zh-Hans": {"stringUnit": {"state": "translated", "value": "版本"}}}},
     "settings.proxy.port" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "Port"}}, "vi": {"stringUnit": {"state": "translated", "value": "Cổng"}}, "fr": {"stringUnit": {"state": "translated", "value": "Port"}}, "zh-Hans": {"stringUnit": {"state": "translated", "value": "端口"}}}},
     "settings.proxy.configuration" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "Configuration"}}, "vi": {"stringUnit": {"state": "translated", "value": "Cấu hình"}}, "fr": {"stringUnit": {"state": "translated", "value": "Configuration"}}, "zh-Hans": {"stringUnit": {"state": "translated", "value": "配置"}}}},
-    "settings.proxy.copyKey" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "Copy Key"}}, "vi": {"stringUnit": {"state": "translated", "value": "Sao chép key"}}, "fr": {"stringUnit": {"state": "translated", "value": "Copier la clé"}}, "zh-Hans": {"stringUnit": {"state": "translated", "value": "复制密钥"}}}},
+    "settings.proxy.copyKey" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "Copy Management Key"}}, "vi": {"stringUnit": {"state": "translated", "value": "Sao chép khóa quản lý"}}, "fr": {"stringUnit": {"state": "translated", "value": "Copier la clé de gestion"}}, "zh-Hans": {"stringUnit": {"state": "translated", "value": "复制管理密钥"}}}},
+    "settings.proxy.clientAPIKeys" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "Client API Keys"}}, "vi": {"stringUnit": {"state": "translated", "value": "Khóa API client"}}, "fr": {"stringUnit": {"state": "translated", "value": "Clés API client"}}, "zh-Hans": {"stringUnit": {"state": "translated", "value": "客户端 API 密钥"}}}},
+    "settings.proxy.apiKeysHint" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "Add or remove keys on the management page."}}, "vi": {"stringUnit": {"state": "translated", "value": "Thêm hoặc xóa khóa trên trang quản lý."}}, "fr": {"stringUnit": {"state": "translated", "value": "Ajoutez ou supprimez des clés sur la page de gestion."}}, "zh-Hans": {"stringUnit": {"state": "translated", "value": "在管理页面中添加或删除密钥。"}}}},
     "settings.proxy.openManagement" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "Open Management Page"}}, "vi": {"stringUnit": {"state": "translated", "value": "Mở trang quản lý"}}, "fr": {"stringUnit": {"state": "translated", "value": "Ouvrir la page de gestion"}}, "zh-Hans": {"stringUnit": {"state": "translated", "value": "打开管理页面"}}}},
     "settings.proxy.endpoint" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "Endpoint"}}, "vi": {"stringUnit": {"state": "translated", "value": "Địa chỉ endpoint"}}, "fr": {"stringUnit": {"state": "translated", "value": "Adresse du serveur"}}, "zh-Hans": {"stringUnit": {"state": "translated", "value": "服务地址"}}}},
     "settings.proxy.state" : {"localizations": {"en": {"stringUnit": {"state": "translated", "value": "Status"}}, "vi": {"stringUnit": {"state": "translated", "value": "Trạng thái"}}, "fr": {"stringUnit": {"state": "translated", "value": "État"}}, "zh-Hans": {"stringUnit": {"state": "translated", "value": "状态"}}}},
@@ -5133,6 +5135,90 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "刷新失败 — 显示的是 %@ 获取的列表，可能已过时。"
+          }
+        }
+      }
+    },
+    "availableModels.otherOwner" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Other"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Autres"
+          }
+        },
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Khác"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "其他"
+          }
+        }
+      }
+    },
+    "settings.proxy.availableModels" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Available Models"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modèles disponibles"
+          }
+        },
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mô hình khả dụng"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "可用模型"
+          }
+        }
+      }
+    },
+    "settings.proxy.availableModelsHint" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Model IDs the proxy currently serves on /v1/models, grouped by owner."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Identifiants de modèles que le proxy sert actuellement sur /v1/models, regroupés par propriétaire."
+          }
+        },
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ID mô hình mà proxy hiện phục vụ trên /v1/models, nhóm theo chủ sở hữu."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "代理当前通过 /v1/models 提供的模型 ID，按所有者分组。"
           }
         }
       }

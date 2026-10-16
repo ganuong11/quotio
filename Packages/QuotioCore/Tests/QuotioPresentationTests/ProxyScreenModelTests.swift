@@ -131,10 +131,16 @@ private actor StubProxyController: ProxyControlling {
     private var recordedActions: [String] = []
 
     private let startFailure: ProxyFailure?
+    private let catalogResult: Result<[ModelCatalogEntry], Error>
 
-    init(snapshot: ProxySnapshot, startFailure: ProxyFailure? = nil) {
+    init(
+        snapshot: ProxySnapshot,
+        startFailure: ProxyFailure? = nil,
+        catalogResult: Result<[ModelCatalogEntry], Error> = .success([])
+    ) {
         self.value = snapshot
         self.startFailure = startFailure
+        self.catalogResult = catalogResult
     }
 
     func snapshots() -> AsyncStream<ProxySnapshot> {
@@ -221,6 +227,13 @@ private actor StubProxyController: ProxyControlling {
 
     func regenerateManagementKey() throws {
         recordedActions.append("regenerateManagementKey")
+    }
+
+    func clientAPIKeys() -> [String] { [] }
+
+    func availableModels() throws -> [ModelCatalogEntry] {
+        recordedActions.append("availableModels")
+        return try catalogResult.get()
     }
 
     func actions() -> [String] { recordedActions }

@@ -72,6 +72,7 @@ enum CompositionRoot {
             sleeper: ContinuousSleeper(),
             dateProvider: SystemDateProvider(),
             frontDoor: gatewayListener,
+            modelCatalog: URLSessionProxyModelCatalog(),
             installedVersionLimit: AppConstants.maxInstalledVersions
         )
         let proxyScreenModel = ProxyScreenModel(

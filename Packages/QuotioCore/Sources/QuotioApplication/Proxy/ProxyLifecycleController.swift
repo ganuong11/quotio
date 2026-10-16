@@ -19,6 +19,7 @@ public actor ProxyLifecycleController: ProxyControlling {
     private let dateProvider: any DateProviding
     private let startupPoller: ProxyStartupHealthPoller
     private let frontDoor: (any ProxyFrontDoorListening)?
+    private let modelCatalog: any ProxyModelCatalogFetching
     private let installedVersionLimit: Int
 
     private var stateMachine = ProxyLifecycleStateMachine()
@@ -57,6 +58,7 @@ public actor ProxyLifecycleController: ProxyControlling {
         dateProvider: any DateProviding,
         startupPoller: ProxyStartupHealthPoller = ProxyStartupHealthPoller(),
         frontDoor: (any ProxyFrontDoorListening)? = nil,
+        modelCatalog: any ProxyModelCatalogFetching,
         installedVersionLimit: Int = 3
     ) {
         self.processController = processController
@@ -76,6 +78,7 @@ public actor ProxyLifecycleController: ProxyControlling {
         self.dateProvider = dateProvider
         self.startupPoller = startupPoller
         self.frontDoor = frontDoor
+        self.modelCatalog = modelCatalog
         self.installedVersionLimit = installedVersionLimit
         self.currentSnapshot = ProxySnapshot(paths: paths)
     }
@@ -479,6 +482,24 @@ public actor ProxyLifecycleController: ProxyControlling {
     public func setProxyURL(_ url: String?) async {
         await configurationRepository.setProxyURL(url)
         await restartIfRunning()
+    }
+
+    public func clientAPIKeys() async -> [String] {
+        await configurationRepository.loadAPIKeys()
+    }
+
+    public func availableModels() async throws -> [ModelCatalogEntry] {
+        guard currentSnapshot.status.running else {
+            throw ModelCatalogError.proxyUnavailable
+        }
+        // The front door serves the merged catalog (CPA + provider overlays).
+        // Without it, CPA's own listener on the internal port is the catalog.
+        let port = frontDoor != nil
+            ? currentSnapshot.status.port
+            : currentSnapshot.paths.internalProxyPort
+        let endpoint = try ProxyEndpoint(port: port)
+        let apiKey = await configurationRepository.loadAPIKeys().first
+        return try await modelCatalog.fetchModels(endpoint: endpoint, apiKey: apiKey)
     }
 
     public func regenerateManagementKey() async throws {

@@ -10,11 +10,16 @@ struct CLIProxySettingsPage: View {
     @State private var showVersions = false
     @State private var working = false
     @State private var errorMessage: String?
+    @State private var clientAPIKeys: [String] = []
+    @State private var modelCatalog = ModelCatalogState()
+    @State private var copiedModelID: String?
 
     var body: some View {
         Form {
             if proxy.isBinaryInstalled {
                 serverSection
+                clientAPIKeysSection
+                availableModelsSection
                 configurationSection
                 versionSection
             } else {
@@ -51,6 +56,16 @@ struct CLIProxySettingsPage: View {
         .navigationTitle("CLIProxyAPI")
         .onAppear { portText = String(proxy.port) }
         .onChange(of: proxy.port) { _, port in portText = String(port) }
+        .task {
+            await refreshClientAPIKeys()
+            await refreshModels()
+        }
+        .onChange(of: proxy.proxyStatus.running) { _, _ in
+            Task {
+                await refreshClientAPIKeys()
+                await refreshModels()
+            }
+        }
         .sheet(isPresented: $showVersions) { ProxyVersionManagerSheet() }
     }
 
@@ -80,13 +95,13 @@ struct CLIProxySettingsPage: View {
                         Text("settings.proxy.endpoint".localized())
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                        Text(proxy.baseURL)
+                        Text(proxy.baseURL + "/v1")
                             .font(.system(.body, design: .monospaced))
                             .textSelection(.enabled)
                     }
                     Spacer()
                     Button("action.copy".localized(), systemImage: "doc.on.doc") {
-                        pasteboard.copy(proxy.baseURL)
+                        pasteboard.copy(proxy.baseURL + "/v1")
                     }
                     .labelStyle(.iconOnly)
                     .help("action.copy".localized())
@@ -112,6 +127,163 @@ struct CLIProxySettingsPage: View {
             pasteboard.copy(proxy.managementKey)
         }
         .disabled(proxy.managementKey.isEmpty)
+    }
+
+    private var clientAPIKeysSection: some View {
+        Section {
+            if clientAPIKeys.isEmpty {
+                Text("apiKeys.emptyDescription".localized())
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(clientAPIKeys, id: \.self) { key in
+                    HStack {
+                        Text(maskedKey(key))
+                            .font(.system(.body, design: .monospaced))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer()
+                        Button("action.copy".localized(), systemImage: "doc.on.doc") {
+                            pasteboard.copy(key)
+                        }
+                        .labelStyle(.iconOnly)
+                        .help("action.copy".localized())
+                    }
+                }
+            }
+        } header: {
+            Text("settings.proxy.clientAPIKeys".localized())
+        } footer: {
+            Text("settings.proxy.apiKeysHint".localized())
+        }
+    }
+
+    private struct ModelGroup: Identifiable {
+        let owner: String
+        let entries: [ModelCatalogEntry]
+        var id: String { owner }
+    }
+
+    private var modelGroups: [ModelGroup] {
+        Dictionary(grouping: modelCatalog.entries, by: { $0.displayOwner ?? "" })
+            .map { ModelGroup(owner: $0.key, entries: $0.value) }
+            .sorted {
+                $0.owner.localizedCaseInsensitiveCompare($1.owner) == .orderedAscending
+            }
+    }
+
+    private var availableModelsSection: some View {
+        Section {
+            if !proxy.proxyStatus.running {
+                modelNoteRow(icon: "pause.circle", text: "availableModels.proxyStopped".localized())
+            } else if modelCatalog.isLoading && !modelCatalog.hasCompletedFetch {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("availableModels.loading".localized())
+                        .foregroundStyle(.secondary)
+                }
+            } else if modelCatalog.entries.isEmpty && modelCatalog.lastFetchFailed {
+                modelNoteRow(icon: "exclamationmark.triangle", text: "availableModels.error".localized())
+            } else if modelCatalog.isEmptyLiveResult {
+                modelNoteRow(icon: "tray", text: "availableModels.empty".localized())
+            } else if !modelCatalog.entries.isEmpty {
+                catalogRows
+            }
+        } header: {
+            Text("settings.proxy.availableModels".localized())
+        } footer: {
+            Text("settings.proxy.availableModelsHint".localized())
+        }
+    }
+
+    @ViewBuilder
+    private var catalogRows: some View {
+        HStack {
+            Text(String(format: "availableModels.modelCount".localized(), modelCatalog.entries.count))
+                .foregroundStyle(.secondary)
+            Spacer()
+            RefreshButton(title: "action.refresh".localized(), isRefreshing: modelCatalog.isLoading) {
+                await refreshModels()
+            }
+            .labelStyle(.iconOnly)
+            .buttonStyle(.borderless)
+            .help("action.refresh".localized())
+        }
+        if case .stale(let fetchedAt) = modelCatalog.freshness {
+            Label(
+                String(format: "availableModels.stale".localized(),
+                       fetchedAt.formatted(date: .omitted, time: .standard)),
+                systemImage: "exclamationmark.triangle"
+            )
+            .font(.caption)
+            .foregroundStyle(.orange)
+        }
+        ForEach(modelGroups) { group in
+            DisclosureGroup {
+                ForEach(group.entries) { entry in
+                    modelRow(entry)
+                }
+            } label: {
+                HStack {
+                    Text(modelGroupLabel(group.owner))
+                    Spacer()
+                    Text("\(group.entries.count)")
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private func modelRow(_ entry: ModelCatalogEntry) -> some View {
+        HStack {
+            Text(entry.id)
+                .font(.system(.body, design: .monospaced))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer()
+            Button("action.copy".localized(), systemImage: copiedModelID == entry.id ? "checkmark" : "doc.on.doc") {
+                pasteboard.copy(entry.id)
+                copiedModelID = entry.id
+                Task {
+                    try? await Task.sleep(for: .seconds(1.5))
+                    if copiedModelID == entry.id { copiedModelID = nil }
+                }
+            }
+            .labelStyle(.iconOnly)
+            .help("action.copy".localized())
+        }
+    }
+
+    private func modelNoteRow(icon: String, text: String) -> some View {
+        Label(text, systemImage: icon)
+            .foregroundStyle(.secondary)
+    }
+
+    private func modelGroupLabel(_ owner: String) -> String {
+        guard !owner.isEmpty else { return "availableModels.otherOwner".localized() }
+        return QuotaProvider(rawValue: owner)?.displayName ?? owner
+    }
+
+    private func refreshModels() async {
+        guard proxy.proxyStatus.running else {
+            modelCatalog.reset()
+            return
+        }
+        modelCatalog.beginLoading()
+        do {
+            let entries = try await proxy.availableModels()
+            modelCatalog.apply(entries: entries, fetchedAt: Date())
+        } catch {
+            modelCatalog.applyFailure()
+        }
+    }
+
+    private func maskedKey(_ key: String) -> String {
+        guard key.count > 8 else { return String(repeating: "•", count: key.count) }
+        return "\(key.prefix(6))••••••••\(key.suffix(4))"
+    }
+
+    private func refreshClientAPIKeys() async {
+        clientAPIKeys = await proxy.clientAPIKeys()
     }
 
     private var configurationSection: some View {

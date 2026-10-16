@@ -371,6 +371,8 @@ private actor PollingProxyFake: ProxyControlling {
     func setRoutingStrategy(_ strategy: String) {}
     func setProxyURL(_ url: String?) {}
     func regenerateManagementKey() throws {}
+    func clientAPIKeys() -> [String] { [] }
+    func availableModels() throws -> [ModelCatalogEntry] { [] }
 }
 
 @MainActor
