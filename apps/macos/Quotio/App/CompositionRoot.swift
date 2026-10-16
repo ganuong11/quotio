@@ -183,6 +183,25 @@ enum CompositionRoot {
             await accountsScreenModel.reloadAccounts()
             return result
         }
+        let gatewayAccountStore = GatewayAccountStore(identity: identity)
+        let gatewayCredentialVault = GatewayCredentialVault(
+            dataStore: KeychainCredentialDataStore(
+                service: AppIdentity.keychainService(suffix: "gateway-credentials"),
+                canMigrateLegacy: false
+            ),
+            accounts: gatewayAccountStore
+        )
+        let gatewayLegacyImport = GatewayLegacyImport(
+            legacyAccountsURL: FileManager.default
+                .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("Quotio/Monitor/accounts-v1.json"),
+            legacyServices: [AppIdentity.keychainService(suffix: "monitor-auth")]
+                + AppIdentity.legacyKeychainServices(suffix: "monitor-auth"),
+            reader: ExternalKeychainCredentialReader()
+        )
+        Task {
+            await gatewayLegacyImport.run(into: gatewayCredentialVault)
+        }
         let launchAtLoginController = LaunchAtLoginController(
             registration: ServiceManagementLaunchAtLoginAdapter(),
             urlOpener: urlOpener
