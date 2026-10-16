@@ -31,7 +31,8 @@ public actor FileProxyConfigurationRepository: ProxyConfigurationRepository {
             authDirectoryPath: identity.proxyAuthDirectory(
                 home: fileManager.homeDirectoryForCurrentUser, applicationSupport: appSupport
             ).path,
-            expectedBinaryPath: proxyDirectory.appendingPathComponent("CLIProxyAPI").path
+            expectedBinaryPath: proxyDirectory.appendingPathComponent("CLIProxyAPI").path,
+            internalProxyPort: identity.internalProxyPort
         )
     }
 
@@ -39,11 +40,7 @@ public actor FileProxyConfigurationRepository: ProxyConfigurationRepository {
         resolvedPaths
     }
 
-    public func ensureExists(
-        port: UInt16,
-        managementKey: String,
-        allowNetworkAccess: Bool
-    ) {
+    public func ensureExists(managementKey: String) {
         let configURL = URL(fileURLWithPath: resolvedPaths.configPath)
         try? fileManager.createDirectory(
             at: configURL.deletingLastPathComponent(),
@@ -53,11 +50,14 @@ public actor FileProxyConfigurationRepository: ProxyConfigurationRepository {
             atPath: resolvedPaths.authDirectoryPath,
             withIntermediateDirectories: true
         )
-        guard !fileManager.fileExists(atPath: resolvedPaths.configPath) else { return }
+        if fileManager.fileExists(atPath: resolvedPaths.configPath) {
+            migrateManagedKeys()
+            return
+        }
 
         let configuration = """
-        host: "\(allowNetworkAccess ? "0.0.0.0" : "127.0.0.1")"
-        port: \(port)
+        host: "127.0.0.1"
+        port: \(resolvedPaths.internalProxyPort)
         auth-dir: "\(resolvedPaths.authDirectoryPath)"
         proxy-url: ""
 
@@ -89,12 +89,38 @@ public actor FileProxyConfigurationRepository: ProxyConfigurationRepository {
         )
     }
 
-    public func setPort(_ port: UInt16) {
-        updateValue(pattern: #"port:\s*\d+"#, replacement: "port: \(port)")
-    }
-
-    public func setHost(_ host: String) {
-        updateValue(pattern: #"host:\s*"[^"]*""#, replacement: "host: \"\(host)\"")
+    private func migrateManagedKeys() {
+        guard var content = try? String(
+            contentsOfFile: resolvedPaths.configPath,
+            encoding: .utf8
+        ) else {
+            return
+        }
+        let managedHost = #"host: "127.0.0.1""#
+        let managedPort = "port: \(resolvedPaths.internalProxyPort)"
+        var sawHost = false
+        var sawPort = false
+        var lines = content.components(separatedBy: "\n")
+        for index in lines.indices {
+            let line = lines[index]
+            if line.range(of: #"^host:\s*"#, options: .regularExpression) != nil {
+                lines[index] = managedHost
+                sawHost = true
+            } else if line.range(of: #"^port:\s*\d+"#, options: .regularExpression) != nil {
+                lines[index] = managedPort
+                sawPort = true
+            }
+        }
+        var missing: [String] = []
+        if !sawHost { missing.append(managedHost) }
+        if !sawPort { missing.append(managedPort) }
+        if !missing.isEmpty {
+            lines.insert(contentsOf: missing, at: 0)
+        }
+        let migrated = lines.joined(separator: "\n")
+        guard migrated != content else { return }
+        content = migrated
+        write(content)
     }
 
     public func ensureAPIKey() {

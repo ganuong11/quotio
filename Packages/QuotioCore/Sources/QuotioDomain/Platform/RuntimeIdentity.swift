@@ -13,6 +13,7 @@ public struct RuntimeIdentity: Equatable, Sendable {
     public var isProduction: Bool { bundleIdentifier == Self.productionBundleIdentifier }
     public var applicationSupportDirectoryName: String { isProduction ? "Quotio" : bundleIdentifier }
     public var defaultProxyPort: UInt16 { isProduction ? 8317 : 8318 }
+    public var internalProxyPort: UInt16 { isProduction ? 18317 : 18318 }
     public var allowsLegacyAccountMigration: Bool { isProduction }
     public var applicationUpdatePolicy: ApplicationUpdatePolicy {
         isProduction || bundleIdentifier == Self.betaBundleIdentifier ? .sparkle : .manualDownload

@@ -117,9 +117,9 @@ public actor ProxyProcessController: ProxyProcessControlling {
 
     public func firstAvailablePort(
         in range: ClosedRange<UInt16>,
-        excluding excludedPort: UInt16
+        excluding excludedPorts: Set<UInt16>
     ) throws -> UInt16 {
-        for port in range where port != excludedPort {
+        for port in range where !excludedPorts.contains(port) {
             if !Self.isPortInUse(port) {
                 return port
             }

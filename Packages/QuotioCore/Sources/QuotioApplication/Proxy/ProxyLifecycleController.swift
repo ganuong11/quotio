@@ -129,11 +129,7 @@ public actor ProxyLifecycleController: ProxyControlling {
         currentSnapshot.managementKey = managementKey
         currentSnapshot.lastUpdateCheckDate = metadataRepository.loadLastUpdateCheckDate()
         currentSnapshot.legacyInstalledVersion = metadataRepository.loadLegacyInstalledVersion()
-        await configurationRepository.ensureExists(
-            port: port,
-            managementKey: managementKey,
-            allowNetworkAccess: preferences.allowNetworkAccess
-        )
+        await configurationRepository.ensureExists(managementKey: managementKey)
         await refreshVersionState()
         isInitialized = true
         isInitializing = false
@@ -452,13 +448,11 @@ public actor ProxyLifecycleController: ProxyControlling {
         guard port > 0, port != currentSnapshot.status.port else { return }
         currentSnapshot.status.port = port
         metadataRepository.savePort(port)
-        await configurationRepository.setPort(port)
         publish()
         await restartIfRunning()
     }
 
     public func setNetworkAccess(_ enabled: Bool) async {
-        await configurationRepository.setHost(enabled ? "0.0.0.0" : "127.0.0.1")
         if enabled {
             await configurationRepository.ensureAPIKey()
         }
@@ -543,6 +537,7 @@ public actor ProxyLifecycleController: ProxyControlling {
 
         let port = currentSnapshot.status.port
         await processController.cleanupProcesses(on: port)
+        await processController.cleanupProcesses(on: currentSnapshot.paths.internalProxyPort)
         try ensureCurrentOperation(operationID)
         await prepareConfigurationForStart()
         try ensureCurrentOperation(operationID)
@@ -568,7 +563,7 @@ public actor ProxyLifecycleController: ProxyControlling {
         } catch {
             if activeRunID == runID {
                 activeRunID = nil
-                await processController.stop(runID, on: port)
+                await processController.stop(runID, on: currentSnapshot.paths.internalProxyPort)
                 currentSnapshot.status.running = false
                 try? transition(to: .idle)
                 publish()
@@ -592,7 +587,6 @@ public actor ProxyLifecycleController: ProxyControlling {
         await configurationSupplement.synchronize(
             configurationPath: currentSnapshot.paths.configPath
         )
-        await configurationRepository.setPort(currentSnapshot.status.port)
     }
 
     private func stopActiveProcess(
@@ -616,7 +610,8 @@ public actor ProxyLifecycleController: ProxyControlling {
         activeRunID = nil
         currentSnapshot.status.running = false
         publish()
-        await processController.stop(runID, on: currentSnapshot.status.port)
+        await processController.stop(runID, on: currentSnapshot.paths.internalProxyPort)
+        await processController.cleanupProcesses(on: currentSnapshot.status.port)
 
         if let operationID, activeOperationID != operationID {
             return
@@ -633,7 +628,10 @@ public actor ProxyLifecycleController: ProxyControlling {
         do {
             port = try await processController.firstAvailablePort(
                 in: 18_000...18_100,
-                excluding: currentSnapshot.status.port
+                excluding: [
+                    currentSnapshot.status.port,
+                    currentSnapshot.paths.internalProxyPort,
+                ]
             )
         } catch {
             throw ProxyFailure.dryRunFailed("No available port for testing")
@@ -789,7 +787,7 @@ public actor ProxyLifecycleController: ProxyControlling {
 
     private func performHealthCheck(for runID: ProxyRunID) async {
         guard activeRunID == runID, currentSnapshot.status.running else { return }
-        let endpoint = try? ProxyEndpoint(port: currentSnapshot.status.port)
+        let endpoint = try? ProxyEndpoint(port: currentSnapshot.paths.internalProxyPort)
         guard let endpoint else { return }
         let healthy = await managementChecker.isHealthy(
             endpoint: endpoint,

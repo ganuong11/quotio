@@ -319,6 +319,60 @@ final class ProxyLifecycleControllerTests: XCTestCase {
         await harness.controller.shutdown()
     }
 
+    func testSetNetworkAccessKeepsManagedConfigurationHostUntouched() async {
+        let harness = makeHarness()
+
+        await harness.controller.setNetworkAccess(true)
+
+        let calls = await harness.configuration.calls
+        XCTAssertTrue(calls.contains("ensureAPIKey"))
+        XCTAssertFalse(calls.contains { $0.hasPrefix("setHost") || $0.hasPrefix("setPort") })
+    }
+
+    func testSetPortLeavesManagedConfigurationPortAlone() async {
+        let harness = makeHarness()
+
+        await harness.controller.setPort(9000)
+
+        let snapshot = await harness.controller.snapshot()
+        let calls = await harness.configuration.calls
+        XCTAssertEqual(snapshot.status.port, 9000)
+        XCTAssertEqual(harness.metadata.savedPort, 9000)
+        XCTAssertFalse(calls.contains { $0.hasPrefix("setPort") || $0.hasPrefix("setHost") })
+    }
+
+    func testHealthCheckTargetsInternalProxyPort() async throws {
+        let sleeper = TestSleeper(healthSleepsToRelease: 1)
+        let management = TestManagementChecker(healthResponses: [true])
+        let harness = makeHarness(sleeper: sleeper, management: management)
+
+        try await harness.controller.start()
+
+        let checked = await waitUntil {
+            await management.healthCheckPorts.isEmpty == false
+        }
+        let ports = await management.healthCheckPorts
+        XCTAssertTrue(checked)
+        XCTAssertEqual(ports, [18317])
+        await harness.controller.shutdown()
+    }
+
+    func testStartupCleanupAndStopCoverInternalPort() async throws {
+        let harness = makeHarness()
+
+        try await harness.controller.start()
+        let cleanedPorts = await harness.process.cleanedPorts
+        XCTAssertTrue(cleanedPorts.contains(8317))
+        XCTAssertTrue(cleanedPorts.contains(18317))
+
+        await harness.controller.stopAndWait()
+
+        let stoppedPorts = await harness.process.stoppedPorts
+        let cleanedAfterStop = await harness.process.cleanedPorts
+        XCTAssertTrue(stoppedPorts.contains(18317))
+        XCTAssertTrue(cleanedAfterStop.filter { $0 == 8317 }.count >= 2)
+    }
+
     private func makeHarness(
         process: TestProcessController = TestProcessController(),
         versions: TestVersionRepository = TestVersionRepository(),
@@ -332,7 +386,8 @@ final class ProxyLifecycleControllerTests: XCTestCase {
             legacyBinaryPath: "/tmp/legacy/CLIProxyAPI",
             configPath: "/tmp/config.yaml",
             authDirectoryPath: "/tmp/auth",
-            expectedBinaryPath: "/tmp/proxy/current/CLIProxyAPI"
+            expectedBinaryPath: "/tmp/proxy/current/CLIProxyAPI",
+            internalProxyPort: 18317
         )
         let configuration = TestConfigurationRepository(paths: paths)
         let metadata = TestMetadataRepository()
@@ -404,6 +459,8 @@ private actor TestProcessController: ProxyProcessControlling {
     private var startRunningOutcomes: [Bool]
     private var startFailuresRemaining: Int
     private(set) var stopCount = 0
+    private(set) var cleanedPorts: [UInt16] = []
+    private(set) var stoppedPorts: [UInt16] = []
 
     init(startRunningOutcomes: [Bool] = [], startFailuresRemaining: Int = 0) {
         self.startRunningOutcomes = startRunningOutcomes
@@ -434,18 +491,21 @@ private actor TestProcessController: ProxyProcessControlling {
 
     func stop(_ runID: ProxyRunID?, on port: UInt16) {
         stopCount += 1
+        stoppedPorts.append(port)
         if let runID {
             runningIDs.remove(runID)
         }
     }
 
-    func cleanupProcesses(on port: UInt16) {}
+    func cleanupProcesses(on port: UInt16) {
+        cleanedPorts.append(port)
+    }
 
     func firstAvailablePort(
         in range: ClosedRange<UInt16>,
-        excluding port: UInt16
+        excluding excludedPorts: Set<UInt16>
     ) throws -> UInt16 {
-        range.first(where: { $0 != port })!
+        range.first(where: { !excludedPorts.contains($0) })!
     }
 
     func emitExit(requestIndex: Int, exitCode: Int32) {
@@ -550,6 +610,7 @@ private actor TestVersionRepository: ProxyVersionRepository {
 private actor TestConfigurationRepository: ProxyConfigurationRepository {
     private let storedPaths: ProxyPaths
     private(set) var ensureCount = 0
+    private(set) var calls: [String] = []
     private(set) var proxyURLValues: [String?] = []
     private(set) var removedTestConfigurationCount = 0
 
@@ -559,13 +620,14 @@ private actor TestConfigurationRepository: ProxyConfigurationRepository {
 
     func paths() -> ProxyPaths { storedPaths }
 
-    func ensureExists(port: UInt16, managementKey: String, allowNetworkAccess: Bool) {
+    func ensureExists(managementKey: String) {
         ensureCount += 1
+        calls.append("ensureExists")
     }
 
-    func setPort(_ port: UInt16) {}
-    func setHost(_ host: String) {}
-    func ensureAPIKey() {}
+    func ensureAPIKey() {
+        calls.append("ensureAPIKey")
+    }
     func setAllowRemote(_ enabled: Bool) {}
     func setLogging(_ enabled: Bool) {}
     func setRoutingStrategy(_ strategy: String) {}
@@ -634,6 +696,7 @@ private struct TestChecksumVerifier: ProxyChecksumVerifying {
 private actor TestManagementChecker: ProxyManagementChecking {
     private var healthResponses: [Bool]
     private let compatibilityResult: ProxyCompatibilityResult
+    private(set) var healthCheckPorts: [UInt16] = []
 
     init(
         healthResponses: [Bool] = [],
@@ -648,7 +711,8 @@ private actor TestManagementChecker: ProxyManagementChecking {
         managementKey: String,
         timeout: Duration
     ) -> Bool {
-        healthResponses.isEmpty ? true : healthResponses.removeFirst()
+        healthCheckPorts.append(endpoint.port)
+        return healthResponses.isEmpty ? true : healthResponses.removeFirst()
     }
 
     func compatibility(
@@ -661,9 +725,10 @@ private actor TestManagementChecker: ProxyManagementChecking {
 
 private final class TestMetadataRepository: ProxyRuntimeMetadataRepository, @unchecked Sendable {
     private(set) var savedLegacyVersion: String?
+    private(set) var savedPort: UInt16?
 
     func loadPort() -> UInt16 { 8317 }
-    func savePort(_ port: UInt16) {}
+    func savePort(_ port: UInt16) { savedPort = port }
     func loadLegacyInstalledVersion() -> String? { "1.0.0" }
     func saveLegacyInstalledVersion(_ version: String) { savedLegacyVersion = version }
     func loadLastUpdateCheckDate() -> Date? { nil }

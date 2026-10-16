@@ -76,12 +76,12 @@ final class ProxyInfrastructureTests: XCTestCase {
         XCTAssertEqual(versions, ["2.0.0"])
     }
 
-    func testExistingConfigurationIsPreservedAndTargetedUpdatesKeepUnknownContent() async throws {
+    func testExistingConfigurationMigratesManagedKeysAndKeepsUnknownContent() async throws {
         let directory = try makeTemporaryDirectory()
         defer { try? fileManager.removeItem(at: directory) }
         let configURL = directory.appendingPathComponent("config.yaml")
         let original = """
-        host: "127.0.0.1"
+        host: "0.0.0.0"
         port: 8317
         proxy-url: "http://old.example:8080"
         user-owned-setting: keep-me
@@ -97,19 +97,20 @@ final class ProxyInfrastructureTests: XCTestCase {
         )
         let repository = FileProxyConfigurationRepository(paths: paths)
 
-        await repository.ensureExists(
-            port: 9000,
-            managementKey: "replacement-key",
-            allowNetworkAccess: true
-        )
-        XCTAssertEqual(try String(contentsOf: configURL, encoding: .utf8), original)
+        await repository.ensureExists(managementKey: "replacement-key")
 
-        await repository.setPort(9000)
+        let migrated = try String(contentsOf: configURL, encoding: .utf8)
+        XCTAssertTrue(migrated.contains("port: 18317"))
+        XCTAssertTrue(migrated.contains(#"host: "127.0.0.1""#))
+        XCTAssertFalse(migrated.contains("0.0.0.0"))
+        XCTAssertTrue(migrated.contains("proxy-url: \"http://old.example:8080\""))
+        XCTAssertTrue(migrated.contains("user-owned-setting: keep-me"))
+
         await repository.setProxyURL("http://new.example:9001")
         await repository.setManagementKey("replacement-key")
 
         let updated = try String(contentsOf: configURL, encoding: .utf8)
-        XCTAssertTrue(updated.contains("port: 9000"))
+        XCTAssertTrue(updated.contains("port: 18317"))
         XCTAssertTrue(updated.contains("proxy-url: \"http://new.example:9001\""))
         XCTAssertTrue(updated.contains("secret-key: \"replacement-key\""))
         XCTAssertTrue(updated.contains("user-owned-setting: keep-me"))

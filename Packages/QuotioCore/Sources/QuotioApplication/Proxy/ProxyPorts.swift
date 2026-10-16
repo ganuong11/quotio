@@ -9,7 +9,7 @@ public protocol ProxyProcessControlling: Sendable {
     func isRunning(_ runID: ProxyRunID) async -> Bool
     func stop(_ runID: ProxyRunID?, on port: UInt16) async
     func cleanupProcesses(on port: UInt16) async
-    func firstAvailablePort(in range: ClosedRange<UInt16>, excluding port: UInt16) async throws -> UInt16
+    func firstAvailablePort(in range: ClosedRange<UInt16>, excluding ports: Set<UInt16>) async throws -> UInt16
 }
 
 public protocol ProxyVersionRepository: Sendable {
@@ -34,9 +34,7 @@ public protocol ProxyUpdateFeedChecking: Sendable {
 
 public protocol ProxyConfigurationRepository: Sendable {
     func paths() async -> ProxyPaths
-    func ensureExists(port: UInt16, managementKey: String, allowNetworkAccess: Bool) async
-    func setPort(_ port: UInt16) async
-    func setHost(_ host: String) async
+    func ensureExists(managementKey: String) async
     func ensureAPIKey() async
     func setAllowRemote(_ enabled: Bool) async
     func setLogging(_ enabled: Bool) async

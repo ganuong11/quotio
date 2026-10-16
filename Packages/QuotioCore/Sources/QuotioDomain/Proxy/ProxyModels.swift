@@ -254,17 +254,20 @@ public struct ProxyPaths: Equatable, Sendable {
     public let configPath: String
     public let authDirectoryPath: String
     public let expectedBinaryPath: String
+    public let internalProxyPort: UInt16
 
     public init(
         legacyBinaryPath: String,
         configPath: String,
         authDirectoryPath: String,
-        expectedBinaryPath: String
+        expectedBinaryPath: String,
+        internalProxyPort: UInt16 = RuntimeIdentity.production.internalProxyPort
     ) {
         self.legacyBinaryPath = legacyBinaryPath
         self.configPath = configPath
         self.authDirectoryPath = authDirectoryPath
         self.expectedBinaryPath = expectedBinaryPath
+        self.internalProxyPort = internalProxyPort
     }
 }
 

@@ -26,7 +26,11 @@ final class ProxyScreenModelTests: XCTestCase {
         )
 
         XCTAssertEqual(model.baseURL, "http://127.0.0.1:8317")
-        XCTAssertEqual(model.managementURL, "http://127.0.0.1:8317/v0/management")
+        XCTAssertEqual(model.managementURL, "http://127.0.0.1:18317/v0/management")
+        XCTAssertEqual(
+            model.managementPageURL,
+            URL(string: "http://127.0.0.1:18317/management.html")
+        )
         XCTAssertEqual(model.effectiveBinaryPath, "/tmp/proxy/v1.2.3/CLIProxyAPI")
         XCTAssertEqual(model.currentVersion, "1.2.3")
         XCTAssertEqual(model.managementKey, "management-key")
