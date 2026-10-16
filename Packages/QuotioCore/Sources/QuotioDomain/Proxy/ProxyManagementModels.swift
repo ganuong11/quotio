@@ -98,8 +98,10 @@ public struct ManagedAuthFile: Codable, Identifiable, Hashable, Sendable {
         return key.isEmpty ? name : key
     }
 
+    public var isReadyStatus: Bool { status == "ready" || status == "active" }
+
     public var isReady: Bool {
-        status == "ready" && !disabled && !unavailable
+        isReadyStatus && !disabled && !unavailable
     }
 
     public func hash(into hasher: inout Hasher) {

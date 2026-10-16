@@ -13,7 +13,7 @@ struct QuotaCard: View {
     var quotaData: [String: ProviderQuota]?
     
     private var readyCount: Int {
-        accounts.filter { $0.status == "ready" && !$0.disabled }.count
+        accounts.filter { $0.isReadyStatus && !$0.disabled }.count
     }
     
     private var coolingCount: Int {
@@ -140,7 +140,7 @@ struct QuotaCard: View {
     
     private var sessionRemainingPercent: Double {
         guard !accounts.isEmpty else { return 100 }
-        let readyCount = accounts.filter { $0.status == "ready" && !$0.disabled }.count
+        let readyCount = accounts.filter { $0.isReadyStatus && !$0.disabled }.count
         return Double(readyCount) / Double(accounts.count) * 100
     }
     

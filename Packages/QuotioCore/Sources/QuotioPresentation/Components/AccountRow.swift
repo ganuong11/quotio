@@ -33,6 +33,7 @@ struct AccountRowData: Identifiable, Hashable {
     let id: String
     let provider: QuotaProvider
     let displayName: String       // Email or account identifier
+    let subtitle: String?         // Secondary line (Qoder email) when it adds info
     let menuBarAccountKey: String
     let authFileName: String?
     let source: AccountRowSource
@@ -50,6 +51,7 @@ struct AccountRowData: Identifiable, Hashable {
         id: String,
         provider: QuotaProvider,
         displayName: String,
+        subtitle: String? = nil,
         menuBarAccountKey: String? = nil,
         authFileName: String? = nil,
         source: AccountRowSource,
@@ -65,6 +67,7 @@ struct AccountRowData: Identifiable, Hashable {
         self.id = id
         self.provider = provider
         self.displayName = displayName
+        self.subtitle = subtitle
         self.menuBarAccountKey = menuBarAccountKey ?? displayName
         self.authFileName = authFileName
         self.source = source
@@ -77,6 +80,8 @@ struct AccountRowData: Identifiable, Hashable {
         self.canEdit = canEdit
         self.canSwitch = canSwitch
     }
+
+    var isReadyStatus: Bool { status == "ready" || status == "active" }
 
     // For menu bar selection
     var menuBarItem: MenuBarQuotaItem {
@@ -204,7 +209,7 @@ struct AccountRow: View {
     
     private var statusColor: Color {
         switch account.status {
-        case "ready": return account.isDisabled ? .gray : .green
+        case "ready", "active": return account.isDisabled ? .gray : .green
         case "cooling", "outdated", "failed", "partial": return .orange
         case "error": return .red
         default: return .gray
@@ -221,7 +226,14 @@ struct AccountRow: View {
                 SensitiveAccountText(value: account.displayName, isSensitive: settings.hideSensitiveInfo)
                     .fontWeight(.medium)
                     .lineLimit(1)
-                
+
+                if let subtitle = account.subtitle {
+                    Text(subtitle.masked(if: settings.hideSensitiveInfo))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
                 HStack(spacing: 6) {
                     Text(account.sourceLabel)
                         .foregroundStyle(.secondary)
