@@ -113,6 +113,11 @@ public actor GatewayQuotaService {
     /// Per-account rate-limit backoff keyed by accountKey.
     private var rateLimitedUntil: [String: Date] = [:]
 
+    /// Last successful quota per accountKey. Served when a cycle's fetch
+    /// fails or the account is in backoff — an empty result would remove the
+    /// provider from quota surfaces entirely, so stale beats missing.
+    private var lastQuotas: [String: ProviderQuota] = [:]
+
     public init(
         vault: any GatewayCredentialStoring,
         metadata: any GatewayAccountStoring,
@@ -137,10 +142,16 @@ public actor GatewayQuotaService {
             && !disabledAccountIDs.contains(account.id)
             && !account.isDisabled {
             if let until = rateLimitedUntil[account.accountKey], until > now {
+                if let stale = lastQuotas[account.accountKey] {
+                    results[account.accountKey] = stale
+                }
                 continue
             }
             if let quota = await fetchOwnedQuota(account: account, now: now) {
+                lastQuotas[account.accountKey] = quota
                 results[account.accountKey] = quota
+            } else if let stale = lastQuotas[account.accountKey] {
+                results[account.accountKey] = stale
             }
         }
         return results
@@ -154,7 +165,11 @@ public actor GatewayQuotaService {
                 && !disabledAccountIDs.contains($0.id)
                 && !$0.isDisabled
         }) else { return nil }
-        return await fetchOwnedQuota(account: account, now: Date())
+        if let quota = await fetchOwnedQuota(account: account, now: Date()) {
+            lastQuotas[accountKey] = quota
+            return quota
+        }
+        return lastQuotas[accountKey]
     }
 
     private func fetchOwnedQuota(account: GatewayAccount, now: Date) async -> ProviderQuota? {

@@ -253,6 +253,47 @@ final class GatewayQuotaServiceTests: XCTestCase {
         XCTAssertTrue(quota.isForbidden)
     }
 
+    func testRateLimitedAccountKeepsLastGoodQuota() async throws {
+        let vault = QuotaStubVault()
+        let account = makeAccount()
+        await vault.seed(account, makeCredential(accountID: "u1"))
+
+        // First request succeeds; any later one would be rate limited.
+        StubURLProtocol.handler = { _ in
+            StubURLProtocol.requests.count <= 1
+                ? StubURLProtocol.json(Self.usageJSON)
+                : (429, ["Retry-After": "120"], Data())
+        }
+        let service = makeService(vault: vault)
+
+        let first = await service.fetchAllQuotas()
+        XCTAssertNotNil(first[account.accountKey])
+
+        // Backoff cycle: no request, but the provider must keep its last
+        // quota — an empty result would drop Qoder from the menu entirely.
+        _ = await service.fetchAllQuotas()  // lands the 429 → backoff armed
+        let third = await service.fetchAllQuotas()  // backoff: no request issued
+        XCTAssertEqual(StubURLProtocol.requests.count, 2)
+        XCTAssertEqual(third[account.accountKey]?.models.count, 2)
+    }
+
+    func testServerErrorKeepsLastGoodQuota() async throws {
+        let vault = QuotaStubVault()
+        let account = makeAccount()
+        await vault.seed(account, makeCredential(accountID: "u1"))
+
+        StubURLProtocol.handler = { _ in
+            StubURLProtocol.requests.count == 1
+                ? StubURLProtocol.json(Self.usageJSON)
+                : (500, [:], Data())
+        }
+        let service = makeService(vault: vault)
+        _ = await service.fetchAllQuotas()
+
+        let results = await service.fetchAllQuotas()
+        XCTAssertEqual(results[account.accountKey]?.models.count, 2)
+    }
+
     func testServerErrorReturnsNoEntry() async throws {
         let vault = QuotaStubVault()
         let account = makeAccount()
