@@ -2267,7 +2267,7 @@ async fn legacy_migration_preserves_disabled_credentials_and_survives_restart() 
         )
         .await
         .unwrap_or_else(|_| panic!("intake {provider}"));
-        let completed = done(&state, &op.id).await;
+        let completed = done(&state, op["id"].as_str().unwrap()).await;
         assert_eq!(
             completed.status, "completed",
             "{provider}: {:?}",
@@ -2300,7 +2300,7 @@ async fn legacy_migration_preserves_disabled_credentials_and_survives_restart() 
         )
         .await
         .unwrap_or_else(|_| panic!());
-        let repeated = done(&state, &retry.id).await;
+        let repeated = done(&state, retry["id"].as_str().unwrap()).await;
         assert_eq!(repeated.result.unwrap()["account_id"], id);
         let tx = vault.begin().unwrap();
         assert_eq!(
@@ -2346,7 +2346,7 @@ async fn legacy_migration_rejects_invalid_and_conflicting_imports() {
         )
         .await
         .unwrap_or_else(|_| panic!());
-        assert_eq!(done(&state, &op.id).await.status, "failed");
+        assert_eq!(done(&state, op["id"].as_str().unwrap()).await.status, "failed");
     }
     assert_eq!(
         state
@@ -3298,5 +3298,46 @@ async fn public_hosts_require_local_approval_for_native_access_and_browser_sign_
     );
     server.abort();
     let _ = server.await;
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn legacy_migration_skips_gateway_owned_providers() {
+    let (state, dir, _) = fixture().await;
+    for provider in ["qoder", "opencode"] {
+        let body = json!({
+            "legacy_id": format!("old-{provider}"),
+            "provider": provider,
+            "label": format!("Legacy {provider}"),
+            "enabled": true,
+            "credential": {"access_token": "synthetic"},
+        });
+        let (status, Json(value)) = management::migrate(
+            State(state.clone()),
+            security::owner(),
+            key(&format!("migrate-{provider}")),
+            ApiJson(body),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{provider} should be skipped with 2xx"));
+        assert_eq!(status, StatusCode::OK, "{provider}");
+        assert_eq!(
+            serde_json::to_value(&value).unwrap(),
+            json!({"skipped": true}),
+            "{provider}"
+        );
+    }
+    // Nothing reached the vault beyond the fixture's seeded account.
+    let vault = state.vault.clone().unwrap();
+    let tx = vault.begin().unwrap();
+    assert_eq!(
+        tx.document
+            .accounts
+            .iter()
+            .filter(|a| a.provider.id() == "qoder" || a.provider.id() == "opencode")
+            .count(),
+        0
+    );
+    drop(tx);
     std::fs::remove_dir_all(dir).unwrap();
 }

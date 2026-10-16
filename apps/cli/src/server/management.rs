@@ -211,13 +211,20 @@ pub(super) async fn migrate(
     Extension(principal): Extension<security::Principal>,
     headers: HeaderMap,
     ApiJson(body): ApiJson<Value>,
-) -> Result<(StatusCode, Json<Operation>), ApiError> {
+) -> Result<(StatusCode, Json<Value>), ApiError> {
     if !principal.owner {
         return Err(ApiError(StatusCode::FORBIDDEN, "owner_required"));
     }
+    // Gateway-owned providers (Qoder, OpenCode) live in the Swift gateway vault,
+    // never in CPA auth files. Their ids stay unregistered on `Provider`, so the
+    // `from_value` below would reject them with 400 — leaving the caller's
+    // migration record pending forever. Skip with 2xx before decode instead.
+    if matches!(body["provider"].as_str(), Some("qoder" | "opencode")) {
+        return Ok((StatusCode::OK, Json(json!({"skipped": true}))));
+    }
     let input = serde_json::from_value(body.clone())
         .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_request"))?;
-    mutate(
+    let (status, Json(operation)) = mutate(
         state,
         principal,
         headers,
@@ -226,7 +233,10 @@ pub(super) async fn migrate(
         body,
         Mutation::Migrate(input),
     )
-    .await
+    .await?;
+    let value = serde_json::to_value(&operation)
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?;
+    Ok((status, Json(value)))
 }
 pub(super) async fn discover(
     State(state): State<Arc<ApiState>>,
