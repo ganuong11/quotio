@@ -16,10 +16,12 @@
 //      descriptors and reports them enabled; strips gateway IDs before
 //      forwarding settings updates to the host.
 //
-//  Gateway accounts surface through the quota snapshot (`accountStates`,
-//  `accountAliases`, `accountIDs`) rather than `accounts()` — the settings UI
-//  derives its rows from the snapshot's `accountIDs` map, which the overlay
-//  points at `GatewayAccount.id`, making disable/delete routing reachable.
+//  Gateway accounts surface as synthesized `Account` rows in `accounts()` —
+//  the settings UI renders them and calls disable/delete with their surfaced
+//  (`monitor-…`) ID — and as `accountStates`/`accountAliases`/`accountIDs`
+//  entries in the quota snapshot. `delete` is offered only for onboarded or
+//  legacy-imported records; detected accounts are read-only (the owning CLI
+//  still holds the credential).
 //
 
 import Foundation
@@ -59,6 +61,32 @@ public actor GatewayQuotaOverlay {
         QuotaProvider(rawValue: provider.rawValue) ?? .qoder
     }
 
+    /// The `Account.id` a gateway account surfaces as — `monitor-`-prefixed,
+    /// matching `AccountIdentity.make(providerID:accountKey:)` so rows rendered
+    /// from `accounts()` line up with `accountIDs`/`accountIssues` maps.
+    private static func surfaceAccountID(for account: GatewayAccount, provider: QuotaProvider) -> String {
+        AccountIdentity.make(
+            providerID: AccountProviderID(rawValue: provider.rawValue),
+            accountKey: account.accountKey
+        ).id
+    }
+
+    private static func surfaceAccount(
+        for account: GatewayAccount,
+        disabled: Bool
+    ) -> Account {
+        let provider = quotaProvider(for: account.provider)
+        let deletable = account.source == .onboarded || account.source == .legacyImport
+        return Account.make(
+            providerID: AccountProviderID(rawValue: provider.rawValue),
+            accountKey: account.accountKey,
+            displayName: account.displayName,
+            source: .quotioKeychain,
+            capabilities: deletable ? [.disable, .delete] : [.disable],
+            status: disabled ? .disabled : .ready
+        )
+    }
+
     private func merged(_ host: QuotaSnapshot) async -> QuotaSnapshot {
         var snapshot = host
         let accounts = await directory.accounts()
@@ -76,7 +104,8 @@ public actor GatewayQuotaOverlay {
             )
             snapshot.providerNames[provider] = provider.rawValue == "qoder" ? "Qoder" : "OpenCode"
             snapshot.accountAliases[provider, default: [:]][account.accountKey] = account.displayName
-            snapshot.accountIDs[provider, default: [:]][account.accountKey] = account.id
+            snapshot.accountIDs[provider, default: [:]][account.accountKey] =
+                Self.surfaceAccountID(for: account, provider: provider)
         }
 
         for (provider, quotas) in quotaCache {
@@ -228,8 +257,16 @@ public actor GatewayQuotaOverlay {
 
     // MARK: - AccountManaging
 
-    private func isGatewayAccountID(_ accountID: String) async -> Bool {
-        await directory.accounts().contains { $0.id == accountID }
+    /// Resolve an incoming account ID — either the vault's `GatewayAccount.id`
+    /// or the surfaced `Account.id` — to its gateway record.
+    private func gatewayAccount(for accountID: String) async -> GatewayAccount? {
+        await directory.accounts().first { account in
+            account.id == accountID
+                || Self.surfaceAccountID(
+                    for: account,
+                    provider: Self.quotaProvider(for: account.provider)
+                ) == accountID
+        }
     }
 
     public func registerDetectedNativeAccounts() async {
@@ -274,12 +311,21 @@ public actor GatewayQuotaOverlay {
     }
 
     public func accounts() async -> [Account] {
-        await host.accounts()
+        var accounts = await host.accounts()
+        let disabledIDs = await directory.disabledAccountIDs()
+        for account in await directory.accounts()
+        where QuotaProvider.gatewayNativeProviders.contains(Self.quotaProvider(for: account.provider)) {
+            accounts.append(Self.surfaceAccount(
+                for: account,
+                disabled: disabledIDs.contains(account.id) || account.isDisabled
+            ))
+        }
+        return accounts
     }
 
     public func setDisabled(_ disabled: Bool, accountID: String) async {
-        if await isGatewayAccountID(accountID) {
-            try? await directory.setDisabled(disabled, accountID: accountID)
+        if let account = await gatewayAccount(for: accountID) {
+            try? await directory.setDisabled(disabled, accountID: account.id)
             await publishMerged()
             return
         }
@@ -287,8 +333,10 @@ public actor GatewayQuotaOverlay {
     }
 
     public func delete(accountID: String) async throws {
-        if await isGatewayAccountID(accountID) {
-            await credentials.remove(accountID: accountID)
+        if let account = await gatewayAccount(for: accountID) {
+            await credentials.remove(accountID: account.id)
+            quotaCache[Self.quotaProvider(for: account.provider)]?
+                .removeValue(forKey: account.accountKey)
             await publishMerged()
             return
         }

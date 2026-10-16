@@ -128,7 +128,10 @@ final class GatewayQuotaOverlayTests: XCTestCase {
         XCTAssertEqual(merged.quotas[.qoder]?["u1"]?.models.first?.name, "m")
         XCTAssertEqual(merged.providerNames[.qoder], "Qoder")
         XCTAssertEqual(merged.accountAliases[.qoder]?["u1"], "Qoder User")
-        XCTAssertEqual(merged.accountIDs[.qoder]?["u1"], account.id)
+        XCTAssertEqual(
+            merged.accountIDs[.qoder]?["u1"],
+            AccountIdentity.make(providerID: AccountProviderID(rawValue: "qoder"), accountKey: "u1").id
+        )
 
         // Host data untouched.
         XCTAssertEqual(merged.providerNames[.claude], "Claude")
@@ -325,13 +328,52 @@ final class GatewayQuotaOverlayTests: XCTestCase {
         XCTAssertTrue(hostDeletes.isEmpty)
     }
 
-    func testAccountsForwardsToHost() async throws {
+    func testAccountsMergesGatewayAccounts() async throws {
         let host = HostStub()
         let directory = DirectoryStub()
-        await directory.add(qoderAccount())
+        let account = qoderAccount()
+        await directory.add(account)
+        let overlay = makeOverlay(host: host, directory: directory)
+
+        let accounts = await overlay.accounts()
+        let surfaced = try XCTUnwrap(accounts.first { $0.providerID.rawValue == "qoder" })
+        XCTAssertEqual(surfaced.accountKey, "u1")
+        XCTAssertEqual(surfaced.displayName, "Qoder User")
+        XCTAssertTrue(surfaced.canDelete)
+        XCTAssertEqual(surfaced.status, .ready)
+    }
+
+    func testSurfacedAccountIDRoutesDisableAndDelete() async throws {
+        let host = HostStub()
+        let directory = DirectoryStub()
+        let account = qoderAccount()
+        await directory.add(account)
+        let credentials = CredentialsStub()
+        let overlay = makeOverlay(host: host, directory: directory, credentials: credentials)
+
+        let surfacedID = AccountIdentity.make(
+            providerID: AccountProviderID(rawValue: "qoder"), accountKey: "u1"
+        ).id
+        await overlay.setDisabled(true, accountID: surfacedID)
+        let disableCalls = await directory.setDisabledCalls
+        XCTAssertEqual(disableCalls.map(\.1), [account.id])
+        try await overlay.delete(accountID: surfacedID)
+        let removed = await credentials.removed
+        XCTAssertEqual(removed, [account.id])
+        let hostDeletes = await host.deleteCalls
+        XCTAssertTrue(hostDeletes.isEmpty)
+    }
+
+    func testDetectedGatewayAccountCannotBeDeleted() async throws {
+        let host = HostStub()
+        let directory = DirectoryStub()
+        await directory.add(GatewayAccount.make(
+            provider: .opencode, accountKey: "oc", source: .detected
+        ))
         let overlay = makeOverlay(host: host, directory: directory)
         let accounts = await overlay.accounts()
-        XCTAssertTrue(accounts.isEmpty) // host knows nothing of gateway accounts
+        let surfaced = try XCTUnwrap(accounts.first { $0.providerID.rawValue == "opencode" })
+        XCTAssertFalse(surfaced.canDelete)
     }
 
     // MARK: - MonitoringSettingsManaging
