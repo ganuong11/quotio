@@ -13,3 +13,19 @@ public nonisolated enum GatewayModelExtraction {
         return json["model"] as? String
     }
 }
+
+/// Parses `stream_options.include_usage` from a request body. Only a genuine
+/// JSON boolean true counts — numeric 1/0 or a numeric-looking string is not
+/// an opt-in.
+public nonisolated enum GatewayIncludeUsageFlag {
+    public static func flag(in body: Data) -> Bool {
+        guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let streamOptions = json["stream_options"] as? [String: Any] else {
+            return false
+        }
+        guard let value = streamOptions["include_usage"] as? NSNumber else {
+            return false
+        }
+        return strcmp(value.objCType, "c") == 0 && value.boolValue
+    }
+}
