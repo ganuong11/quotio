@@ -65,7 +65,7 @@ final class GatewayCredentialVaultTests: XCTestCase {
             extra: ["pat": "pt-redacted-fixture", "machineID": "machine-1"]
         )
         try await vault.store(credential, account: account("acct-a"))
-        let loaded = await vault.credential(for: "acct-a")
+        let loaded = await vault.credential(for: account("acct-a").id)
         try XCTSkipIf(loaded == nil, "The test keychain is unavailable")
         XCTAssertEqual(loaded?.accessToken, "at-1")
         XCTAssertEqual(loaded?.extra["machineID"], "machine-1")
@@ -81,10 +81,10 @@ final class GatewayCredentialVaultTests: XCTestCase {
             account: account("acct-b")
         )
         // Two readers load generation G.
-        let first = await vault.credential(for: "acct-b")
+        let first = await vault.credential(for: account("acct-b").id)
         try XCTSkipIf(first == nil, "The test keychain is unavailable")
         let secondVault = makeVault()
-        _ = await secondVault.credential(for: "acct-b")
+        _ = await secondVault.credential(for: account("acct-b").id)
 
         // First writer commits G→G'; second writer's CAS against G must fail.
         try await vault.store(GatewayCredential(accessToken: "v2", extra: [:]), account: account("acct-b"))
@@ -94,17 +94,17 @@ final class GatewayCredentialVaultTests: XCTestCase {
         } catch {
             // expected
         }
-        let current = await vault.credential(for: "acct-b")
+        let current = await vault.credential(for: account("acct-b").id)
         XCTAssertEqual(current?.accessToken, "v2")
     }
 
     func testRemoveDeletesCredentialAndAccount() async throws {
         let vault = makeVault()
         try await vault.store(GatewayCredential(accessToken: "x", extra: [:]), account: account("acct-a"))
-        let seededCred = await vault.credential(for: "acct-a")
+        let seededCred = await vault.credential(for: account("acct-a").id)
         try XCTSkipIf(seededCred == nil, "The test keychain is unavailable")
-        await vault.remove(accountKey: "acct-a")
-        let removed = await vault.credential(for: "acct-a")
+        await vault.remove(accountID: account("acct-a").id)
+        let removed = await vault.credential(for: account("acct-a").id)
         XCTAssertNil(removed)
         let remaining = await vault.accounts()
         XCTAssertTrue(remaining.isEmpty)
@@ -113,11 +113,11 @@ final class GatewayCredentialVaultTests: XCTestCase {
     func testAccountStorePersistsDisabledSetByAccountKey() async throws {
         let store = makeStore()
         try await store.saveAccount(account("acct-a"))
-        try await store.setDisabled(true, accountKey: "acct-a")
+        try await store.setDisabled(true, accountID: "gateway-acct-a")
         let reloaded = GatewayAccountStore(url: temporaryDirectory.appendingPathComponent("gateway-accounts-v1.json"))
         let disabled = await reloaded.disabledAccountIDs()
-        XCTAssertEqual(disabled, ["acct-a"])
-        try await reloaded.setDisabled(false, accountKey: "acct-a")
+        XCTAssertEqual(disabled, ["gateway-acct-a"])
+        try await reloaded.setDisabled(false, accountID: "gateway-acct-a")
         let enabled = await reloaded.disabledAccountIDs()
         XCTAssertEqual(enabled, [])
     }
@@ -170,7 +170,10 @@ final class GatewayCredentialVaultTests: XCTestCase {
         )
         let imported = await importer.run(into: vault)
         XCTAssertEqual(imported, 1)
-        let cred = await vault.credential(for: "imported-key")
+        let importedID = GatewayAccount.make(
+            provider: .qoder, accountKey: "imported-key", source: .legacyImport
+        ).id
+        let cred = await vault.credential(for: importedID)
         XCTAssertEqual(cred?.accessToken, "legacy-at")
         XCTAssertEqual(cred?.extra["pat"], "pt-redacted-fixture")
         let accounts = await vault.accounts()

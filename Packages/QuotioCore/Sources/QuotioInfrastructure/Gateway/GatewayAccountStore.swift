@@ -7,7 +7,7 @@ import QuotioDomain
 public actor GatewayAccountStore {
     private struct Payload: Codable {
         var accounts: [GatewayAccount] = []
-        var disabledAccountKeys: Set<String> = []
+        var disabledAccountIDs: Set<String> = []
     }
 
     private let url: URL
@@ -25,7 +25,7 @@ public actor GatewayAccountStore {
     }
 
     public func accounts() -> [GatewayAccount] { load().accounts }
-    public func disabledAccountIDs() -> Set<String> { load().disabledAccountKeys }
+    public func disabledAccountIDs() -> Set<String> { load().disabledAccountIDs }
 
     public func saveAccount(_ account: GatewayAccount) throws {
         var payload = load()
@@ -34,17 +34,17 @@ public actor GatewayAccountStore {
         try save(payload)
     }
 
-    public func deleteAccount(accountKey: String) throws {
+    public func deleteAccount(accountID: String) throws {
         var payload = load()
-        payload.accounts.removeAll { $0.accountKey == accountKey }
-        payload.disabledAccountKeys.remove(accountKey)
+        payload.accounts.removeAll { $0.id == accountID }
+        payload.disabledAccountIDs.remove(accountID)
         try save(payload)
     }
 
-    public func setDisabled(_ disabled: Bool, accountKey: String) throws {
+    public func setDisabled(_ disabled: Bool, accountID: String) throws {
         var payload = load()
-        if disabled { payload.disabledAccountKeys.insert(accountKey) }
-        else { payload.disabledAccountKeys.remove(accountKey) }
+        if disabled { payload.disabledAccountIDs.insert(accountID) }
+        else { payload.disabledAccountIDs.remove(accountID) }
         try save(payload)
     }
 

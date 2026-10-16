@@ -7,7 +7,7 @@ public enum GatewayCredentialError: Error {
 }
 
 /// Keychain-backed credential vault for gateway accounts, keyed by
-/// `accountKey`. Wraps an injected `KeychainCredentialDataStore` (service
+/// `accountID`. Wraps an injected `KeychainCredentialDataStore` (service
 /// resolved at the composition root) plus a `GatewayAccountStore` for
 /// metadata. Rotation uses compare-and-swap on the last-read generation so a
 /// stale writer can never clobber a fresher credential.
@@ -25,40 +25,40 @@ public actor GatewayCredentialVault {
         await metadata.accounts()
     }
 
-    public func credential(for accountKey: String) async -> GatewayCredential? {
-        guard let record = await dataStore.read(accountID: accountKey) else { return nil }
-        loadedGenerations[accountKey] = record.generation
+    public func credential(for accountID: String) async -> GatewayCredential? {
+        guard let record = await dataStore.read(accountID: accountID) else { return nil }
+        loadedGenerations[accountID] = record.generation
         return try? JSONDecoder().decode(GatewayCredential.self, from: record.data)
     }
 
     /// Returns the raw stored record so callers needing the generation can
     /// chain a `compareAndSwap` without a second read.
-    public func record(for accountKey: String) async -> CredentialDataRecord? {
-        let record = await dataStore.read(accountID: accountKey)
-        loadedGenerations[accountKey] = record?.generation
+    public func record(for accountID: String) async -> CredentialDataRecord? {
+        let record = await dataStore.read(accountID: accountID)
+        loadedGenerations[accountID] = record?.generation
         return record
     }
 
     public func store(_ credential: GatewayCredential, account: GatewayAccount) async throws {
         let data = try JSONEncoder().encode(credential)
         let saved: CredentialDataRecord?
-        if let expected = loadedGenerations[account.accountKey] {
+        if let expected = loadedGenerations[account.id] {
             saved = await dataStore.compareAndSwap(
                 data,
-                accountID: account.accountKey,
+                accountID: account.id,
                 expectedGeneration: expected
             )
         } else {
-            saved = await dataStore.save(data, accountID: account.accountKey)
+            saved = await dataStore.save(data, accountID: account.id)
         }
         guard let saved else { throw GatewayCredentialError.credentialWriteFailed }
-        loadedGenerations[account.accountKey] = saved.generation
+        loadedGenerations[account.id] = saved.generation
         try await metadata.saveAccount(account)
     }
 
-    public func remove(accountKey: String) async {
-        await dataStore.delete(accountID: accountKey)
-        loadedGenerations.removeValue(forKey: accountKey)
-        try? await metadata.deleteAccount(accountKey: accountKey)
+    public func remove(accountID: String) async {
+        await dataStore.delete(accountID: accountID)
+        loadedGenerations.removeValue(forKey: accountID)
+        try? await metadata.deleteAccount(accountID: accountID)
     }
 }
