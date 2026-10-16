@@ -1,0 +1,330 @@
+import Foundation
+import QuotioApplication
+import QuotioDomain
+
+public actor QoderPATService: QoderPATRefreshing {
+
+    /// Global OpenAPI base. Hardcoded — never `openapi.qoder.com.cn`.
+    /// Per ADR 0006, a CN-region PAT must fail exchange here.
+    private static let openAPIBase = "https://openapi.qoder.sh"
+
+    private static let exchangeURL = URL(string: "\(openAPIBase)/api/v1/jobToken/exchange")!
+    private static let userInfoURL = URL(string: "\(openAPIBase)/api/v1/userinfo")!
+
+    /// Refresh buffer applied to job-token expiry before storing, matching Grok
+    /// (GrokQuotaFetcher) and pi's `expires - 5 * 60 * 1000`. The failover
+    /// router (ADR 0006 §2) and quota fetcher (ticket #3) reuse the same
+    /// threshold to decide when to re-exchange.
+    private static let expiryBuffer: TimeInterval = 5 * 60
+
+    private let userAgent = "Quotio"
+    private let cosyVersion = "1.0.1"
+    private let cosyClientType = "5"
+
+    private var session: URLSession
+
+    /// Minimum gap between successive `jobToken/exchange` call *starts*
+    /// (ADR 0017). Empirical default 1s — the repo has no measurement of
+    /// Qoder's exchange rate limit. Tests inject a smaller value; `session`
+    /// lets tests stub the network via `URLProtocol`. `QoderPATService.shared`
+    /// uses both defaults.
+    private let minExchangeInterval: TimeInterval
+
+    /// When the next exchange may start. Claimed synchronously inside
+    /// `waitForExchangeSlot` (no suspension between check and claim) so
+    /// concurrent callers — quota polling and failover re-exchange, which run
+    /// on separate actors but funnel into this one — stay spaced apart.
+    private var nextExchangeAt: Date = .distantPast
+
+    public init(minExchangeInterval: TimeInterval = 1.0, session: URLSession? = nil) {
+        self.minExchangeInterval = minExchangeInterval
+        self.session = session ?? URLSession(configuration: ProxyURLSessionFactory.makeConfiguration(timeout: 20))
+    }
+
+    /// Rebuild the URLSession after the user changes their upstream proxy.
+    public func updateProxyConfiguration() {
+        session = URLSession(configuration: ProxyURLSessionFactory.makeConfiguration(timeout: 20))
+    }
+
+    /// Exchange a PAT for a job token, fetch the user's identity, and return a
+    /// Vault-ready credential plus the resolved identity.
+    ///
+    /// On any failure (network, non-2xx, malformed response, identity fetch
+    /// error) this throws — the caller must not persist a credential.
+    public func credentials(fromPat rawPAT: String) async throws -> QoderPATResult {
+        let pat = rawPAT.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard pat.hasPrefix("pt-"), pat.count > "pt-".count else {
+            throw QoderPATError.invalidPAT
+        }
+
+        let exchange = try await exchangeJobToken(pat: pat)
+        let identity = try await fetchUserInfo(jobToken: exchange.jobToken)
+        // userID is the stored `accountID` and the onboarding confirmation key
+        // (ADR 0006 §3). A 2xx userinfo with no `id` is unusable — refuse to
+        // persist rather than storing a credential with an empty accountID.
+        guard !identity.userID.isEmpty else {
+            throw QoderPATError.identityMissing
+        }
+
+        // Per-account machine ID, fresh per ADR 0006 §1. Quotio does NOT reuse
+        // ~/.qoder/.auth/machine_id — its identity is independent of the
+        // official CLI / pi provider.
+        let machineID = UUID().uuidString
+
+        // Apply the 5-min refresh buffer so a stored credential reads as
+        // "needs rotation" slightly before true expiry, matching Grok.
+        let bufferedExpiry = exchange.expiresAt.addingTimeInterval(-Self.expiryBuffer)
+
+        var extra: [String: String] = [
+            "pat": pat,
+            "machineID": machineID,
+        ]
+        if !exchange.jobRefreshToken.isEmpty {
+            extra["jobRefreshToken"] = exchange.jobRefreshToken
+        }
+
+        let credential = GatewayCredential(
+            accessToken: exchange.jobToken,
+            refreshToken: nil,
+            idToken: nil,
+            accountID: identity.userID,
+            expiresAt: bufferedExpiry,
+            extra: extra
+        )
+        return QoderPATResult(credential: credential, identity: identity)
+    }
+
+    /// Exchange-only refresh: re-runs the PAT → job-token exchange using the
+    /// PAT stored on `credential.extra["pat"]`, preserving the existing
+    /// `accountID`, `extra["machineID"]`, and identity. Used by the failover
+    /// router (ADR 0006 §2) on HTTP 401 — most 401s are job-token expiry
+    /// (~24h), not PAT revocation, so re-exchanging the same PAT and retrying
+    /// the same account is the right first move.
+    ///
+    /// **machineID-preserving by design.** This is the divergence from
+    /// `credentials(fromPat:)` flagged in ticket #7: that entry point mints a
+    /// fresh machine ID on every call (Phase 1's `QoderQuotaFetcher` uses it
+    /// and accepts the rotation — the machine ID is a client-identification
+    /// header, not session state). The router must NOT rotate the machine ID
+    /// per request, or every retried request presents as a new install to
+    /// Qoder. Here we keep the stored `extra["machineID"]` verbatim.
+    ///
+    /// `account` is the monitor metadata; its `id` matches the credential's
+    /// `accountID`. The router persists the refreshed credential via the
+    /// Vault's CAS path (`vault.save`), so concurrent refreshes from the quota
+    /// fetcher don't clobber this write.
+    public func refreshCredential(
+        _ credential: GatewayCredential,
+        account: GatewayAccount
+    ) async throws -> GatewayCredential {
+        guard let pat = credential.extra["pat"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              pat.hasPrefix("pt-") else {
+            // Without a stored PAT we can't re-exchange. The router treats this
+            // as "PAT revoked" and disables the account.
+            throw QoderPATError.invalidPAT
+        }
+
+        let exchange = try await exchangeJobToken(pat: pat)
+        let bufferedExpiry = exchange.expiresAt.addingTimeInterval(-Self.expiryBuffer)
+
+        // Preserve accountID, machineID, and any identity-derived extra fields.
+        // Only the token + expiry + refresh token change.
+        var extra = credential.extra
+        extra["pat"] = pat
+        if !exchange.jobRefreshToken.isEmpty {
+            extra["jobRefreshToken"] = exchange.jobRefreshToken
+        }
+        // `machineID` is intentionally left untouched — see method doc.
+
+        return GatewayCredential(
+            accessToken: exchange.jobToken,
+            refreshToken: nil,
+            idToken: credential.idToken,
+            accountID: credential.accountID,
+            expiresAt: bufferedExpiry,
+            extra: extra
+        )
+    }
+
+    // MARK: - Exchange pacing
+
+    /// Wait until this caller may start an exchange, then claim the slot.
+    ///
+    /// Loop body: read `nextExchangeAt`; if the slot is free (`<= now`), claim
+    /// it (`nextExchangeAt = now + minExchangeInterval`) and return immediately
+    /// — no suspension between check and claim, so only one caller wins a given
+    /// slot. If the slot is taken, sleep until it frees, then loop and
+    /// *re-check*: another caller may have claimed the next slot while we were
+    /// waking, in which case we sleep again.
+    ///
+    /// The first caller is never delayed (initial `nextExchangeAt` is
+    /// `.distantPast`, so the first slot is always free).
+    ///
+    /// Cancellation during the sleep propagates as `CancellationError` (the
+    /// `try` is not swallowed), consistent with `perform()`'s mapping of a
+    /// cancelled `session.data(for:)` to `QoderPATError.network`: the caller
+    /// already handles transport cancellation through that shape.
+    private func waitForExchangeSlot() async throws {
+        while true {
+            let now = Date()
+            if nextExchangeAt <= now {
+                nextExchangeAt = now.addingTimeInterval(minExchangeInterval)
+                return
+            }
+            let wait = nextExchangeAt.timeIntervalSince(now)
+            try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+            // Loop: re-read nextExchangeAt after waking.
+        }
+    }
+
+    // MARK: - Exchange
+
+    private struct PatExchangeResult: Sendable {
+        let jobToken: String
+        let jobRefreshToken: String
+        let expiresAt: Date
+    }
+
+    /// `POST /api/v1/jobToken/exchange { personal_token }`.
+    /// No COSY signature required for this endpoint (CONTEXT.md).
+    private func exchangeJobToken(pat: String) async throws -> PatExchangeResult {
+        // Pace every exchange through one slot — quota polling, failover
+        // re-exchange, and onboarding all funnel through this method, so a
+        // multi-account burst (synchronized job-token expiries) cannot hammer
+        // the rate-limited exchange endpoint. ADR 0017.
+        try await waitForExchangeSlot()
+        var request = URLRequest(url: Self.exchangeURL)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        applyClientHeaders(to: &request)
+
+        // personal_token only; no other fields. Matches pi's exchangeJobToken.
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["personal_token": pat])
+
+        let (data, http) = try await perform(request)
+        guard 200...299 ~= http.statusCode else {
+            throw QoderPATError.exchangeFailed(status: http.statusCode, snippet: bodySnippet(data))
+        }
+
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let token = (json["token"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !token.isEmpty else {
+            throw QoderPATError.exchangeMalformed
+        }
+
+        let refreshToken = (json["refresh_token"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        let expiresAt = resolveExpiry(json: json, fallback: .now + 24 * 60 * 60)
+        return PatExchangeResult(jobToken: token, jobRefreshToken: refreshToken, expiresAt: expiresAt)
+    }
+
+    // MARK: - User info
+
+    /// `GET /api/v1/userinfo` with `Bearer <job token>`.
+    ///
+    /// Pi swallows userinfo errors as best-effort and returns empty strings;
+    /// we surface them as `userInfoFailed` so the onboarding sheet (ticket #4)
+    /// can show the upstream error rather than silently persisting a
+    /// half-formed identity. ADR 0006 §3 makes userID load-bearing for the
+    /// confirmation step, so an unresolvable identity should not produce a
+    /// stored credential — `credentials(fromPat:)` enforces that below.
+    private func fetchUserInfo(jobToken: String) async throws -> QoderUserIdentity {
+        var request = URLRequest(url: Self.userInfoURL)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(jobToken)", forHTTPHeaderField: "Authorization")
+        applyClientHeaders(to: &request)
+
+        let (data, http) = try await perform(request)
+        guard 200...299 ~= http.statusCode else {
+            throw QoderPATError.userInfoFailed(status: http.statusCode, snippet: bodySnippet(data))
+        }
+
+        let json = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+        let userID = (json["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let email = (json["email"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let name = ((json["name"] as? String) ?? (json["username"] as? String))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return QoderUserIdentity(userID: userID, email: email, name: name)
+    }
+
+    // MARK: - HTTP helpers
+
+    /// Stamp the shared client-identification headers on a request. These are
+    /// `Cosy-*` client headers (matching pi), not the COSY signature envelope
+    /// that ticket #5 adds for the chat gateway; the exchange and userinfo
+    /// endpoints require no signature (CONTEXT.md).
+    private func applyClientHeaders(to request: inout URLRequest) {
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue(cosyVersion, forHTTPHeaderField: "Cosy-Version")
+        request.setValue(cosyClientType, forHTTPHeaderField: "Cosy-ClientType")
+    }
+
+    /// Send a request and map transport failures to `QoderPATError.network`.
+    /// Callers guard the status code themselves so the error case keeps its
+    /// specific `.exchangeFailed` / `.userInfoFailed` shape with a body snippet.
+    private func perform(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        let (data, response): (Data, URLResponse)
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            throw QoderPATError.network(error.localizedDescription)
+        }
+        guard let http = response as? HTTPURLResponse else {
+            throw QoderPATError.network("non-HTTP response")
+        }
+        return (data, http)
+    }
+
+    // MARK: - Expiry parsing
+
+    /// Choose the earliest reliable expiry signal. The Qoder API has been
+    /// observed to return `expires_at` (ISO8601 string) or `expires_in`
+    /// (milliseconds — not seconds — per pi's reverse-engineering). Falls back
+    /// to 24h if neither is present, matching pi.
+    private func resolveExpiry(json: [String: Any], fallback: Date) -> Date {
+        if let expiresAtString = json["expires_at"] as? String,
+           let parsed = Self.parseISO8601(expiresAtString) {
+            return parsed
+        }
+        if let expiresIn = json["expires_in"] as? NSNumber {
+            // milliseconds, per pi note.
+            return Date().addingTimeInterval(expiresIn.doubleValue / 1000.0)
+        }
+        if let expiresInNumber = json["expires_in"] as? Double {
+            return Date().addingTimeInterval(expiresInNumber / 1000.0)
+        }
+        return fallback
+    }
+
+    /// Surfaces a short, redacted body snippet for error messages. The PAT and
+    /// job token never legitimately appear in these response bodies, but we
+    /// defensively redact any `pt-`/`jt-`-prefixed runs before truncating so a
+    /// surprising upstream echo cannot leak a secret into a caller's log line
+    /// or UI — hardening the AGENTS.md "no secrets logged" rule.
+    private nonisolated func bodySnippet(_ data: Data) -> String {
+        guard let text = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) else { return "" }
+        return String(Self.redactTokens(in: text).prefix(200))
+    }
+
+    private nonisolated static func parseISO8601(_ value: String) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: value) { return date }
+        return ISO8601DateFormatter().date(from: value) // without fractional seconds
+    }
+
+    /// Replace `pt-…` / `jt-…` runs with a placeholder. Token characters are
+    /// alphanumeric plus `-`/`_`; we stop at whitespace, quotes, or JSON
+    /// punctuation so the substitution stays local to the token run.
+    ///
+    /// Internal so other Qoder services reuse it (the SSE reparser scrubs
+    /// upstream error snippets the same way). Hardens the AGENTS.md
+    /// "no secrets logged" rule against surprising upstream echoes.
+    public nonisolated static func redactTokens(in text: String) -> String {
+        GatewayTokenRedaction.redactTokens(in: text)
+    }
+}
