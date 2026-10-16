@@ -64,6 +64,7 @@ public extension QuotaProvider {
         case "ibmbob": "ibm"
         case "kilo": "kilocode"
         case "opencodego": "opencode"
+        case "qoder": "qoder-menubar"
         case "glm": "zai"
         default: rawValue
         }

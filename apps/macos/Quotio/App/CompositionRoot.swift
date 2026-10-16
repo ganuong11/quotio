@@ -208,7 +208,8 @@ enum CompositionRoot {
             monitoringSettings: gatewayOverlay,
             menuBarSettings: menuBarSettings,
             notifications: notificationController,
-            qoderOnboarding: qoderOnboardingController
+            qoderOnboarding: qoderOnboardingController,
+            opencodeFreeModels: { opencodeCatalog.advertisedModels }
         )
         oauthScreenModel.setSuccessHandler { [weak quotaController] in
             await quotaController?.refreshAll(force: true)
@@ -271,6 +272,9 @@ enum CompositionRoot {
                     category: "GatewayListener"
                 )
             )
+            // Seed immediately: the loop's first catalog tick is an hour out,
+            // and both the route gate and the Accounts card read this state.
+            await opencodeCatalog.refresh()
             var lastCatalog = Date()
             var lastDetected = Date()
             var lastVault = Date()

@@ -35,6 +35,8 @@ public final class QuotaFeatureController {
     /// Qoder PAT onboarding use case (exchange + persist). Optional: nil keeps
     /// pre-gateway configurations compiling and renders the "unavailable" copy.
     @ObservationIgnored public let qoderOnboarding: QoderOnboardingController?
+    /// Live free-model catalog for OpenCode; read on render so refreshes show up.
+    @ObservationIgnored public let opencodeFreeModels: @Sendable () -> [OpencodeFreeModel]
 
     @ObservationIgnored private let modeManager: OperatingModeManager
     @ObservationIgnored private let menuBarSettings: MenuBarSettingsManager
@@ -50,7 +52,8 @@ public final class QuotaFeatureController {
         monitoringSettings: any MonitoringSettingsManaging,
         menuBarSettings: MenuBarSettingsManager,
         notifications: any NotificationRequesting,
-        qoderOnboarding: QoderOnboardingController? = nil
+        qoderOnboarding: QoderOnboardingController? = nil,
+        opencodeFreeModels: @escaping @Sendable () -> [OpencodeFreeModel] = { [] }
     ) {
         self.settingsService = monitoringSettings
         self.quota = quota
@@ -60,6 +63,7 @@ public final class QuotaFeatureController {
         self.menuBarSettings = menuBarSettings
         self.notifications = notifications
         self.qoderOnboarding = qoderOnboarding
+        self.opencodeFreeModels = opencodeFreeModels
     }
 
     deinit {

@@ -38,6 +38,9 @@ struct ProviderAccountsSection: View {
                     AccountSettingsRow(provider: provider, descriptor: descriptor, account: account,
                         row: AccountSettingsRowState(account: account, provider: provider, snapshot: quota.state, tracked: tracked))
                 }
+                if provider == .opencode {
+                    OpencodeFreeModelsRow(models: controller.opencodeFreeModels())
+                }
             }
         }
     }
@@ -94,6 +97,35 @@ struct ProviderAccountsSection: View {
 }
 
 /// One provider-level problem: an orange glyph, a single-line title, and trailing controls.
+/// The OpenCode free-model catalog, listed where its account rows live because Zen
+/// exposes no quota endpoint — availability of the free tier is the quota signal.
+private struct OpencodeFreeModelsRow: View {
+    let models: [OpencodeFreeModel]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("quota.opencode.freeModels".localized())
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if models.isEmpty {
+                Text("quota.noDataYet".localized())
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                FlowLayout(spacing: 4) {
+                    ForEach(models, id: \.id) { model in
+                        Text(model.displayName ?? model.id)
+                            .font(.caption2)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(.quaternary, in: Capsule())
+                    }
+                }
+            }
+        }
+    }
+}
+
 private struct AttentionRow<Trailing: View>: View {
     let systemImage: String
     let title: String
