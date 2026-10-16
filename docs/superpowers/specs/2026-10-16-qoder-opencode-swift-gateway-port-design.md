@@ -258,9 +258,14 @@ satisfied automatically since everything stays on `URLSession`. Verify early any
 
 `QuotioCLILegacyAccountMigration` imports every `quotioKeychain`/`apiKey` account in
 the legacy `accounts-v1.json` + `monitor-auth` Keychain records into the host vault.
-For users coming from the `qoder` branch: `Provider::from_str("qoder")` is
-unregistered → records sit `pending` and retry every launch. Add an explicit skip for
-`qoder`/`opencode` provider ids in `migration::prepare` (apps/cli, ~5 lines + test).
+For users coming from the `qoder` branch: `Provider::from_str("qoder")` (clap
+`ValueEnum::from_str`, invoked by `Provider`'s `Deserialize`) is unregistered → the
+request fails `serde_json::from_value::<migration::Input>` in `management.rs`'s
+`migrate` handler, before `migration::prepare` runs → records sit `pending` and
+retry every launch. Add an explicit skip for `qoder`/`opencode` provider ids at the
+`migrate` handler, before `Input` deserialization (apps/cli, ~5 lines + test). The
+skip must return 2xx (e.g. `{"skipped": true}`) — the app marks a record completed
+only when `importLegacyAccount` doesn't throw, so an error would keep it pending.
 Our new gateway vault performs its own one-time import of legacy `monitor-auth`
 qoder/opencode records (same record shape), leaving the legacy items in place —
 never delete user credential material.
