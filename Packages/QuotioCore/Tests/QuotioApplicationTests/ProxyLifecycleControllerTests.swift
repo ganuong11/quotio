@@ -40,6 +40,58 @@ final class ProxyLifecycleControllerTests: XCTestCase {
         XCTAssertEqual(stopCount, 1)
     }
 
+    func testStartBindsFrontDoorToStatusPortWithInternalUpstream() async throws {
+        let harness = makeHarness()
+
+        try await harness.controller.start()
+
+        let starts = await harness.frontDoor.starts
+        XCTAssertEqual(
+            starts,
+            [TestFrontDoor.Start(port: 8317, bindHost: "127.0.0.1", upstreamPort: 18317)]
+        )
+    }
+
+    func testStopStopsFrontDoorBeforeProcess() async throws {
+        let harness = makeHarness()
+        try await harness.controller.start()
+
+        await harness.controller.stopAndWait()
+
+        let stopCount = await harness.frontDoor.stopCount
+        XCTAssertEqual(stopCount, 1)
+    }
+
+    func testFrontDoorBindsLANWhenNetworkAccessAllowed() async throws {
+        let harness = makeHarness(preferences: TestProxyPreferences(allowNetworkAccess: true))
+
+        try await harness.controller.start()
+
+        let starts = await harness.frontDoor.starts
+        XCTAssertEqual(
+            starts,
+            [TestFrontDoor.Start(port: 8317, bindHost: "0.0.0.0", upstreamPort: 18317)]
+        )
+    }
+
+    func testFrontDoorStartFailureAbortsStartupAndSurfacesError() async throws {
+        let harness = makeHarness()
+        await harness.frontDoor.setStartError(TestFrontDoorError.bindFailed)
+
+        do {
+            try await harness.controller.start()
+            XCTFail("expected start to throw")
+        } catch {}
+
+        let snapshot = await harness.controller.snapshot()
+        XCTAssertFalse(snapshot.status.running)
+        XCTAssertNotNil(snapshot.lastError)
+        let stopCount = await harness.process.stopCount
+        XCTAssertEqual(stopCount, 1)
+        let starts = await harness.frontDoor.starts
+        XCTAssertTrue(starts.isEmpty)
+    }
+
     func testProcessLaunchFailureReturnsToIdleAndAllowsRetry() async throws {
         let process = TestProcessController(startFailuresRemaining: 1)
         let harness = makeHarness(process: process)
@@ -380,6 +432,7 @@ final class ProxyLifecycleControllerTests: XCTestCase {
         sleeper: any Sleeping = TestSleeper(),
         management: TestManagementChecker = TestManagementChecker(),
         preferences: TestProxyPreferences = TestProxyPreferences(),
+        frontDoor: TestFrontDoor = TestFrontDoor(),
         keyLoadDelay: Duration? = nil
     ) -> ProxyHarness {
         let paths = ProxyPaths(
@@ -409,7 +462,8 @@ final class ProxyLifecycleControllerTests: XCTestCase {
             configurationSupplement: TestConfigurationSupplement(),
             notificationDelivery: notifications,
             sleeper: sleeper,
-            dateProvider: TestDateProvider()
+            dateProvider: TestDateProvider(),
+            frontDoor: frontDoor
         )
         return ProxyHarness(
             controller: controller,
@@ -418,7 +472,8 @@ final class ProxyLifecycleControllerTests: XCTestCase {
             configuration: configuration,
             metadata: metadata,
             keyVault: keyVault,
-            notifications: notifications
+            notifications: notifications,
+            frontDoor: frontDoor
         )
     }
 
@@ -450,6 +505,36 @@ private struct ProxyHarness {
     let metadata: TestMetadataRepository
     let keyVault: TestKeyVault
     let notifications: TestNotificationDelivery
+    let frontDoor: TestFrontDoor
+}
+
+private actor TestFrontDoor: ProxyFrontDoorListening {
+    struct Start: Equatable {
+        let port: UInt16
+        let bindHost: String
+        let upstreamPort: UInt16
+    }
+
+    private(set) var starts: [Start] = []
+    private(set) var stopCount = 0
+    private var startError: Error?
+
+    func setStartError(_ error: Error?) {
+        startError = error
+    }
+
+    func start(port: UInt16, bindHost: String, upstreamPort: UInt16) throws {
+        if let startError { throw startError }
+        starts.append(Start(port: port, bindHost: bindHost, upstreamPort: upstreamPort))
+    }
+
+    func stop() {
+        stopCount += 1
+    }
+}
+
+private enum TestFrontDoorError: Error {
+    case bindFailed
 }
 
 private actor TestProcessController: ProxyProcessControlling {
@@ -737,12 +822,16 @@ private final class TestMetadataRepository: ProxyRuntimeMetadataRepository, @unc
 
 private final class TestProxyPreferences: ProxyPreferencesRepository, @unchecked Sendable {
     private let proxyURL: String?
+    private let allowNetworkAccess: Bool
 
-    init(proxyURL: String? = nil) {
+    init(proxyURL: String? = nil, allowNetworkAccess: Bool = false) {
         self.proxyURL = proxyURL
+        self.allowNetworkAccess = allowNetworkAccess
     }
 
-    func load() -> ProxyPreferences { ProxyPreferences(proxyURL: proxyURL) }
+    func load() -> ProxyPreferences {
+        ProxyPreferences(allowNetworkAccess: allowNetworkAccess, proxyURL: proxyURL)
+    }
     func setAutoStartProxy(_ enabled: Bool) {}
     func setAllowNetworkAccess(_ enabled: Bool) {}
     func setLoggingToFile(_ enabled: Bool) {}

@@ -70,6 +70,7 @@ enum CompositionRoot {
             notificationDelivery: ProxyNotificationRelay(notifications: notificationController),
             sleeper: ContinuousSleeper(),
             dateProvider: SystemDateProvider(),
+            frontDoor: GatewayListener(),
             installedVersionLimit: AppConstants.maxInstalledVersions
         )
         let proxyScreenModel = ProxyScreenModel(

@@ -82,6 +82,14 @@ public protocol ProxyNotificationDelivering: Sendable {
     func deliver(_ notification: ProxyNotification) async
 }
 
+public protocol ProxyFrontDoorListening: Sendable {
+    /// Binds the agent-facing listener. Throws when the bind fails so the
+    /// lifecycle controller can surface the failure instead of leaving the
+    /// front-door port silently dead.
+    func start(port: UInt16, bindHost: String, upstreamPort: UInt16) async throws
+    func stop() async
+}
+
 public protocol ProxyControlling: Sendable {
     func snapshots() async -> AsyncStream<ProxySnapshot>
     func snapshot() async -> ProxySnapshot

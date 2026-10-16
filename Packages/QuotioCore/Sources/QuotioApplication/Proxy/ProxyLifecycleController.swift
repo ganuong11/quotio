@@ -18,6 +18,7 @@ public actor ProxyLifecycleController: ProxyControlling {
     private let sleeper: any Sleeping
     private let dateProvider: any DateProviding
     private let startupPoller: ProxyStartupHealthPoller
+    private let frontDoor: (any ProxyFrontDoorListening)?
     private let installedVersionLimit: Int
 
     private var stateMachine = ProxyLifecycleStateMachine()
@@ -55,6 +56,7 @@ public actor ProxyLifecycleController: ProxyControlling {
         sleeper: any Sleeping,
         dateProvider: any DateProviding,
         startupPoller: ProxyStartupHealthPoller = ProxyStartupHealthPoller(),
+        frontDoor: (any ProxyFrontDoorListening)? = nil,
         installedVersionLimit: Int = 3
     ) {
         self.processController = processController
@@ -73,6 +75,7 @@ public actor ProxyLifecycleController: ProxyControlling {
         self.sleeper = sleeper
         self.dateProvider = dateProvider
         self.startupPoller = startupPoller
+        self.frontDoor = frontDoor
         self.installedVersionLimit = installedVersionLimit
         self.currentSnapshot = ProxySnapshot(paths: paths)
     }
@@ -560,6 +563,19 @@ public actor ProxyLifecycleController: ProxyControlling {
             guard activeRunID == runID, await processController.isRunning(runID) else {
                 throw ProxyFailure.startupFailed
             }
+            if let frontDoor {
+                // The Swift gateway owns the agent-facing port; CPA stays on
+                // the loopback-only internal port. A bind failure aborts
+                // startup through the same catch so it surfaces via
+                // `lastError` instead of leaving the front door dead.
+                let bindHost = preferencesRepository.load().allowNetworkAccess
+                    ? "0.0.0.0" : "127.0.0.1"
+                try await frontDoor.start(
+                    port: currentSnapshot.status.port,
+                    bindHost: bindHost,
+                    upstreamPort: currentSnapshot.paths.internalProxyPort
+                )
+            }
         } catch {
             if activeRunID == runID {
                 activeRunID = nil
@@ -610,6 +626,8 @@ public actor ProxyLifecycleController: ProxyControlling {
         activeRunID = nil
         currentSnapshot.status.running = false
         publish()
+        // Stop accepting agent traffic before tearing down CPA.
+        await frontDoor?.stop()
         await processController.stop(runID, on: currentSnapshot.paths.internalProxyPort)
         await processController.cleanupProcesses(on: currentSnapshot.status.port)
 
