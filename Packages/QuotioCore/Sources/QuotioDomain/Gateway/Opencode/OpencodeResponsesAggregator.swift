@@ -129,7 +129,7 @@ public nonisolated struct OpencodeResponsesAggregator {
     ///
     /// `requestModel` echoes the model the agent requested (with the
     /// `opencode/` prefix), as OpenAI echoes the request model.
-    func responseObject(requestModel: String) -> [String: Any] {
+    public func responseObject(requestModel: String) -> [String: Any] {
         if var captured = capturedResponse {
             captured["model"] = requestModel
             return captured

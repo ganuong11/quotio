@@ -9,6 +9,9 @@ public enum GatewayDisposition: Sendable, Equatable {
     /// Intercepted `qoder/*` request — carries the resolved surface decision
     /// (chat / responses / rejected) for the dispatch layer.
     case qoder(QoderRoute)
+    /// Intercepted `opencode/*` request — carries the resolved route
+    /// (chat / responses / notInFreeSet / rejected) for the dispatch layer.
+    case opencode(OpencodeRoute)
     /// `GET /v1/models` — fetch CPA's list and merge provider catalogs.
     case modelsMerge
 }

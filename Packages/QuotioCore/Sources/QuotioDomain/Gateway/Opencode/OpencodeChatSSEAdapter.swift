@@ -81,11 +81,11 @@ public nonisolated struct OpencodeChatSSEAdapter {
     /// top-level `error` event). Surfaced so the non-streaming fold can
     /// answer with a true HTTP error instead of folding the error frame's
     /// (choices-less) bytes into an empty-but-200 completion.
-    private(set) var failed: Bool = false
+    public private(set) var failed: Bool = false
 
     /// The upstream's failure message when `failed` — relayed by the
     /// non-streaming fold's error response.
-    private(set) var failureMessage: String?
+    public private(set) var failureMessage: String?
 
     public init(model: String) {
         self.model = model

@@ -42,7 +42,7 @@ public nonisolated enum OpencodeMapperError: Error, Equatable {
     /// stateless chat surface — the client must resend the full history.
     case statefulConversation(field: String)
 
-    var errorDescription: String? {
+    public var errorDescription: String? {
         switch self {
         case .statefulConversation(let field):
             return "'\(field)' cannot be translated to the chat completions surface "

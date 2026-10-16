@@ -31,6 +31,13 @@ import QuotioDomain
 public actor GatewayQuotaOverlay {
     public typealias Host = QuotaCoordinating & AccountManaging & MonitoringSettingsManaging
 
+    /// Mutable holder for NotificationCenter observer tokens — `NSObjectProtocol`
+    /// isn't Sendable, so it can't live in actor state read from the
+    /// nonisolated deinit. Contents are only mutated during init/deinit.
+    private final class ObserverBox: @unchecked Sendable {
+        var tokens: [NSObjectProtocol] = []
+    }
+
     private let host: any Host
     private let quotaService: any QoderQuotaFetching
     private let directory: any GatewayAccountDirectory
@@ -42,6 +49,17 @@ public actor GatewayQuotaOverlay {
     private var hostSnapshot: QuotaSnapshot?
     private var upstreamTask: Task<Void, Never>?
     private var continuations: [UUID: AsyncStream<QuotaSnapshot>.Continuation] = [:]
+    /// OpenCode accounts whose credential is stale (router-reported), keyed by
+    /// lowercased `accountKey` → displayName. Folds into `accountIssues` on
+    /// every merged snapshot until a `…account-recovered` notification clears
+    /// the entry.
+    private var opencodeStaleAccounts: [String: String] = [:]
+    /// Router-reported 429 cooldowns, keyed by lowercased `accountKey` → the
+    /// cooldown's expiry. Self-expiring; consumers compare against now.
+    private var opencodeRateLimits: [String: Date] = [:]
+    /// Sendable box for the observer tokens so the actor's nonisolated
+    /// init/deinit can hold them.
+    private let notificationObservers = ObserverBox()
 
     public init(
         wrapping host: any Host,
@@ -53,6 +71,94 @@ public actor GatewayQuotaOverlay {
         self.quotaService = quotaService
         self.directory = directory
         self.credentials = credentials
+        notificationObservers.tokens = [
+            NotificationCenter.default.addObserver(
+                forName: OpencodeRouter.opencodeAccountStale, object: nil, queue: nil
+            ) { [weak self] note in
+                guard let key = note.userInfo?["accountKey"] as? String,
+                      let name = note.userInfo?["displayName"] as? String else { return }
+                Task { await self?.markOpencodeStale(key: key, displayName: name) }
+            },
+            NotificationCenter.default.addObserver(
+                forName: OpencodeRouter.opencodeAccountRecovered, object: nil, queue: nil
+            ) { [weak self] note in
+                guard let key = note.userInfo?["accountKey"] as? String else { return }
+                Task { await self?.markOpencodeRecovered(key: key) }
+            },
+            NotificationCenter.default.addObserver(
+                forName: OpencodeRouter.opencodeAccountRateLimited, object: nil, queue: nil
+            ) { [weak self] note in
+                guard let key = note.userInfo?["accountKey"] as? String else { return }
+                let retryAfter = (note.userInfo?["retryAfter"] as? TimeInterval) ?? 0
+                Task { await self?.applyOpencodeRateLimit(key: key, retryAfter: retryAfter) }
+            },
+        ]
+    }
+
+    deinit {
+        for observer in notificationObservers.tokens {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
+
+    private func markOpencodeStale(key: String, displayName: String) {
+        opencodeStaleAccounts[key.lowercased()] = displayName
+        Task { await publishMerged() }
+    }
+
+    private func markOpencodeRecovered(key: String) {
+        guard opencodeStaleAccounts.removeValue(forKey: key.lowercased()) != nil else { return }
+        Task { await publishMerged() }
+    }
+
+    private func applyOpencodeRateLimit(key: String, retryAfter: TimeInterval) {
+        Self.applyOpencodeRateLimit(accountKey: key, retryAfter: retryAfter, to: &opencodeRateLimits)
+    }
+
+    // MARK: - OpenCode issue/rate-limit cores (pure statics — testable without
+    // constructing the overlay; the instance methods above are thin shells)
+
+    /// Set or clear the stale-credential issue on the matching gateway
+    /// account. `issues` keys by the account's own `accountKey` casing.
+    public nonisolated static func applyOpencodeIssue(
+        accountKey: String,
+        stale: Bool,
+        to accounts: [GatewayAccount],
+        issues: inout [QuotaAccountID: QuotaRefreshIssue],
+        now: Date = Date()
+    ) {
+        guard let account = accounts.first(where: {
+            $0.provider == .opencode
+                && $0.accountKey.caseInsensitiveCompare(accountKey) == .orderedSame
+        }) else { return }
+        let id = QuotaAccountID(provider: .opencode, accountKey: account.accountKey)
+        if stale {
+            issues[id] = QuotaRefreshIssue(
+                kind: .failed, occurredAt: now, reason: .authentication)
+        } else {
+            issues.removeValue(forKey: id)
+        }
+    }
+
+    /// Record a router-reported 429 cooldown for an opencode account.
+    public nonisolated static func applyOpencodeRateLimit(
+        accountKey: String,
+        retryAfter: TimeInterval,
+        to limits: inout [String: Date],
+        now: Date = Date()
+    ) {
+        limits[accountKey.lowercased()] = now.addingTimeInterval(retryAfter)
+    }
+
+    /// Cooldown expiry for an opencode account still inside its rate-limit
+    /// window — nil for unknown keys and expired entries.
+    public nonisolated static func opencodeRateLimitUntil(
+        accountKey: String,
+        in limits: [String: Date],
+        now: Date = Date()
+    ) -> Date? {
+        guard let until = limits[accountKey.lowercased()], until > now else { return nil }
+        return until
     }
 
     // MARK: - Merge
@@ -110,6 +216,11 @@ public actor GatewayQuotaOverlay {
 
         for (provider, quotas) in quotaCache {
             snapshot.quotas[provider] = quotas
+        }
+        for (staleKey, _) in opencodeStaleAccounts {
+            Self.applyOpencodeIssue(
+                accountKey: staleKey, stale: true,
+                to: accounts, issues: &snapshot.accountIssues)
         }
         snapshot.refreshingProviders.formUnion(refreshing)
         return snapshot

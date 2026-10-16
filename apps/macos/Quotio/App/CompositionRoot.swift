@@ -227,10 +227,28 @@ enum CompositionRoot {
             patService: QoderPATService(),
             gateway: QoderGatewayClient()
         )
+        let opencodeCatalog = OpencodeModelCatalog(identity: identity)
+        let opencodeDetectedCache = OpencodeDetectedCache()
+        let opencodeConsoleClient = OpencodeConsoleClient()
+        let opencodeRouter = OpencodeRouter(
+            catalog: opencodeCatalog,
+            console: opencodeConsoleClient,
+            upstream: OpencodeUpstreamClient(),
+            vault: gatewayCredentialVault,
+            metadata: gatewayAccountStore,
+            detectedSnapshot: { opencodeDetectedCache.snapshot() }
+        )
         let qoderAccessValidator = QoderAccessValidator()
         Task {
+            // Seed the OpenCode catalog + detected-credential snapshot before
+            // the first gated request can hit an empty view; the periodic
+            // refresh loop then keeps both current (1 h / 5 min / 15 min).
+            await opencodeCatalog.loadPersisted()
+            opencodeDetectedCache.refresh()
             await gatewayListener.configureRouting(
                 qoderRouter: qoderRouter,
+                opencodeRouter: opencodeRouter,
+                opencodeCatalog: opencodeCatalog,
                 accessValidator: qoderAccessValidator,
                 apiKeySource: { await configurationRepository.loadAPIKeys() },
                 logger: OSApplicationLogger(
@@ -238,6 +256,26 @@ enum CompositionRoot {
                     category: "GatewayListener"
                 )
             )
+            var lastCatalog = Date()
+            var lastDetected = Date()
+            var lastVault = Date()
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(60))
+                guard !Task.isCancelled else { return }
+                let now = Date()
+                if now.timeIntervalSince(lastCatalog) >= 3600 {
+                    lastCatalog = now
+                    await opencodeCatalog.refresh()
+                }
+                if now.timeIntervalSince(lastDetected) >= 300 {
+                    lastDetected = now
+                    opencodeDetectedCache.refresh()
+                }
+                if now.timeIntervalSince(lastVault) >= 900 {
+                    lastVault = now
+                    await opencodeRouter.refreshExpiringVaultCredentials()
+                }
+            }
         }
         let launchAtLoginController = LaunchAtLoginController(
             registration: ServiceManagementLaunchAtLoginAdapter(),

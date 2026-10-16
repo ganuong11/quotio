@@ -46,6 +46,13 @@ public actor GatewayListener: ProxyFrontDoorListening {
     /// then fall through to CPA (which will 404 them), matching the legacy
     /// "branch not wired" posture.
     private var qoderRouter: QoderFailoverRouter?
+    /// OpenCode upstream router. Nil disables interception — `opencode/*`
+    /// requests then fall through to CPA (which will 404 them), matching the
+    /// Qoder "branch not wired" posture.
+    private var opencodeRouter: OpencodeRouter?
+    /// The catalog the OpenCode route gate reads for free-model membership
+    /// and `/v1/models` merge inputs. Required alongside `opencodeRouter`.
+    private var opencodeCatalog: OpencodeModelCatalog?
     /// Shared API-key validator for intercepted provider traffic (ADR 0008).
     /// Fed by `apiKeySource` at listener start; while unprimed it fails CLOSED.
     private var accessValidator: QoderAccessValidator?
@@ -56,15 +63,19 @@ public actor GatewayListener: ProxyFrontDoorListening {
 
     public init() {}
 
-    /// Wire the Qoder branch. Called before `start` (or while running — the
-    /// next request observes the new values; routing state is actor-isolated).
+    /// Wire the provider branches. Called before `start` (or while running —
+    /// the next request observes the new values; routing state is actor-isolated).
     public func configureRouting(
         qoderRouter: QoderFailoverRouter?,
+        opencodeRouter: OpencodeRouter? = nil,
+        opencodeCatalog: OpencodeModelCatalog? = nil,
         accessValidator: QoderAccessValidator? = nil,
         apiKeySource: (@Sendable () async throws -> [String])? = nil,
         logger: (any ApplicationLogging)? = nil
     ) {
         self.qoderRouter = qoderRouter
+        self.opencodeRouter = opencodeRouter
+        self.opencodeCatalog = opencodeCatalog
         self.accessValidator = accessValidator
         self.apiKeySource = apiKeySource
         self.logger = logger
@@ -290,6 +301,16 @@ public actor GatewayListener: ProxyFrontDoorListening {
         if qoderRoute != .notQoder, qoderRouter != nil {
             return .qoder(qoderRoute)
         }
+        if let catalog = opencodeCatalog {
+            let opencodeRoute = OpencodeRouteGate.resolve(
+                method: request.method,
+                path: request.path,
+                model: model
+            ) { catalog.isFree($0) }
+            if opencodeRoute != .notOpencode, opencodeRouter != nil {
+                return .opencode(opencodeRoute)
+            }
+        }
         return .passthrough
     }
 
@@ -302,11 +323,15 @@ public actor GatewayListener: ProxyFrontDoorListening {
     ) async {
         switch route(request) {
         case .modelsMerge:
+            let opencodeModels = (opencodeRouter != nil)
+                ? (opencodeCatalog?.advertisedModels ?? [])
+                : []
             serveModelsList(
                 path: request.path,
                 headers: request.headers.map { ($0.name, $0.value) },
                 originalConnection: connection,
-                mergeQoder: qoderRouter != nil
+                mergeQoder: qoderRouter != nil,
+                opencodeModels: opencodeModels
             )
         case .qoder(let qoderRoute):
             guard let router = qoderRouter else {
@@ -351,6 +376,38 @@ public actor GatewayListener: ProxyFrontDoorListening {
                 requestSize: request.headerBytes + request.body.count,
                 requestModel: GatewayModelExtraction.extractModel(from: request.body) ?? "",
                 responsesMode: responsesMode
+            )
+        case .opencode(let opencodeRoute):
+            guard let router = opencodeRouter else {
+                Self.forwardRequest(
+                    request: request,
+                    originalConnection: connection,
+                    upstreamPort: upstreamPort
+                )
+                return
+            }
+            // Rejection classes map to true HTTP errors BEFORE any upstream
+            // contact — `opencode/` models never reach CPA (a paid model
+            // must not fall through).
+            if let rejection = Self.opencodeRejection(
+                for: opencodeRoute,
+                catalogIsEmpty: opencodeCatalog?.isEmpty ?? true
+            ) {
+                Self.sendError(to: connection, statusCode: rejection.status, message: rejection.message)
+                return
+            }
+            await forwardOpencodeRequest(
+                router: router,
+                route: opencodeRoute,
+                method: request.method,
+                path: request.path,
+                headers: request.headers.map { ($0.name, $0.value) },
+                body: request.body,
+                originalConnection: connection,
+                connectionID: connectionID,
+                startTime: startTime,
+                requestSize: request.headerBytes + request.body.count,
+                requestModel: GatewayModelExtraction.extractModel(from: request.body) ?? ""
             )
         case .passthrough:
             Self.forwardRequest(
@@ -923,7 +980,8 @@ public actor GatewayListener: ProxyFrontDoorListening {
         path: String,
         headers: [(String, String)],
         originalConnection: NWConnection,
-        mergeQoder: Bool
+        mergeQoder: Bool,
+        opencodeModels: [OpencodeFreeModel]
     ) {
         let targetPort = upstreamPort
         guard let port = NWEndpoint.Port(rawValue: targetPort) else {
@@ -987,6 +1045,7 @@ public actor GatewayListener: ProxyFrontDoorListening {
                             to: originalConnection,
                             responseData: Data(),
                             mergeQoder: mergeQoder,
+                            opencodeModels: opencodeModels,
                             maxAccumBytes: maxAccumBytes
                         )
                     }
@@ -1008,6 +1067,7 @@ public actor GatewayListener: ProxyFrontDoorListening {
         to originalConnection: NWConnection,
         responseData: Data,
         mergeQoder: Bool,
+        opencodeModels: [OpencodeFreeModel],
         maxAccumBytes: Int
     ) {
         targetConnection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, isComplete, error in
@@ -1033,7 +1093,8 @@ public actor GatewayListener: ProxyFrontDoorListening {
                 finishModelsList(
                     accumulatedResponse: accumulated,
                     originalConnection: originalConnection,
-                    mergeQoder: mergeQoder
+                    mergeQoder: mergeQoder,
+                    opencodeModels: opencodeModels
                 )
             } else {
                 DispatchQueue.global(qos: .userInitiated).async {
@@ -1042,6 +1103,7 @@ public actor GatewayListener: ProxyFrontDoorListening {
                         to: originalConnection,
                         responseData: accumulated,
                         mergeQoder: mergeQoder,
+                        opencodeModels: opencodeModels,
                         maxAccumBytes: maxAccumBytes
                     )
                 }
@@ -1055,14 +1117,19 @@ public actor GatewayListener: ProxyFrontDoorListening {
     private nonisolated static func finishModelsList(
         accumulatedResponse: Data,
         originalConnection: NWConnection,
-        mergeQoder: Bool
+        mergeQoder: Bool,
+        opencodeModels: [OpencodeFreeModel]
     ) {
         var mergedBody: Data? = nil
-        if mergeQoder,
+        if (mergeQoder || !opencodeModels.isEmpty),
            let status = statusCode(from: accumulatedResponse),
            (200..<300).contains(status),
            let body = QoderModelsMerger.extractHTTPBody(from: accumulatedResponse) {
-            mergedBody = QoderModelsMerger.mergeQoderModels(into: body)
+            mergedBody = mergeModelsBody(
+                into: body,
+                mergeQoder: mergeQoder,
+                opencodeModels: opencodeModels
+            )
         }
 
         if let mergedBody {
@@ -1103,6 +1170,496 @@ public actor GatewayListener: ProxyFrontDoorListening {
     /// shared `sendError` without capturing send paths.
     private func sendLocalError(to connection: NWConnection, statusCode: Int, message: String) {
         Self.sendError(to: connection, statusCode: statusCode, message: message)
+    }
+
+    // MARK: - Models merge / opencode rejection helpers
+
+    /// Chain the per-namespace model mergers over CPA's `/v1/models` body:
+    /// Qoder first, then opencode. A failed merge aborts the whole merge (nil)
+    /// — the caller degrades to raw passthrough so discovery never breaks.
+    nonisolated static func mergeModelsBody(
+        into cpaBody: Data,
+        mergeQoder: Bool,
+        opencodeModels: [OpencodeFreeModel]
+    ) -> Data? {
+        var merged: Data? = nil
+        var anyMerged = false
+        if mergeQoder {
+            guard let q = QoderModelsMerger.mergeQoderModels(into: cpaBody) else {
+                return nil
+            }
+            merged = q
+            anyMerged = true
+        }
+        if !opencodeModels.isEmpty {
+            guard let o = OpencodeModelsMerger.mergeOpencodeModels(
+                into: merged ?? cpaBody, models: opencodeModels) else {
+                return nil
+            }
+            merged = o
+            anyMerged = true
+        }
+        return anyMerged ? merged : nil
+    }
+
+    /// Map a non-servable `OpencodeRoute` to its HTTP rejection. `.chat` and
+    /// `.responses` return nil (forward to the router). `.rejected` and a
+    /// populated-catalog `.notInFreeSet` → 404; an empty-catalog
+    /// `.notInFreeSet` → 503: the catalog couldn't load, so "unknown" is
+    /// provisional rather than "paid". `.notOpencode` isn't reachable here.
+    nonisolated static func opencodeRejection(
+        for route: OpencodeRoute,
+        catalogIsEmpty: Bool
+    ) -> (status: Int, message: String)? {
+        switch route {
+        case .chat, .responses, .notOpencode:
+            return nil
+        case .rejected:
+            return (404, "OpenCode models are only supported on POST /v1/chat/completions and POST /v1/responses.")
+        case .notInFreeSet:
+            if catalogIsEmpty {
+                return (503, "opencode free-model catalog unavailable — refresh pending or failed.")
+            }
+            return (404, "model not found in the opencode free-model set.")
+        }
+    }
+
+    // MARK: - OpenCode branch (ADR 0021)
+
+    /// Forward an `opencode/<id>` request through `OpencodeRouter`, bypassing
+    /// CPA. ADR 0021 surface dispatch: same-surface requests relay the
+    /// upstream status/headers/bytes verbatim; cross-surface requests
+    /// translate at the seam; a `stream:false` client is aggregated into one
+    /// JSON body on every arm (the free-tier gate forces `stream:true`
+    /// upstream). Mirrors `forwardQoderRequest`'s lifecycle.
+    private func forwardOpencodeRequest(
+        router: OpencodeRouter,
+        route: OpencodeRoute,
+        method: String,
+        path: String,
+        headers: [(String, String)],
+        body: Data,
+        originalConnection: NWConnection,
+        connectionID: Int,
+        startTime: Date,
+        requestSize: Int,
+        requestModel: String
+    ) async {
+        guard await authenticateProxyRequest(
+            headers: headers,
+            path: path,
+            connection: originalConnection,
+            notReadyMessage: "API-key validation is not ready yet — the proxy key snapshot has not loaded. Retry in a moment."
+        ) != nil else {
+            return
+        }
+
+        // The pump runs in an unstructured Task so the upstream byte pull
+        // doesn't block the listener actor; the handle lives in
+        // `pumpTasks[connectionID]` for the disconnect-cancel path.
+        let pumpTask = Task { [weak self] in
+            guard let self = self else { return }
+            defer { Task { await self.removePumpTask(connectionID) } }
+
+            let opened: OpencodeOpenedStream
+            do {
+                opened = try await router.open(requestBody: body, route: route)
+            } catch let error as OpencodeRouterError {
+                Self.sendError(
+                    to: originalConnection,
+                    statusCode: error.httpStatus,
+                    message: error.errorDescription ?? "opencode upstream error.",
+                    retryAfter: error.retryAfterSeconds.map(TimeInterval.init)
+                )
+                return
+            } catch {
+                Self.sendError(to: originalConnection, statusCode: 502, message: "opencode upstream error.")
+                return
+            }
+
+            let plan = opened.plan
+            let is2xx = (200..<300).contains(opened.status)
+            // The upstream is ALWAYS streamed (the free-tier gate 403s
+            // `stream:false`); the client's own `stream` field only decides
+            // how the agent is served — SSE relay or one aggregated body.
+            let clientStreams = OpencodeRouter.streamRequested(in: body)
+
+            var relayBytes = 0
+            var relayFailed = false
+            var statusCodeForMetadata: Int? = opened.status
+
+            if is2xx && !clientStreams {
+                // --- Non-streaming client: fold the forced-SSE upstream into
+                // one JSON body. The head is written only after aggregation
+                // (exact Content-Length); a failure before that point is a
+                // true HTTP 502 — nothing has reached the agent yet.
+                final class AggregateBox: @unchecked Sendable {
+                    var chat: QoderCompletionAggregator?
+                    var responses: OpencodeResponsesAggregator?
+                    var chatAdapter: OpencodeChatSSEAdapter?
+                    var totalBytes = 0
+                }
+                let box = AggregateBox()
+                if plan == .passthrough(native: .responses) {
+                    box.responses = OpencodeResponsesAggregator()
+                } else {
+                    box.chat = QoderCompletionAggregator()
+                    if plan == .chatToResponses {
+                        box.chatAdapter = OpencodeChatSSEAdapter(model: requestModel)
+                    }
+                }
+
+                var aggregateFailed = false
+                if !opened.bufferedPrefix.isEmpty {
+                    box.totalBytes += opened.bufferedPrefix.count
+                    if box.chat != nil {
+                        if box.chatAdapter != nil {
+                            var adapter = box.chatAdapter!
+                            let chunks = (try? adapter.ingest(opened.bufferedPrefix)) ?? Data()
+                            box.chatAdapter = adapter
+                            try? box.chat?.ingest(chunks)
+                        } else {
+                            try? box.chat?.ingest(opened.bufferedPrefix)
+                        }
+                    } else {
+                        box.responses?.ingest(opened.bufferedPrefix)
+                    }
+                }
+                do {
+                    try await opened.pump { chunk in
+                        box.totalBytes += chunk.count
+                        if box.chat != nil {
+                            if box.chatAdapter != nil {
+                                var adapter = box.chatAdapter!
+                                let chunks = (try? adapter.ingest(chunk)) ?? Data()
+                                box.chatAdapter = adapter
+                                try? box.chat?.ingest(chunks)
+                            } else {
+                                try? box.chat?.ingest(chunk)
+                            }
+                        } else {
+                            box.responses?.ingest(chunk)
+                        }
+                        return true
+                    }
+                } catch {
+                    if !Task.isCancelled {
+                        await log("opencode (non-stream) upstream ended: \(String(describing: error))")
+                    }
+                    aggregateFailed = true
+                }
+
+                // Flush the adapter's synthesized terminal (clean EOF without
+                // a Responses terminal event) so the folded completion
+                // carries finish_reason and any terminal usage.
+                if !aggregateFailed, var adapter = box.chatAdapter {
+                    if let terminal = try? adapter.finish(), !terminal.isEmpty {
+                        try? box.chat?.ingest(terminal)
+                    }
+                    box.chatAdapter = adapter
+                }
+
+                relayBytes = box.totalBytes
+                relayFailed = aggregateFailed
+
+                let json: [String: Any]?
+                if plan == .passthrough(native: .responses), let responsesAgg = box.responses {
+                    json = responsesAgg.responseObject(requestModel: requestModel)
+                } else if let chatAgg = box.chat {
+                    json = plan == .responsesToChat
+                        ? chatAgg.responsesObject(requestModel: requestModel)
+                        : chatAgg.completionJSON(requestModel: requestModel)
+                } else {
+                    json = nil
+                }
+
+                // An upstream-reported failure (response.failed / error
+                // event) reached the adapter — the chat non-streaming
+                // contract is an HTTP error, and nothing is written yet.
+                let adapterFailed = box.chatAdapter?.failed ?? false
+                if aggregateFailed || adapterFailed || json == nil {
+                    statusCodeForMetadata = nil
+                    Self.sendError(
+                        to: originalConnection, statusCode: 502,
+                        message: box.chatAdapter?.failureMessage
+                            ?? "opencode upstream stream ended before completion.")
+                    originalConnection.send(content: nil, isComplete: true, completion: .contentProcessed { _ in
+                        originalConnection.cancel()
+                    })
+                } else {
+                    let bodyBytes = (try? JSONSerialization.data(withJSONObject: json!))
+                        ?? Data("{\"error\":\"failed to serialize completion\"}".utf8)
+                    let head = "HTTP/1.1 200 OK\r\n"
+                        + "Content-Type: application/json\r\n"
+                        + "Content-Length: \(bodyBytes.count)\r\n"
+                        + "Cache-Control: no-cache\r\n"
+                        + "Connection: close\r\n\r\n"
+                    do {
+                        try await Self.sendToAgent(Data(head.utf8), on: originalConnection)
+                        try await Self.sendToAgent(bodyBytes, on: originalConnection)
+                    } catch {
+                        opened.cancel()
+                        return
+                    }
+                    relayBytes += bodyBytes.count
+                    originalConnection.send(content: nil, isComplete: true, completion: .contentProcessed { _ in
+                        originalConnection.cancel()
+                    })
+                }
+            } else if is2xx && plan == .responsesToChat {
+                // --- Translated streaming: upstream is Chat Completions SSE,
+                // the client speaks Responses. Translate through
+                // `QoderResponsesAdapter` (skips [DONE]; `finish()`
+                // synthesizes the Responses terminals). A mid-stream failure
+                // after the 200 head can't change the status — emit a
+                // Responses-shaped terminal error event.
+                let responseHead = "HTTP/1.1 200 OK\r\n"
+                    + "Content-Type: text/event-stream\r\n"
+                    + "Cache-Control: no-cache\r\n"
+                    + "Connection: close\r\n\r\n"
+                do {
+                    try await Self.sendToAgent(Data(responseHead.utf8), on: originalConnection)
+                } catch {
+                    opened.cancel()
+                    return
+                }
+
+                final class TranslateBox: @unchecked Sendable {
+                    // Value type behind a reference holder — copy out,
+                    // mutate, write back (same in/out mechanics as the
+                    // Qoder ReparserBox).
+                    var adapter: QoderResponsesAdapter
+                    var totalBytes = 0
+                    var failed = false
+                    init(_ adapter: QoderResponsesAdapter) { self.adapter = adapter }
+                }
+                let box = TranslateBox(QoderResponsesAdapter(model: requestModel))
+
+                if !opened.bufferedPrefix.isEmpty {
+                    box.totalBytes += opened.bufferedPrefix.count
+                    var adapter = box.adapter
+                    let events = (try? adapter.ingest(opened.bufferedPrefix)) ?? Data()
+                    box.adapter = adapter
+                    if !events.isEmpty {
+                        try? await Self.sendToAgent(events, on: originalConnection)
+                    }
+                }
+
+                do {
+                    try await opened.pump { chunk in
+                        box.totalBytes += chunk.count
+                        var adapter = box.adapter
+                        let events = (try? adapter.ingest(chunk)) ?? Data()
+                        box.adapter = adapter
+                        guard !events.isEmpty else { return true }
+                        do {
+                            try await Self.sendToAgent(events, on: originalConnection)
+                            return true
+                        } catch {
+                            return false   // agent went away — stop pumping
+                        }
+                    }
+                } catch {
+                    if !Task.isCancelled {
+                        box.failed = true
+                        statusCodeForMetadata = nil
+                        await log("opencode (translated) upstream stream ended: \(String(describing: error))")
+                    }
+                }
+
+                if box.failed {
+                    var adapter = box.adapter
+                    let frame = adapter.errorEvent(
+                        message: "opencode upstream stream ended before completion.")
+                    box.adapter = adapter
+                    _ = try? await Self.sendToAgent(frame, on: originalConnection)
+                } else {
+                    var adapter = box.adapter
+                    let terminal = (try? adapter.finish()) ?? Data()
+                    box.adapter = adapter
+                    if !terminal.isEmpty {
+                        try? await Self.sendToAgent(terminal, on: originalConnection)
+                    }
+                }
+                relayBytes = box.totalBytes
+                relayFailed = box.failed
+
+                originalConnection.send(content: nil, isComplete: true, completion: .contentProcessed { _ in
+                    originalConnection.cancel()
+                })
+            } else if is2xx && plan == .chatToResponses {
+                // --- Reverse translated streaming: upstream is Responses
+                // SSE, the client speaks Chat Completions. Translate through
+                // `OpencodeChatSSEAdapter` (Responses events →
+                // chat.completion.chunk frames, ends with [DONE]). A
+                // mid-stream failure after the 200 head can't change the
+                // status — emit a chat-shaped terminal error frame.
+                let responseHead = "HTTP/1.1 200 OK\r\n"
+                    + "Content-Type: text/event-stream\r\n"
+                    + "Cache-Control: no-cache\r\n"
+                    + "Connection: close\r\n\r\n"
+                do {
+                    try await Self.sendToAgent(Data(responseHead.utf8), on: originalConnection)
+                } catch {
+                    opened.cancel()
+                    return
+                }
+
+                final class ChatTranslateBox: @unchecked Sendable {
+                    var adapter: OpencodeChatSSEAdapter
+                    var totalBytes = 0
+                    var failed = false
+                    init(_ adapter: OpencodeChatSSEAdapter) { self.adapter = adapter }
+                }
+                let box = ChatTranslateBox(OpencodeChatSSEAdapter(model: requestModel))
+
+                if !opened.bufferedPrefix.isEmpty {
+                    box.totalBytes += opened.bufferedPrefix.count
+                    var adapter = box.adapter
+                    let chunks = (try? adapter.ingest(opened.bufferedPrefix)) ?? Data()
+                    box.adapter = adapter
+                    if !chunks.isEmpty {
+                        try? await Self.sendToAgent(chunks, on: originalConnection)
+                    }
+                }
+
+                do {
+                    try await opened.pump { chunk in
+                        box.totalBytes += chunk.count
+                        var adapter = box.adapter
+                        let chunks = (try? adapter.ingest(chunk)) ?? Data()
+                        box.adapter = adapter
+                        guard !chunks.isEmpty else { return true }
+                        do {
+                            try await Self.sendToAgent(chunks, on: originalConnection)
+                            return true
+                        } catch {
+                            return false   // agent went away — stop pumping
+                        }
+                    }
+                } catch {
+                    if !Task.isCancelled {
+                        box.failed = true
+                        statusCodeForMetadata = nil
+                        await log("opencode (reverse-translated) upstream stream ended: \(String(describing: error))")
+                    }
+                }
+
+                if box.failed {
+                    var adapter = box.adapter
+                    let frame = adapter.errorEvent(
+                        message: "opencode upstream stream ended before completion.")
+                    box.adapter = adapter
+                    _ = try? await Self.sendToAgent(frame, on: originalConnection)
+                } else {
+                    var adapter = box.adapter
+                    let terminal = (try? adapter.finish()) ?? Data()
+                    box.adapter = adapter
+                    if !terminal.isEmpty {
+                        try? await Self.sendToAgent(terminal, on: originalConnection)
+                    }
+                }
+                relayBytes = box.totalBytes
+                relayFailed = box.failed
+
+                originalConnection.send(content: nil, isComplete: true, completion: .contentProcessed { _ in
+                    originalConnection.cancel()
+                })
+            } else {
+                // --- Verbatim relay: same-surface streaming, and every
+                // non-2xx upstream status. The agent sees upstream's own
+                // status/headers/body exactly — for the translated arm this
+                // includes error bodies, whose `{"error":{…}}` envelope is
+                // shared across both surfaces.
+                let reason = HTTPURLResponse.localizedString(forStatusCode: opened.status)
+                var head = "HTTP/1.1 \(opened.status) \(reason)\r\n"
+                let hopByHop: Set<String> = [
+                    "connection", "transfer-encoding", "content-length", "keep-alive"
+                ]
+                for (name, value) in opened.headers where !hopByHop.contains(name.lowercased()) {
+                    head += "\(name): \(value)\r\n"
+                }
+                head += "Connection: close\r\n\r\n"
+
+                let agentConn = originalConnection
+                do {
+                    try await Self.sendToAgent(Data(head.utf8), on: agentConn)
+                } catch {
+                    opened.cancel()
+                    return
+                }
+
+                final class StreamBox: @unchecked Sendable {
+                    var totalBytes = 0
+                    var failed = false
+                }
+                let box = StreamBox()
+
+                // Replay any router-buffered prefix, then pump the remaining
+                // upstream bytes RAW — no SSE reparsing. A failed send to
+                // the agent stops the pump; a failed upstream pull truncates
+                // the agent response like a real opencode client sees.
+                if !opened.bufferedPrefix.isEmpty {
+                    box.totalBytes += opened.bufferedPrefix.count
+                    do {
+                        try await Self.sendToAgent(opened.bufferedPrefix, on: agentConn)
+                    } catch {
+                        opened.cancel()
+                        return
+                    }
+                }
+                do {
+                    try await opened.pump { chunk in
+                        box.totalBytes += chunk.count
+                        do {
+                            try await Self.sendToAgent(chunk, on: agentConn)
+                        } catch {
+                            return false  // agent went away — stop pumping cleanly
+                        }
+                        return true
+                    }
+                } catch {
+                    if !Task.isCancelled {
+                        // Mid-stream transport drop: record, don't fabricate.
+                        box.failed = true
+                        statusCodeForMetadata = nil
+                        await log("opencode upstream stream ended: \(String(describing: error))")
+                    }
+                }
+                relayBytes = box.totalBytes
+                relayFailed = box.failed
+
+                originalConnection.send(content: nil, isComplete: true, completion: .contentProcessed { _ in
+                    originalConnection.cancel()
+                })
+            }
+
+            let durationMs = Int(Date().timeIntervalSince(startTime) * 1000)
+            let finalMetadata = GatewayRequestMetadata(
+                timestamp: startTime,
+                method: method,
+                path: path,
+                provider: "opencode",
+                model: requestModel,
+                resolvedModel: requestModel,
+                resolvedProvider: "opencode",
+                statusCode: relayFailed ? nil : statusCodeForMetadata,
+                durationMs: durationMs,
+                requestSize: requestSize,
+                responseSize: relayBytes,
+                responseSnippet: nil,
+                inputTokens: nil,
+                outputTokens: nil,
+                cacheReadTokens: nil,
+                cacheWriteTokens: nil,
+                reasoningTokens: nil
+            )
+            await self.onRequestCompleted?(finalMetadata)
+        }
+
+        // Store the pump handle BEFORE its body can begin so a fast agent
+        // disconnect finds it in `pumpTasks`.
+        pumpTasks[connectionID] = pumpTask
     }
 
     // MARK: - Error responses
