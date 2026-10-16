@@ -31,7 +31,7 @@ import Foundation
 ///
 /// `nonisolated enum` → all members inherit nonisolated, callable from any
 /// isolation domain (the project's default isolation is MainActor; pure value
-/// types must opt out explicitly, like `ProxyURLValidator` and `AIProvider`).
+/// types must opt out explicitly, like `ProxyURLValidator`).
 public nonisolated enum QoderWAFEncoder {
     /// Qoder's substitution target alphabet. The character at index `i` is the
     /// encoded form of the standard-base64 character at index `i` of
