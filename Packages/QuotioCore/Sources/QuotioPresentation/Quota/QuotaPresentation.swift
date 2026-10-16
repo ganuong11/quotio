@@ -13,6 +13,8 @@ private func relativeQuotaResetTime(_ value: String) -> String {
     guard !value.isEmpty, let date = parseQuotaResetDate(value) else { return "—" }
     let interval = date.timeIntervalSinceNow
     guard interval > 0 else { return "now" }
+    // No-expiry sentinels (e.g. year 9999) are meaningless as countdowns.
+    guard interval < 366 * 5 * 86_400 else { return "—" }
     let totalMinutes = Int(interval / 60)
     let hours = totalMinutes / 60
     let minutes = totalMinutes % 60

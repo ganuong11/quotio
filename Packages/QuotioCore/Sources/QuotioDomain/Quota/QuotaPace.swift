@@ -74,11 +74,17 @@ public extension QuotaPace {
 }
 
 public extension QuotaMetric {
+    /// Beyond this horizon a reset timestamp is a no-expiry sentinel (e.g. year 9999),
+    /// not a countdown worth rendering.
+    private static var meaningfulResetHorizon: TimeInterval { 366 * 5 * 86_400 }
+
     var resetDate: Date? {
         guard !resetTime.isEmpty else { return nil }
         let fractional = ISO8601DateFormatter()
         fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return fractional.date(from: resetTime) ?? ISO8601DateFormatter().date(from: resetTime)
+        let date = fractional.date(from: resetTime) ?? ISO8601DateFormatter().date(from: resetTime)
+        guard let date, date.timeIntervalSinceNow < Self.meaningfulResetHorizon else { return nil }
+        return date
     }
 
     func pace(now: Date = Date()) -> QuotaPace? {
