@@ -30,18 +30,18 @@ Quotio's stable identity for one account in the quota/monitoring dictionary: `{p
 ### Provider routing
 
 **CPA (CLIProxyAPI)**:
-The third-party Go binary Quotio bundles. Listens on localhost, speaks OpenAI Chat Completions shape, translates per-provider, signs per-provider, routes upstream. Quotio writes its auth files and YAML config; Quotio does not own its protocol code.
+The third-party Go binary Quotio bundles. It listens on a loopback-only internal port (`18317` production, `18318` development) — agents never reach it directly. It speaks OpenAI Chat Completions shape, translates per-provider, signs per-provider, routes upstream. Quotio writes its auth files and YAML config; Quotio does not own its protocol code.
 _Avoid_: the proxy (ambiguous), CLIProxyAPI-Plus (a specific build flavour)
 
-**ProxyBridge**:
-An in-process `NWListener` in Quotio that sits between CLI agents and CPA. Today it is a transparent byte-forwarder that forces `Connection: close` to dodge stale-connection bugs. Under Option A for Qoder, it becomes branchy: Qoder-bound requests are intercepted, COSY-signed, and shipped direct to `api3.qoder.sh`; all other traffic still forwards to CPA unchanged.
+**GatewayListener** (was ProxyBridge):
+An in-process `NWListener` in Quotio that owns the agent-facing front door (`8317` production, `8318` development). Provider-owned traffic (`qoder/*`, `opencode/*`) is intercepted and served by the Swift gateways — Qoder requests are COSY-signed and shipped direct to `api3.qoder.sh`; OpenCode requests go through `OpencodeRouter`'s account-aware failover. All other inference and CPA management traffic byte-forwards to CPA's internal port. The old name survives in some ADRs and docs.
 _Avoid_: bridge, proxy (ambiguous with CPA)
 
 **Routing discriminator**:
-The rule ProxyBridge uses to decide whether a request is Qoder-bound (and therefore takes the COSY path) or CPA-bound. A conjunctive allowlist: body `model:` starts with `qoder/` **and** method is `POST` **and** path is an explicitly supported endpoint (today: `/v1/chat/completions` and `/v1/responses`; extensible as #451/#452 land). A `qoder/` model on anything else is rejected with a Qoder-owned 404 — it does not fall through to CPA. ADR 0003 (prefix) refined by ADR 0009 (method+path).
+The rule GatewayListener uses to decide whether a request is Qoder-bound (and therefore takes the COSY path) or CPA-bound. A conjunctive allowlist: body `model:` starts with `qoder/` **and** method is `POST` **and** path is an explicitly supported endpoint (today: `/v1/chat/completions` and `/v1/responses`; extensible as #451/#452 land). A `qoder/` model on anything else is rejected with a Qoder-owned 404 — it does not fall through to CPA. ADR 0003 (prefix) refined by ADR 0009 (method+path).
 
 **/v1/models merge**:
-`GET /v1/models` is intercepted by ProxyBridge and answered with CPA's list plus the Qoder catalog under `qoder/<id>` (one entry per `QoderModelRegistry` seed key, `created` pinned to the 2026-08-03 catalog-refresh epoch). Any failure — non-2xx from CPA, unparseable body, merge error — degrades to raw CPA passthrough (the agent sees exactly what CPA sent), so model discovery never breaks. The merge only runs when `qoderRouter` is wired; otherwise the endpoint stays a pure passthrough. The endpoint stays on CPA's auth surface (client `Authorization` flows through; `QoderAccessValidator` is not involved). ADR 0016 reverses ADR 0003 §3.
+`GET /v1/models` is intercepted by GatewayListener and answered with CPA's list plus the Qoder catalog under `qoder/<id>` (one entry per `QoderModelRegistry` seed key, `created` pinned to the 2026-08-03 catalog-refresh epoch). Any failure — non-2xx from CPA, unparseable body, merge error — degrades to raw CPA passthrough (the agent sees exactly what CPA sent), so model discovery never breaks. The merge only runs when `qoderRouter` is wired; otherwise the endpoint stays a pure passthrough. The endpoint stays on CPA's auth surface (client `Authorization` flows through; `QoderAccessValidator` is not involved). ADR 0016 reverses ADR 0003 §3.
 
 **QoderAccessValidator**:
 The in-process API-key gate that owns authentication on the Qoder path, since CPA's `AuthMiddleware` is bypassed for `qoder/*` traffic. Mirrors CPA's `config_access` provider exactly — same five candidate sources (`Authorization` Bearer-or-bare, `X-Api-Key`, `X-Goog-Api-Key`, `?key=`, `?auth_token=`), same `401` failure shapes, same key set (a CPA-sourced snapshot reloaded on the `fetchAPIKeys()` cadence). ADR 0008.
@@ -82,7 +82,7 @@ _Avoid_: "context window" (that's token-based, client-side compaction), message 
 ### OpenCode-specific
 
 **OpenCode**:
-The OpenCode Console AI service (`opencode.ai/console` for auth, `opencode.ai/inference` for inference). Free inference models are served through a Quotio-native ProxyBridge branch (ADR 0020): account-aware failover over Quotio-managed device-code logins plus read-only detection of the system opencode install's credentials (`auth.json`, `opencode*.db` via temp copies — never written back).
+The OpenCode Console AI service (`opencode.ai/console` for auth, `opencode.ai/inference` for inference). Free inference models are served through a Quotio-native GatewayListener branch (ADR 0020): account-aware failover over Quotio-managed device-code logins plus read-only detection of the system opencode install's credentials (`auth.json`, `opencode*.db` via temp copies — never written back).
 _Avoid_: opencode (ambiguous with the client app), OpenCode CLI (the client, not the service)
 
 **OpenCode free-tier gate**:
