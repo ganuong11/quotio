@@ -64,3 +64,4 @@ public actor GatewayCredentialVault {
 }
 
 extension GatewayCredentialVault: GatewayCredentialStoring {}
+extension GatewayCredentialVault: GatewayCredentialRemoving {}

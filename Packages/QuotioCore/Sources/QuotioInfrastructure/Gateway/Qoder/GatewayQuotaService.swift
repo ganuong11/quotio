@@ -226,3 +226,5 @@ public actor GatewayQuotaService {
         }
     }
 }
+
+extension GatewayQuotaService: QoderQuotaFetching {}

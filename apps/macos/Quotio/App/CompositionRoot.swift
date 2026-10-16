@@ -116,31 +116,6 @@ enum CompositionRoot {
                 }
             }
         }
-        let accountsScreenModel = AccountsScreenModel(
-            accountService: quotioBackend
-        )
-
-        let monitorAuthorizer = QuotioCLIOAuthAuthorizer(
-            backend: quotioBackend,
-            urlOpener: urlOpener
-        )
-        let modeManager = OperatingModeManager(
-            repository: UserDefaultsOperatingModePreferencesRepository()
-        )
-        let oauthScreenModel = OAuthScreenModel(
-            controller: OAuthFlowController(authorizer: monitorAuthorizer)
-        )
-
-        let quotaScreenModel = QuotaScreenModel(
-            coordinator: quotioBackend
-        )
-        let quotaHistory = QuotaHistoryServiceModel(
-            useCases: QuotaHistoryUseCases(reader: quotioBackend, manager: quotioBackend),
-            coordinator: quotioBackend
-        )
-        let menuBarSettings = MenuBarSettingsManager(
-            repository: UserDefaultsMenuBarPreferencesRepository()
-        )
         let gatewayAccountStore = GatewayAccountStore(identity: identity)
         let gatewayCredentialVault = GatewayCredentialVault(
             dataStore: KeychainCredentialDataStore(
@@ -160,16 +135,54 @@ enum CompositionRoot {
         Task {
             await gatewayLegacyImport.run(into: gatewayCredentialVault)
         }
+        let qoderPATService = QoderPATService()
         let qoderOnboardingController = QoderOnboardingController(
-            onboarding: QoderPATService(),
+            onboarding: qoderPATService,
             credentials: gatewayCredentialVault
+        )
+        let gatewayQuotaService = GatewayQuotaService(
+            vault: gatewayCredentialVault,
+            metadata: gatewayAccountStore,
+            patService: qoderPATService
+        )
+        let gatewayOverlay = GatewayQuotaOverlay(
+            wrapping: quotioBackend,
+            quotaService: gatewayQuotaService,
+            directory: gatewayAccountStore,
+            credentials: gatewayCredentialVault
+        )
+
+        let accountsScreenModel = AccountsScreenModel(
+            accountService: gatewayOverlay
+        )
+
+        let monitorAuthorizer = QuotioCLIOAuthAuthorizer(
+            backend: quotioBackend,
+            urlOpener: urlOpener
+        )
+        let modeManager = OperatingModeManager(
+            repository: UserDefaultsOperatingModePreferencesRepository()
+        )
+        let oauthScreenModel = OAuthScreenModel(
+            controller: OAuthFlowController(authorizer: monitorAuthorizer)
+        )
+
+        let quotaScreenModel = QuotaScreenModel(
+            coordinator: gatewayOverlay
+        )
+        let quotaHistory = QuotaHistoryServiceModel(
+            useCases: QuotaHistoryUseCases(reader: quotioBackend, manager: quotioBackend),
+            coordinator: gatewayOverlay
+        )
+        let menuBarSettings = MenuBarSettingsManager(
+            repository: UserDefaultsMenuBarPreferencesRepository()
         )
         let quotaController = QuotaFeatureController(
             quota: quotaScreenModel,
             accounts: accountsScreenModel,
             oauth: oauthScreenModel,
             modeManager: modeManager,
-            monitoringSettings: quotioBackend,
+            monitoringSettings: gatewayOverlay,
             menuBarSettings: menuBarSettings,
             notifications: notificationController,
             qoderOnboarding: qoderOnboardingController

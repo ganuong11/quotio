@@ -33,3 +33,26 @@ public protocol GatewayAccountStoring: Sendable {
     func disabledAccountIDs() async -> Set<String>
     func setDisabled(_ disabled: Bool, accountID: String) async throws
 }
+
+/// Account-directory surface the quota overlay needs: enumeration for snapshot
+/// merging plus disable/delete routing. Conformed to by `GatewayAccountStore`.
+public protocol GatewayAccountDirectory: Sendable {
+    func accounts() async -> [GatewayAccount]
+    func disabledAccountIDs() async -> Set<String>
+    func setDisabled(_ disabled: Bool, accountID: String) async throws
+    func deleteAccount(accountID: String) async throws
+}
+
+/// Credential-removal surface for `removeQuota`/account `delete` routing.
+/// Conformed to by `GatewayCredentialVault`.
+public protocol GatewayCredentialRemoving: Sendable {
+    func remove(accountID: String) async
+}
+
+/// Per-provider gateway quota fetch. `GatewayQuotaService` conforms for Qoder;
+/// the overlay asks it for `[accountKey: ProviderQuota]` rows and merges them
+/// into the quota snapshot.
+public protocol QoderQuotaFetching: Sendable {
+    func fetchAllQuotas() async -> [String: ProviderQuota]
+    func fetchQuota(accountKey: String) async -> ProviderQuota?
+}

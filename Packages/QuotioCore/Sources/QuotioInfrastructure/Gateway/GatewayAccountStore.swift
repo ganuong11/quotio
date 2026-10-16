@@ -61,3 +61,4 @@ public actor GatewayAccountStore {
 }
 
 extension GatewayAccountStore: GatewayAccountStoring {}
+extension GatewayAccountStore: GatewayAccountDirectory {}
