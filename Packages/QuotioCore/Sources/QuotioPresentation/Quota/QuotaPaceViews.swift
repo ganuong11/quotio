@@ -270,6 +270,10 @@ struct QuotaLimitRow: View {
                     .lineLimit(1)
                 }
             }
+        } else if meter.metric.resetNeverExpires {
+            Text("quota.reset.noExpiry".localized())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
         } else if let trendPerDay {
             Label {
                 Text(String(format: "quota.trend.week".localized(),
@@ -304,6 +308,10 @@ struct QuotaExhaustedBanner: View {
                     Text(meter.resetsOnDate
                         ? String(format: "quota.exhausted.backOn".localized(), QuotaTimeText.day(reset))
                         : String(format: "quota.exhausted.back".localized(), QuotaTimeText.time(reset)))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else if meter.metric.resetNeverExpires {
+                    Text("quota.reset.noExpiry".localized())
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

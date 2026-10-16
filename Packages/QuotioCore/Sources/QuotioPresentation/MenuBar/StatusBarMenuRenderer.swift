@@ -837,6 +837,9 @@ private struct MenuCompactAccountRow: View {
                 : reset.timeIntervalSinceNow < 86_400 ? QuotaTimeText.duration(until: reset) : QuotaTimeText.weekday(reset)
             Text(Self.shortName(meter) + " · " + when)
                 .foregroundStyle(.secondary)
+        } else if meter.metric.resetNeverExpires {
+            Text(Self.shortName(meter) + " · " + "quota.reset.noExpiry".localized())
+                .foregroundStyle(.secondary)
         }
     }
 

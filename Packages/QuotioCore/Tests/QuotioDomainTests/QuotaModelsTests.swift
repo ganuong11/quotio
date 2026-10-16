@@ -122,3 +122,24 @@ final class QuotaModelsTests: XCTestCase {
         )
     }
 }
+
+extension QuotaModelsTests {
+    func testFarFutureResetReadsAsNeverExpiresInsteadOfACountdown() {
+        // Qoder reports a year-9999-style sentinel for packages that do not
+        // expire; that must not surface as a multi-million-day countdown.
+        let sentinel = QuotaMetric(name: "qoder-user-quota", percentage: 80,
+                                 resetTime: "9999-12-31T23:59:59Z")
+        XCTAssertNil(sentinel.resetDate)
+        XCTAssertTrue(sentinel.resetNeverExpires)
+        XCTAssertNil(sentinel.pace())
+
+        let real = QuotaMetric(name: "qoder-user-quota", percentage: 80,
+                               resetTime: "2027-08-12T00:00:00Z")
+        XCTAssertNotNil(real.resetDate)
+        XCTAssertFalse(real.resetNeverExpires)
+
+        let empty = QuotaMetric(name: "qoder-user-quota", percentage: 80, resetTime: "")
+        XCTAssertNil(empty.resetDate)
+        XCTAssertFalse(empty.resetNeverExpires)
+    }
+}
