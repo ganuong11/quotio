@@ -18,7 +18,7 @@ public actor OpencodeDeviceAuthorizer: OAuthAuthorizing {
     private let console: OpencodeConsoleClient
     private let urlOpener: any URLOpening
     private let credentials: any GatewayCredentialStoring
-    private var attempts: [OAuthAttemptID: Task<Void, Never>] = [:]
+    private var cancelledAttempts: Set<OAuthAttemptID> = []
 
     public init(
         console: OpencodeConsoleClient = OpencodeConsoleClient(),
@@ -38,6 +38,7 @@ public actor OpencodeDeviceAuthorizer: OAuthAuthorizing {
         guard request.providerID.rawValue == QuotaProvider.opencode.rawValue else {
             throw OAuthFlowFailure.unsupportedProvider
         }
+        defer { cancelledAttempts.remove(attemptID) }
         do {
             let device = try await console.requestDeviceCode()
             guard let verificationURL = URL(string: device.verificationURIComplete) else {
@@ -53,6 +54,7 @@ public actor OpencodeDeviceAuthorizer: OAuthAuthorizing {
             let deadline = Date().addingTimeInterval(TimeInterval(device.expiresIn))
             while Date() < deadline {
                 try Task.checkCancellation()
+                if cancelledAttempts.contains(attemptID) { throw CancellationError() }
                 try await Task.sleep(for: .seconds(interval))
                 switch try await console.pollDeviceToken(deviceCode: device.deviceCode) {
                 case .pending:
@@ -96,7 +98,7 @@ public actor OpencodeDeviceAuthorizer: OAuthAuthorizing {
     }
 
     public func cancel(attemptID: OAuthAttemptID) async {
-        attempts.removeValue(forKey: attemptID)?.cancel()
+        cancelledAttempts.insert(attemptID)
     }
 
     /// The surfaced `Account` row for a freshly onboarded gateway account.
@@ -125,42 +127,3 @@ public actor OpencodeDeviceAuthorizer: OAuthAuthorizing {
     }
 }
 
-/// Dispatching `OAuthAuthorizing`: gateway-native providers route to their
-/// gateway authorizers; everything else falls through to the CPA authorizer.
-/// Today exactly one gateway provider authorizes this way — `.opencode`.
-public actor GatewayOAuthAuthorizer: OAuthAuthorizing {
-    private let opencode: any OAuthAuthorizing
-    private let fallback: any OAuthAuthorizing
-
-    public init(opencode: any OAuthAuthorizing, fallback: any OAuthAuthorizing) {
-        self.opencode = opencode
-        self.fallback = fallback
-    }
-
-    public func begin(
-        request: OAuthAuthorizationRequest,
-        attemptID: OAuthAttemptID,
-        progress: @escaping @Sendable (OAuthPrompt) async -> Void
-    ) async throws -> OAuthAuthorizationOutcome {
-        if request.providerID.rawValue == QuotaProvider.opencode.rawValue {
-            return try await opencode.begin(request: request, attemptID: attemptID, progress: progress)
-        }
-        return try await fallback.begin(request: request, attemptID: attemptID, progress: progress)
-    }
-
-    public func completeManualCode(
-        _ code: String,
-        providerID: AccountProviderID,
-        attemptID: OAuthAttemptID
-    ) async throws -> Account {
-        if providerID.rawValue == QuotaProvider.opencode.rawValue {
-            return try await opencode.completeManualCode(code, providerID: providerID, attemptID: attemptID)
-        }
-        return try await fallback.completeManualCode(code, providerID: providerID, attemptID: attemptID)
-    }
-
-    public func cancel(attemptID: OAuthAttemptID) async {
-        await opencode.cancel(attemptID: attemptID)
-        await fallback.cancel(attemptID: attemptID)
-    }
-}

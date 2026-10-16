@@ -21,13 +21,12 @@ public actor QoderPATService: QoderPATRefreshing {
     private let cosyVersion = "1.0.1"
     private let cosyClientType = "5"
 
-    private var session: URLSession
+    private let session: URLSession
 
     /// Minimum gap between successive `jobToken/exchange` call *starts*
     /// (ADR 0017). Empirical default 1s — the repo has no measurement of
     /// Qoder's exchange rate limit. Tests inject a smaller value; `session`
-    /// lets tests stub the network via `URLProtocol`. `QoderPATService.shared`
-    /// uses both defaults.
+    /// lets tests stub the network via `URLProtocol`.
     private let minExchangeInterval: TimeInterval
 
     /// When the next exchange may start. Claimed synchronously inside
@@ -39,11 +38,6 @@ public actor QoderPATService: QoderPATRefreshing {
     public init(minExchangeInterval: TimeInterval = 1.0, session: URLSession? = nil) {
         self.minExchangeInterval = minExchangeInterval
         self.session = session ?? URLSession(configuration: ProxyURLSessionFactory.makeConfiguration(timeout: 20))
-    }
-
-    /// Rebuild the URLSession after the user changes their upstream proxy.
-    public func updateProxyConfiguration() {
-        session = URLSession(configuration: ProxyURLSessionFactory.makeConfiguration(timeout: 20))
     }
 
     /// Exchange a PAT for a job token, fetch the user's identity, and return a

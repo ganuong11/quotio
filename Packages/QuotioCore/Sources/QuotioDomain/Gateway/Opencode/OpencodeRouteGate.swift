@@ -21,11 +21,11 @@
 //  decides whether the request enters the opencode branch at all.
 //
 //  The catalog lookup is injected as a closure so the gate stays pure and
-//  synchronous — `ProxyBridge.processRequest` is nonisolated and cannot
-//  await. The cold-start `isEmpty` decision (empty → 503 catalog-unavailable
-//  vs filled → 404 model_not_found) is made at the call site, which can see
-//  `OpencodeModelCatalog.shared.isEmpty` when the gate returns
-//  `.notInFreeSet`.
+//  synchronous — `GatewayListener.route` runs on the socket path and cannot
+//  await the catalog actor. The cold-start `isEmpty` decision (empty → 503
+//  catalog-unavailable vs filled → 404 model_not_found) is made at the call
+//  site, which holds the `OpencodeModelCatalog` reference and can check its
+//  cached `isEmpty` when the gate returns `.notInFreeSet`.
 //
 //  Pure value type — no I/O, no actor state. `public nonisolated enum` so it opts
 //  out of the project's MainActor default and is callable from any
@@ -76,7 +76,7 @@ public nonisolated enum OpencodeRouteGate {
     ///   - path: raw request target, may include `?query` (stripped here).
     ///   - model: the body's `model` field, or nil.
     ///   - isFreeModel: membership test for the stripped upstream id —
-    ///     `OpencodeModelCatalog.shared.isFree` at the call site.
+    ///     `OpencodeModelCatalog.isFree` at the call site.
     public static func resolve(
         method: String, path: String, model: String?,
         isFreeModel: (String) -> Bool

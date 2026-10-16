@@ -5,6 +5,7 @@ import QuotioDomain
 /// sees the vault). Presentation maps this to `qoder.onboarding.duplicate`.
 public enum QoderOnboardingError: Error, Sendable, Equatable {
     case duplicateAccount
+    case persistFailed
 }
 
 /// Qoder PAT onboarding use case: PAT → job-token exchange + userinfo (via the
@@ -52,6 +53,10 @@ public actor QoderOnboardingController {
             source: .onboarded,
             email: email.isEmpty ? nil : email
         )
-        try await credentials.store(result.credential, account: account)
+        do {
+            try await credentials.store(result.credential, account: account)
+        } catch {
+            throw QoderOnboardingError.persistFailed
+        }
     }
 }

@@ -113,7 +113,7 @@ public actor QoderAccessValidator {
     /// `true` once `reload(keys:)` has run at least once. Distinguishes
     /// "no api-keys configured" (primed + empty → open access, CPA parity)
     /// from "keys unknown yet" (unprimed → fail closed with `.notPrimed`).
-    /// See the `.notPrimed` decision and `QuotaViewModel.startProxy` for the
+    /// See the `.notPrimed` decision and `GatewayListener.start` for the
     /// priming call.
     private(set) var isPrimed = false
 
@@ -121,10 +121,10 @@ public actor QoderAccessValidator {
     /// and mark the validator primed (even for an empty list — an empty list
     /// is still a positive statement from CPA: "there are no api-keys").
     ///
-    /// Called on the existing `fetchAPIKeys()` cadence from `QuotaViewModel`
-    /// (ADR 0008 point 4) — an explicit priming call at proxy start, plus the
-    /// periodic quota refresh and after every add/update/delete on the API
-    /// Keys screen. Cheap and idempotent.
+    /// Called on the `loadAPIKeys()` cadence from `CompositionRoot`
+    /// (ADR 0008 point 4) — an explicit priming call at listener start, plus a
+    /// periodic re-prime so api-key edits land without a restart. Cheap and
+    /// idempotent.
     ///
     /// - Parameter keys: The freshly fetched configured keys (raw, possibly with
     ///   whitespace / empties / duplicates — normalized here).

@@ -53,7 +53,7 @@ public nonisolated enum QoderThinkingEmission: Sendable, Equatable {
 ///
 /// `nonisolated struct` with `mutating func` → callable from any isolation
 /// domain; in practice owned as a per-stream `var` inside the reparser, which
-/// itself is a per-request `var` inside the ProxyBridge actor. Never shared.
+/// itself is a per-request `var` inside the `GatewayListener` actor. Never shared.
 /// Matches `QoderSSEReparser` / `QoderWAFEncoder` / `QoderCOSYSigner`.
 public nonisolated struct QoderThinkingTagParser {
     /// Bytes received but not yet resolvable (a partial tag prefix at the tail

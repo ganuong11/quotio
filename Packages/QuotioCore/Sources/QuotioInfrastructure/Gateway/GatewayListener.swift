@@ -59,6 +59,8 @@ public actor GatewayListener: ProxyFrontDoorListening {
     private var apiKeySource: (@Sendable () async throws -> [String])?
     private var logger: (any ApplicationLogging)?
     /// Completion recorder (request accounting hook — ADR 0005 §2 consumer).
+    /// No production consumer is wired yet: usage accounting is deferred to a
+    /// dedicated store task; the hook and metadata are in place.
     public var onRequestCompleted: (@Sendable (GatewayRequestMetadata) -> Void)?
 
     public init() {}

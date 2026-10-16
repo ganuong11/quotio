@@ -38,11 +38,11 @@ public nonisolated struct QoderOpenedStream: Sendable {
 /// exchanged tokens can take time to propagate. `userInfo` carries the account
 /// key for the notification body — never the PAT or token.
 public extension Notification.Name {
-    public static let qoderPATRevoked = Notification.Name("dev.quotio.qoder.pat-revoked")
+    static let qoderPATRevoked = Notification.Name("dev.quotio.qoder.pat-revoked")
 }
 
 /// Failover tuning (issue #12). All values default to the pre-issue behavior;
-/// production wires `.default` from the single call site in `QuotaViewModel`,
+/// production wires `.default` from the single call site in `CompositionRoot`,
 /// tests inject overrides via `Configuration(silentStallStrikeThreshold: 1, …)`
 /// to exercise the strike/Retry-After paths deterministically.
 public nonisolated struct QoderFailoverRouterConfiguration: Sendable {

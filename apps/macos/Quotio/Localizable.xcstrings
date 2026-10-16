@@ -12126,6 +12126,34 @@
         }
       }
     },
+    "qoder.onboarding.saveFailed" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The account could not be saved. Please try again."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le compte n’a pas pu être enregistré. Veuillez réessayer."
+          }
+        },
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Không thể lưu tài khoản. Vui lòng thử lại."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法保存账户，请重试。"
+          }
+        }
+      }
+    },
     "qoder.onboarding.subtitle" : {
       "localizations" : {
         "en" : {

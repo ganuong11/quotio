@@ -231,6 +231,15 @@ public struct QoderPATOnboardingSheet: View {
         if error as? QoderOnboardingError == .duplicateAccount {
             return "qoder.onboarding.duplicate".localized()
         }
+        if error as? QoderOnboardingError == .persistFailed {
+            return "qoder.onboarding.saveFailed".localized()
+        }
+        // Domain errors carry wire-facing descriptions but cannot conform to
+        // LocalizedError — read their `errorDescription` before the NSError
+        // fallback ("The operation couldn't be completed…").
+        if let patError = error as? QoderPATError, let description = patError.errorDescription {
+            return description
+        }
         return error.localizedDescription
     }
 

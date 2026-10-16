@@ -13,6 +13,8 @@ public nonisolated enum GatewayIdentity {
     }
 
     public static func json(at path: String) -> [String: Any]? {
+        var info = stat()
+        guard lstat(path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else { return nil }
         guard let data = FileManager.default.contents(atPath: path) else { return nil }
         return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     }
@@ -33,5 +35,14 @@ public nonisolated enum GatewayIdentity {
         value += String(repeating: "=", count: (4 - value.count % 4) % 4)
         guard let data = Data(base64Encoded: value) else { return nil }
         return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    }
+}
+
+extension String {
+    /// Trims surrounding whitespace; `nil` when nothing is left. Shared by the
+    /// gateway adapters that sanitize third-party credential-store fields.
+    var nilIfBlank: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }

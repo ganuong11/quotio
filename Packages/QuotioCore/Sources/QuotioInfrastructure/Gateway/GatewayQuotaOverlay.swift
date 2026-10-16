@@ -330,7 +330,9 @@ public actor GatewayQuotaOverlay {
             hostSnapshot = host
             await publishMerged()
 
-            quotaCache[request.provider] = await quotaService.fetchAllQuotas()
+            if request.provider == .qoder {
+                quotaCache[.qoder] = await quotaService.fetchAllQuotas()
+            }
             refreshing.remove(request.provider)
             host = await self.host.snapshot
         }
@@ -352,7 +354,9 @@ public actor GatewayQuotaOverlay {
             hostSnapshot = host
             await publishMerged()
 
-            quotaCache[.qoder] = await quotaService.fetchAllQuotas()
+            if targets.contains(.qoder) {
+                quotaCache[.qoder] = await quotaService.fetchAllQuotas()
+            }
             refreshing.subtract(targets)
             host = await self.host.snapshot
         }

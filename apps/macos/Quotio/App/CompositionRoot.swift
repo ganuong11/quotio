@@ -247,7 +247,10 @@ enum CompositionRoot {
         let qoderRouter = QoderFailoverRouter(
             vault: gatewayCredentialVault,
             metadata: gatewayAccountStore,
-            patService: QoderPATService(),
+            // Shares the single PAT-service instance with onboarding + quota:
+            // its `nextExchangeAt` pacing gate (ADR 0017) is per-instance, so a
+            // second service would let failover re-exchanges burst past it.
+            patService: qoderPATService,
             gateway: QoderGatewayClient()
         )
         let qoderAccessValidator = QoderAccessValidator()
@@ -271,10 +274,19 @@ enum CompositionRoot {
             var lastCatalog = Date()
             var lastDetected = Date()
             var lastVault = Date()
+            var lastKeys = Date()
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(60))
                 guard !Task.isCancelled else { return }
                 let now = Date()
+                if now.timeIntervalSince(lastKeys) >= 300 {
+                    lastKeys = now
+                    // Re-prime the seam validator so api-key edits land without
+                    // a proxy restart (the start-time prime alone is a snapshot).
+                    if let keys = try? await configurationRepository.loadAPIKeys() {
+                        await qoderAccessValidator.reload(keys: keys)
+                    }
+                }
                 if now.timeIntervalSince(lastCatalog) >= 3600 {
                     lastCatalog = now
                     await opencodeCatalog.refresh()
